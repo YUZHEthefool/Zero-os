@@ -1,4 +1,3 @@
-use crate::println;
 use alloc::{vec::Vec, string::String};
 use spin::Mutex;
 

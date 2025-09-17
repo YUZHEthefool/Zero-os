@@ -10,21 +10,22 @@ all: build
 
 build:
 	@echo "=== 构建 Bootloader (UEFI) ==="
-	cargo build --release --package bootloader --target x86_64-unknown-uefi
-	
+	cd bootloader && \
+	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi
+		
 	@echo "=== 构建 Kernel (Bare Metal) ==="
 	cd kernel && \
-	RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C relocation-model=static -C code-model=kernel -C panic=abort" \
+	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C relocation-model=static -C code-model=kernel -C panic=abort" \
 	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins
 	
 	@echo "=== 准备 EFI ESP 目录 ==="
 	mkdir -p $(ESP_DIR)
 	
 	@echo "复制 Bootloader 到 ESP/BOOTX64.EFI"
-	cp target/x86_64-unknown-uefi/release/bootloader.efi $(ESP_DIR)/BOOTX64.EFI
+	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi $(ESP_DIR)/BOOTX64.EFI
 	
 	@echo "复制 Kernel 到 ESP/kernel.elf"
-	cp target/x86_64-unknown-none/release/kernel esp/kernel.elf
+	cp kernel-target/x86_64-unknown-none/release/kernel esp/kernel.elf
 	
 	@echo "=== 内核信息 ==="
 	@readelf -h esp/kernel.elf | grep "Entry\|Type"
@@ -48,6 +49,8 @@ debug: build
 
 clean:
 	cargo clean
+	rm -rf kernel-target
+	rm -rf bootloader-target
 	rm -rf esp
 
 # 用于连接到QEMU监视器

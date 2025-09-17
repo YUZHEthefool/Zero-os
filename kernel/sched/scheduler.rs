@@ -1,4 +1,3 @@
-use crate::println;
 use crate::process::{Process, ProcessState, PROCESS_TABLE};
 use alloc::collections::VecDeque;
 use spin::Mutex;

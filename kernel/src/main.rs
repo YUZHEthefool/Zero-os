@@ -34,6 +34,14 @@ unsafe fn serial_write_str(s: &str) {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // 初始化各个子系统
+    arch::init();
+    mm::init();
+    drivers::init();
+    ipc::init();
+    sched::init();
+    kernel_core::init();
+
     // 初始化硬件与子系统
     drivers::vga_buffer::init();
     drivers::vga_buffer::write_str("KERNEL: Started!\n");
@@ -46,8 +54,10 @@ pub extern "C" fn _start() -> ! {
     drivers::vga_buffer::clear_screen();
     drivers::vga_buffer::write_str("KERNEL OK\n");
 
-    // 进入调度循环
-    sched::scheduler::run();
+    // 内核主循环
+    loop {
+        sched::schedule();
+    }
 }
 
 #[panic_handler]

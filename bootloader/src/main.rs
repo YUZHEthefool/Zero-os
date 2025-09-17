@@ -77,7 +77,7 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         
         assert_eq!(elf.header.pt1.magic, [0x7f, 0x45, 0x4c, 0x46], "Invalid ELF magic");
 
-        // 加载所有程序段
+        // 加载所有程序段到物理地址
         for program_header in elf.program_iter() {
             if program_header.get_type() != Ok(Type::Load) {
                 continue;
@@ -88,18 +88,38 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             let file_size = program_header.file_size();
             let file_offset = program_header.offset();
 
+            // 将高半区虚拟地址转换为物理地址（假设内核链接在0xffffffff80000000）
+            let phys_addr = if virt_addr >= 0xffffffff80000000 {
+                // 高半区地址，转换为物理地址（从0x100000开始）
+                0x100000 + (virt_addr - 0xffffffff80000000)
+            } else {
+                // 低地址保持不变
+                virt_addr
+            };
+
             let pages = ((mem_size + 0xFFF) / 0x1000) as usize;
             
-            // 尝试在指定地址分配
-            let _ = boot_services.allocate_pages(
-                AllocateType::Address(virt_addr),
+            // 在物理地址分配内存
+            let result = boot_services.allocate_pages(
+                AllocateType::Address(phys_addr),
                 MemoryType::LOADER_DATA,
                 pages,
             );
             
-            // 复制段数据
+            if result.is_err() {
+                info!("Failed to allocate at 0x{:x}, trying any address", phys_addr);
+                // 如果指定地址失败，尝试任意地址
+                let allocated = boot_services.allocate_pages(
+                    AllocateType::AnyPages,
+                    MemoryType::LOADER_DATA,
+                    pages,
+                ).expect("Failed to allocate memory for segment");
+                info!("Allocated at 0x{:x}", allocated);
+            }
+            
+            // 复制段数据到物理地址
             unsafe {
-                let dest = virt_addr as *mut u8;
+                let dest = phys_addr as *mut u8;
                 let src = kernel_data.as_ptr().add(file_offset as usize);
                 core::ptr::copy_nonoverlapping(src, dest, file_size as usize);
                 
@@ -110,14 +130,20 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 }
             }
             
-            info!("Loaded segment: 0x{:x}, size: 0x{:x}", virt_addr, mem_size);
+            info!("Loaded segment: virt=0x{:x}, phys=0x{:x}, size=0x{:x}", virt_addr, phys_addr, mem_size);
         }
 
-        // 验证内核代码已加载
+        // 验证内核代码已加载到物理地址
         unsafe {
-            let kernel_start = entry_point as *const u8;
+            // 检查物理地址处的内容
+            let phys_entry = if entry_point >= 0xffffffff80000000 {
+                0x100000 + (entry_point - 0xffffffff80000000)
+            } else {
+                entry_point
+            };
+            let kernel_start = phys_entry as *const u8;
             let first_bytes = core::slice::from_raw_parts(kernel_start, 16);
-            info!("First 16 bytes at entry: {:x?}", first_bytes);
+            info!("First 16 bytes at phys entry 0x{:x}: {:x?}", phys_entry, first_bytes);
         }
         
         entry_point
@@ -138,60 +164,81 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     
     info!("Setting up paging for high-half kernel...");
 
-    // 构建最小可用的四级页表结构，将物理内核地址映射到高半区虚拟地址
+    // 构建四级页表结构，将物理内核地址映射到高半区虚拟地址
     unsafe {
         use x86_64::{
             PhysAddr,
             structures::paging::{
                 PageTable, PageTableFlags as Flags, PhysFrame
             },
-            registers::control::{Cr0, Cr3, Cr4}
+            registers::control::Cr3
         };
+
+        let boot_services = system_table.boot_services();
 
         // 分配并清零 PML4
         let pml4_frame = boot_services.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
             .expect("Failed to allocate PML4");
         let pml4_ptr = pml4_frame as *mut PageTable;
-        core::ptr::write_bytes(pml4_ptr, 0, 1);
+        core::ptr::write_bytes(pml4_ptr as *mut u8, 0, 4096);
 
-        // 分配并清零 PDPT
-        let pdpt_frame = boot_services.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+        // 分配并清零 PDPT（高半区）
+        let pdpt_high_frame = boot_services.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
             .expect("Failed to allocate PDPT");
-        let pdpt_ptr = pdpt_frame as *mut PageTable;
-        core::ptr::write_bytes(pdpt_ptr, 0, 1);
+        let pdpt_high_ptr = pdpt_high_frame as *mut PageTable;
+        core::ptr::write_bytes(pdpt_high_ptr as *mut u8, 0, 4096);
 
         // 分配并清零 PD
         let pd_frame = boot_services.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
             .expect("Failed to allocate PD");
         let pd_ptr = pd_frame as *mut PageTable;
-        core::ptr::write_bytes(pd_ptr, 0, 1);
+        core::ptr::write_bytes(pd_ptr as *mut u8, 0, 4096);
 
-        // 建立 2MiB 大页映射，高半区虚拟地址 -> 物理内核地址
-        let phys_kernel_start = PhysAddr::new(0x00100000);
-        (*pd_ptr)[0].set_addr(phys_kernel_start, Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE | Flags::GLOBAL);
+        // 建立 2MiB 大页映射，映射前16MB物理内存
+        // 物理地址 0x100000 -> 虚拟地址 0xffffffff80000000
+        for i in 0..8usize {
+            let phys_addr = PhysAddr::new(0x100000 + (i as u64) * 0x200000);  // 每个大页2MB
+            (&mut *pd_ptr)[i].set_addr(phys_addr, Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE);
+        }
 
-        // 将 PD 挂到 PDPT
-        (*pdpt_ptr)[0].set_addr(PhysAddr::new(pd_frame as u64), Flags::PRESENT | Flags::WRITABLE);
+        // PDPT的第510项指向PD（对应虚拟地址的第30-38位）
+        (&mut *pdpt_high_ptr)[510].set_addr(PhysAddr::new(pd_frame as u64), Flags::PRESENT | Flags::WRITABLE);
 
-        // 将 PDPT 挂到 PML4 高半区入口（通常是 511 号项）
-        (*pml4_ptr)[511].set_addr(PhysAddr::new(pdpt_frame as u64), Flags::PRESENT | Flags::WRITABLE);
+        // PML4的第511项指向高半区PDPT
+        (&mut *pml4_ptr)[511].set_addr(PhysAddr::new(pdpt_high_frame as u64), Flags::PRESENT | Flags::WRITABLE);
 
-        // 加载新的 PML4
+        // 同时建立恒等映射以防止切换页表时崩溃
+        let pdpt_low_frame = boot_services.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+            .expect("Failed to allocate low PDPT");
+        let pdpt_low_ptr = pdpt_low_frame as *mut PageTable;
+        core::ptr::write_bytes(pdpt_low_ptr as *mut u8, 0, 4096);
+
+        let pd_low_frame = boot_services.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+            .expect("Failed to allocate low PD");
+        let pd_low_ptr = pd_low_frame as *mut PageTable;
+        core::ptr::write_bytes(pd_low_ptr as *mut u8, 0, 4096);
+
+        // 恒等映射前16MB
+        for i in 0..8usize {
+            let phys_addr = PhysAddr::new((i as u64) * 0x200000);
+            (&mut *pd_low_ptr)[i].set_addr(phys_addr, Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE);
+        }
+        
+        (&mut *pdpt_low_ptr)[0].set_addr(PhysAddr::new(pd_low_frame as u64), Flags::PRESENT | Flags::WRITABLE);
+        (&mut *pml4_ptr)[0].set_addr(PhysAddr::new(pdpt_low_frame as u64), Flags::PRESENT | Flags::WRITABLE);
+
+        info!("Page tables set up, switching CR3...");
+
+        // 加载新的页表
         Cr3::write(PhysFrame::containing_address(PhysAddr::new(pml4_frame as u64)), Cr3::read().1);
-
-        // 启用 PAE、全局页和分页
-        Cr4::update(|cr4| cr4.insert(Cr4::PHYSICAL_ADDRESS_EXTENSION | Cr4::PAGE_GLOBAL));
-        Cr0::update(|cr0| cr0.insert(Cr0::PAGING));
     }
 
-    info!("Jumping to kernel high-half at 0xffffffff80000000...");
+    info!("Jumping to kernel at entry point: 0x{:x}", entry_point);
 
-    // 跳转到内核高半区入口
+    // 跳转到内核入口点
     unsafe {
         type KernelMain = extern "C" fn() -> !;
-        // entry_point 实际是物理地址，需要转换到高半区虚拟地址
-        let high_half_entry = 0xffffffff80000000u64 + (entry_point - 0x00100000);
-        let kernel_main: KernelMain = core::mem::transmute(high_half_entry);
+        let kernel_main: KernelMain = core::mem::transmute(entry_point);
         kernel_main();
     }
 }

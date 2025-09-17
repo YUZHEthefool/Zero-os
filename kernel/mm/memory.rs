@@ -1,4 +1,3 @@
-use crate::println;
 use linked_list_allocator::LockedHeap;
 use x86_64::{
     structures::paging::{PageTable, PageTableFlags, PhysFrame},

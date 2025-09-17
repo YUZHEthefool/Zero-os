@@ -3,15 +3,7 @@ name = "kernel"
 version = "0.1.0"
 edition = "2021"
 
-[workspace]
-members = [
-    "arch",
-    "mm",
-    "sched",
-    "ipc",
-    "drivers",
-    "kernel_core"
-]
+# 移除内核内部 workspace 配置，避免与顶层 workspace 冲突
 
 [dependencies]
 spin = "0.9"
@@ -19,6 +11,13 @@ lazy_static = { version = "1.4", features = ["spin_no_std"] }
 x86_64 = "0.15"
 uart_16550 = "0.3"
 linked_list_allocator = "0.10"
+arch = { path = "arch" }
+mm = { path = "mm" }
+sched = { path = "sched" }
+ipc = { path = "ipc" }
+drivers = { path = "drivers" }
+kernel_core = { path = "kernel_core" }
+
 # 暂时移除 crossbeam-queue，或确保正确配置
 # crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }
 
