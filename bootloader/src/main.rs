@@ -77,7 +77,58 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         
         assert_eq!(elf.header.pt1.magic, [0x7f, 0x45, 0x4c, 0x46], "Invalid ELF magic");
 
-        // 加载所有程序段到物理地址
+        // 首先，计算内核需要的总内存大小
+        let mut min_addr = u64::MAX;
+        let mut max_addr = 0u64;
+        
+        for program_header in elf.program_iter() {
+            if program_header.get_type() != Ok(Type::Load) {
+                continue;
+            }
+            let virt_addr = program_header.virtual_addr();
+            let mem_size = program_header.mem_size();
+            
+            if virt_addr < min_addr {
+                min_addr = virt_addr;
+            }
+            if virt_addr + mem_size > max_addr {
+                max_addr = virt_addr + mem_size;
+            }
+        }
+        
+        // 分配一块连续的内存来容纳整个内核
+        let kernel_phys_base = 0x100000u64;
+        let kernel_size = (max_addr - min_addr) as usize;
+        let pages = (kernel_size + 0xFFF) / 0x1000;
+        
+        info!("Allocating {} pages ({} bytes) for kernel at 0x{:x}", pages, kernel_size, kernel_phys_base);
+        
+        // 尝试在指定地址分配整块内存
+        let result = boot_services.allocate_pages(
+            AllocateType::Address(kernel_phys_base),
+            MemoryType::LOADER_DATA,
+            pages,
+        );
+        
+        let actual_phys_base = if result.is_err() {
+            info!("Failed to allocate at 0x{:x}, allocating at any address", kernel_phys_base);
+            boot_services.allocate_pages(
+                AllocateType::AnyPages,
+                MemoryType::LOADER_DATA,
+                pages,
+            ).expect("Failed to allocate memory for kernel")
+        } else {
+            kernel_phys_base
+        };
+        
+        info!("Kernel memory allocated at 0x{:x}", actual_phys_base);
+        
+        // 清零整块内存
+        unsafe {
+            core::ptr::write_bytes(actual_phys_base as *mut u8, 0, kernel_size);
+        }
+        
+        // 加载所有程序段到分配的内存
         for program_header in elf.program_iter() {
             if program_header.get_type() != Ok(Type::Load) {
                 continue;
@@ -88,46 +139,15 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             let file_size = program_header.file_size();
             let file_offset = program_header.offset();
 
-            // 将高半区虚拟地址转换为物理地址（假设内核链接在0xffffffff80000000）
-            let phys_addr = if virt_addr >= 0xffffffff80000000 {
-                // 高半区地址，转换为物理地址（从0x100000开始）
-                0x100000 + (virt_addr - 0xffffffff80000000)
-            } else {
-                // 低地址保持不变
-                virt_addr
-            };
-
-            let pages = ((mem_size + 0xFFF) / 0x1000) as usize;
+            // 计算段在物理内存中的偏移
+            let phys_offset = virt_addr - min_addr;
+            let phys_addr = actual_phys_base + phys_offset;
             
-            // 在物理地址分配内存
-            let result = boot_services.allocate_pages(
-                AllocateType::Address(phys_addr),
-                MemoryType::LOADER_DATA,
-                pages,
-            );
-            
-            if result.is_err() {
-                info!("Failed to allocate at 0x{:x}, trying any address", phys_addr);
-                // 如果指定地址失败，尝试任意地址
-                let allocated = boot_services.allocate_pages(
-                    AllocateType::AnyPages,
-                    MemoryType::LOADER_DATA,
-                    pages,
-                ).expect("Failed to allocate memory for segment");
-                info!("Allocated at 0x{:x}", allocated);
-            }
-            
-            // 复制段数据到物理地址
+            // 复制段数据
             unsafe {
                 let dest = phys_addr as *mut u8;
                 let src = kernel_data.as_ptr().add(file_offset as usize);
                 core::ptr::copy_nonoverlapping(src, dest, file_size as usize);
-                
-                if mem_size > file_size {
-                    let bss_start = dest.add(file_size as usize);
-                    let bss_size = (mem_size - file_size) as usize;
-                    core::ptr::write_bytes(bss_start, 0, bss_size);
-                }
             }
             
             info!("Loaded segment: virt=0x{:x}, phys=0x{:x}, size=0x{:x}", virt_addr, phys_addr, mem_size);
@@ -194,10 +214,10 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let pd_ptr = pd_frame as *mut PageTable;
         core::ptr::write_bytes(pd_ptr as *mut u8, 0, 4096);
 
-        // 建立 2MiB 大页映射，映射前16MB物理内存
-        // 物理地址 0x100000 -> 虚拟地址 0xffffffff80000000
+        // 建立 2MiB 大页映射
+        // 映射物理地址 0x0 - 0x1000000 (16MB) 到虚拟地址 0xffffffff80000000
         for i in 0..8usize {
-            let phys_addr = PhysAddr::new(0x100000 + (i as u64) * 0x200000);  // 每个大页2MB
+            let phys_addr = PhysAddr::new((i as u64) * 0x200000);  // 每个大页2MB，从0开始
             (&mut *pd_ptr)[i].set_addr(phys_addr, Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE);
         }
 
