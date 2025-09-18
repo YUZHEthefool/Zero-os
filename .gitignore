@@ -4,4 +4,6 @@ Cargo.lock
 
 
 # Binaries
-/esp/*
+/esp
+/bootloader-target
+/kernel-target
