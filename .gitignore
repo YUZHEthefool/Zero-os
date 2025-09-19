@@ -7,3 +7,9 @@ Cargo.lock
 /esp
 /bootloader-target
 /kernel-target
+
+#no_need
+*.md
+
+!README.md
+!README_zh.md

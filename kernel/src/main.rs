@@ -1,15 +1,21 @@
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
 
+extern crate alloc;
 use core::panic::PanicInfo;
 
-// 引入模块化子系统
+// 引入模块化子系统，drivers需要在最前面以便使用其宏
+#[macro_use]
+extern crate drivers;
 extern crate arch;
 extern crate mm;
 extern crate sched;
 extern crate ipc;
-extern crate drivers;
 extern crate kernel_core;
+
+// 演示模块
+mod demo;
 
 // 串口端口
 const SERIAL_PORT: u16 = 0x3F8;
@@ -52,12 +58,26 @@ pub extern "C" fn _start() -> ! {
     sched::scheduler::init();
 
     drivers::vga_buffer::clear_screen();
-    drivers::vga_buffer::write_str("KERNEL OK\n");
+    drivers::vga_buffer::write_str("KERNEL OK\n\n");
+    
+    // 运行内存管理演示
+    drivers::vga_buffer::write_str("Running memory management demos...\n");
+    demo::run_all_demos();
+    
+    drivers::vga_buffer::write_str("\nEntering kernel main loop...\n");
 
     // 内核主循环
     loop {
         sched::schedule();
+        unsafe {
+            core::arch::asm!("hlt");
+        }
     }
+}
+
+#[alloc_error_handler]
+fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
+    panic!("Allocation error: {:?}", layout);
 }
 
 #[panic_handler]

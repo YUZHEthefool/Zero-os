@@ -7,6 +7,7 @@ extern crate alloc;
 extern crate drivers;
 
 pub mod memory;
+pub mod buddy_allocator;
 
 pub fn init() {
     println!("Memory management module initialized");
