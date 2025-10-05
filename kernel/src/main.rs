@@ -16,6 +16,8 @@ extern crate kernel_core;
 
 // 演示模块
 mod demo;
+mod process_demo;
+mod syscall_demo;
 
 // 串口端口
 const SERIAL_PORT: u16 = 0x3F8;
@@ -61,9 +63,18 @@ pub extern "C" fn _start() -> ! {
     drivers::vga_buffer::write_str("KERNEL OK\n\n");
     
     // 运行内存管理演示
-    drivers::vga_buffer::write_str("Running memory management demos...\n");
+    drivers::vga_buffer::write_str("=== Memory Management Demos ===\n");
     demo::run_all_demos();
     
+    // 运行进程管理演示
+    drivers::vga_buffer::write_str("\n=== Process Management Demos ===\n");
+    process_demo::run_all_demos();
+    
+    // 运行系统调用演示
+    drivers::vga_buffer::write_str("\n=== System Call Demos ===\n");
+    syscall_demo::run_all_demos();
+    
+    drivers::vga_buffer::write_str("\n=== All demos completed ===\n");
     drivers::vga_buffer::write_str("\nEntering kernel main loop...\n");
 
     // 内核主循环
