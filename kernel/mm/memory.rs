@@ -8,8 +8,11 @@ use crate::buddy_allocator;
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-const HEAP_START: usize = 0x4444_4444_0000;
-const HEAP_SIZE: usize = 8 * 1024 * 1024; // 升级到8MB堆
+// 堆地址必须在 bootloader 映射的范围内
+// Bootloader 映射了物理地址 0x0-0x1000000 (16MB) 到虚拟地址 0xffffffff80000000
+// 内核代码占用了前面的部分，我们将堆放在 2MB 之后
+const HEAP_START: usize = 0xffffffff80200000;  // 虚拟地址 2MB 处
+const HEAP_SIZE: usize = 100 * 1024; // 100KB
 
 /// 物理内存管理起始地址（在256MB处）
 const PHYS_MEM_START: u64 = 0x10000000;

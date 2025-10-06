@@ -169,10 +169,7 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         entry_point
     };
     
-    info!("Press any key to jump to kernel...");
-    wait_for_key(&mut system_table);
-    
-    // 测试 VGA 缓冲区是否可访问
+    // 测试 VGA 缓冲区是否可访问 - 在 info! 之前
     unsafe {
         let vga = 0xb8000 as *mut u8;
         let msg = b"BOOT->";
@@ -182,10 +179,17 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         }
     }
     
-    info!("Setting up paging for high-half kernel...");
-
+    info!("Automatically jumping to kernel...");
+    
     // 构建四级页表结构，将物理内核地址映射到高半区虚拟地址
-    unsafe {
+    let (pml4_frame, entry_point_to_jump) = unsafe {
+        // 最早的 VGA 写入 - 在任何其他操作之前
+        let vga = 0xb8000 as *mut u8;
+        let msg = b"SETUP";
+        for (i, &byte) in msg.iter().enumerate() {
+            *vga.offset(80 * 22 * 2 + i as isize * 2) = byte;
+            *vga.offset(80 * 22 * 2 + i as isize * 2 + 1) = 0x09;
+        }
         use x86_64::{
             PhysAddr,
             structures::paging::{
@@ -238,8 +242,9 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let pd_low_ptr = pd_low_frame as *mut PageTable;
         core::ptr::write_bytes(pd_low_ptr as *mut u8, 0, 4096);
 
-        // 恒等映射前16MB
-        for i in 0..8usize {
+        // 恒等映射前 1GB (512 个 2MB 页，填满整个 PD)
+        // 这样可以确保 bootloader 代码、UEFI 数据和内核都能访问
+        for i in 0..512usize {
             let phys_addr = PhysAddr::new((i as u64) * 0x200000);
             (&mut *pd_low_ptr)[i].set_addr(phys_addr, Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE);
         }
@@ -247,19 +252,44 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         (&mut *pdpt_low_ptr)[0].set_addr(PhysAddr::new(pd_low_frame as u64), Flags::PRESENT | Flags::WRITABLE);
         (&mut *pml4_ptr)[0].set_addr(PhysAddr::new(pdpt_low_frame as u64), Flags::PRESENT | Flags::WRITABLE);
 
-        info!("Page tables set up, switching CR3...");
+        // 在切换前写 VGA 测试
+        let vga = 0xb8000 as *mut u8;
+        let msg1 = b"B4CR3";
+        for (i, &byte) in msg1.iter().enumerate() {
+            *vga.offset(80 * 23 * 2 + i as isize * 2) = byte;
+            *vga.offset(80 * 23 * 2 + i as isize * 2 + 1) = 0x0A;
+        }
 
         // 加载新的页表
         Cr3::write(PhysFrame::containing_address(PhysAddr::new(pml4_frame as u64)), Cr3::read().1);
+        
+        // 在切换后写 VGA 测试
+        let msg2 = b"AFCR3";
+        for (i, &byte) in msg2.iter().enumerate() {
+            *vga.offset(80 * 23 * 2 + (i + 6) as isize * 2) = byte;
+            *vga.offset(80 * 23 * 2 + (i + 6) as isize * 2 + 1) = 0x0C;
+        }
+        
+        (pml4_frame, entry_point)
+    };
+    
+    // CR3 切换后，直接写 VGA
+    unsafe {
+        let vga = 0xb8000 as *mut u8;
+        let msg = b"JUMP->";
+        for (i, &byte) in msg.iter().enumerate() {
+            *vga.offset(80 * 24 * 2 + (i + 6) as isize * 2) = byte;
+            *vga.offset(80 * 24 * 2 + (i + 6) as isize * 2 + 1) = 0x0E;
+        }
     }
 
-    info!("Jumping to kernel at entry point: 0x{:x}", entry_point);
-
-    // 跳转到内核入口点
+    // 跳转到内核入口点 - 使用内联汇编确保正确跳转
     unsafe {
-        type KernelMain = extern "C" fn() -> !;
-        let kernel_main: KernelMain = core::mem::transmute(entry_point);
-        kernel_main();
+        core::arch::asm!(
+            "jmp {entry}",
+            entry = in(reg) entry_point_to_jump,
+            options(noreturn)
+        );
     }
 }
 

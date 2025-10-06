@@ -18,6 +18,7 @@ extern crate kernel_core;
 mod demo;
 mod process_demo;
 mod syscall_demo;
+mod interrupt_demo;
 
 // 串口端口
 const SERIAL_PORT: u16 = 0x3F8;
@@ -42,39 +43,63 @@ unsafe fn serial_write_str(s: &str) {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // 初始化各个子系统
+    // 最早期的调试：直接写 VGA，不依赖任何初始化
+    unsafe {
+        let vga = 0xb8000 as *mut u16;
+        let msg = b"KERN>";
+        for (i, &byte) in msg.iter().enumerate() {
+            *vga.offset(i as isize) = (byte as u16) | (0x0F << 8);
+        }
+    }
+    
+    // ========================================
+    // 阶段 1: 基础硬件初始化（不使用堆分配）
+    // ========================================
+    drivers::vga_buffer::init();
+    drivers::vga_buffer::write_str("KERNEL: Booting...\n");
+    
+    // ========================================
+    // 阶段 2: 内存管理初始化
+    // ========================================
+    // 初始化堆分配器 - 必须在任何使用 println! 的代码之前
+    mm::memory::init();
+    
+    // ========================================
+    // 阶段 3: 子系统初始化（现在可以安全使用 println!）
+    // ========================================
     arch::init();
     mm::init();
     drivers::init();
     ipc::init();
     sched::init();
     kernel_core::init();
-
-    // 初始化硬件与子系统
-    drivers::vga_buffer::init();
-    drivers::vga_buffer::write_str("KERNEL: Started!\n");
-
+    
+    // ========================================
+    // 阶段 4: 高级功能初始化
+    // ========================================
     arch::interrupts::init();
-    mm::memory::init();
     kernel_core::syscall::init();
     sched::scheduler::init();
-
+    
+    // ========================================
+    // 阶段 5: 启动完成
+    // ========================================
     drivers::vga_buffer::clear_screen();
     drivers::vga_buffer::write_str("KERNEL OK\n\n");
     
-    // 运行内存管理演示
-    drivers::vga_buffer::write_str("=== Memory Management Demos ===\n");
-    demo::run_all_demos();
+    // 暂时禁用演示代码以诊断启动问题
+    drivers::vga_buffer::write_str("Kernel successfully started!\n");
+    drivers::vga_buffer::write_str("All subsystems initialized.\n");
+    drivers::vga_buffer::write_str("\n");
+    drivers::vga_buffer::write_str("Note: Demo code temporarily disabled for debugging.\n");
+    drivers::vga_buffer::write_str("To enable demos, uncomment the demo calls in main.rs\n");
     
-    // 运行进程管理演示
-    drivers::vga_buffer::write_str("\n=== Process Management Demos ===\n");
-    process_demo::run_all_demos();
+    // TODO: 取消注释以下代码来运行演示
+    // demo::run_all_demos();
+    // process_demo::run_all_demos();
+    // syscall_demo::run_all_demos();
+    // interrupt_demo::run_all_demos();
     
-    // 运行系统调用演示
-    drivers::vga_buffer::write_str("\n=== System Call Demos ===\n");
-    syscall_demo::run_all_demos();
-    
-    drivers::vga_buffer::write_str("\n=== All demos completed ===\n");
     drivers::vga_buffer::write_str("\nEntering kernel main loop...\n");
 
     // 内核主循环
