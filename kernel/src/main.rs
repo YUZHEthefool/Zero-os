@@ -43,70 +43,34 @@ unsafe fn serial_write_str(s: &str) {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // 最早期的调试：直接写 VGA，不依赖任何初始化
+    // 最简化的测试：只写 VGA 然后 halt
+    // VGA 缓冲区在物理地址 0xb8000
+    // 由于我们的页表将虚拟 0xffffffff80000000 映射到物理 0x0
+    // 所以虚拟地址 0xffffffff800b8000 对应物理地址 0xb8000
     unsafe {
-        let vga = 0xb8000 as *mut u16;
-        let msg = b"KERN>";
+        let vga = 0xffffffff800b8000 as *mut u16;
+        
+        // 写入 "KERNEL!" 到屏幕第一行
+        let msg = b"KERNEL!";
         for (i, &byte) in msg.iter().enumerate() {
-            *vga.offset(i as isize) = (byte as u16) | (0x0F << 8);
+            *vga.offset(i as isize) = (byte as u16) | (0x0A << 8);  // 绿色文字
+        }
+        
+        // 写入 "SUCCESS" 到第二行
+        let second_line = 80;
+        let addr_msg = b"SUCCESS";
+        for (i, &byte) in addr_msg.iter().enumerate() {
+            *vga.offset((second_line + i) as isize) = (byte as u16) | (0x0E << 8);  // 黄色文字
         }
     }
     
-    // ========================================
-    // 阶段 1: 基础硬件初始化（不使用堆分配）
-    // ========================================
-    drivers::vga_buffer::init();
-    drivers::vga_buffer::write_str("KERNEL: Booting...\n");
-    
-    // ========================================
-    // 阶段 2: 内存管理初始化
-    // ========================================
-    // 初始化堆分配器 - 必须在任何使用 println! 的代码之前
-    mm::memory::init();
-    
-    // ========================================
-    // 阶段 3: 子系统初始化（现在可以安全使用 println!）
-    // ========================================
-    arch::init();
-    mm::init();
-    drivers::init();
-    ipc::init();
-    sched::init();
-    kernel_core::init();
-    
-    // ========================================
-    // 阶段 4: 高级功能初始化
-    // ========================================
-    arch::interrupts::init();
-    kernel_core::syscall::init();
-    sched::scheduler::init();
-    
-    // ========================================
-    // 阶段 5: 启动完成
-    // ========================================
-    drivers::vga_buffer::clear_screen();
-    drivers::vga_buffer::write_str("KERNEL OK\n\n");
-    
-    // 暂时禁用演示代码以诊断启动问题
-    drivers::vga_buffer::write_str("Kernel successfully started!\n");
-    drivers::vga_buffer::write_str("All subsystems initialized.\n");
-    drivers::vga_buffer::write_str("\n");
-    drivers::vga_buffer::write_str("Note: Demo code temporarily disabled for debugging.\n");
-    drivers::vga_buffer::write_str("To enable demos, uncomment the demo calls in main.rs\n");
-    
-    // TODO: 取消注释以下代码来运行演示
-    // demo::run_all_demos();
-    // process_demo::run_all_demos();
-    // syscall_demo::run_all_demos();
-    // interrupt_demo::run_all_demos();
-    
-    drivers::vga_buffer::write_str("\nEntering kernel main loop...\n");
-
-    // 内核主循环
+    // 无限循环，使用 hlt 降低CPU使用率
     loop {
-        sched::schedule();
         unsafe {
-            core::arch::asm!("hlt");
+            core::arch::asm!(
+                "hlt",
+                options(nomem, nostack, preserves_flags)
+            );
         }
     }
 }

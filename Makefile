@@ -37,7 +37,8 @@ run: build
 		-drive format=raw,file=fat:rw:esp \
 		-m 256M \
 		-nographic \
-		-serial mon:stdio
+		-serial mon:stdio \
+		-d int -no-reboot -no-shutdown
 
 debug: build
 	$(QEMU) \

@@ -128,7 +128,7 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             core::ptr::write_bytes(actual_phys_base as *mut u8, 0, kernel_size);
         }
         
-        // 加载所有程序段到分配的内存
+        // 加载所有程序段 - 使用ELF指定的物理地址
         for program_header in elf.program_iter() {
             if program_header.get_type() != Ok(Type::Load) {
                 continue;
@@ -138,26 +138,34 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             let mem_size = program_header.mem_size();
             let file_size = program_header.file_size();
             let file_offset = program_header.offset();
-
-            // 计算段在物理内存中的偏移
-            let phys_offset = virt_addr - min_addr;
-            let phys_addr = actual_phys_base + phys_offset;
             
-            // 复制段数据
+            // 使用ELF程序头中指定的物理地址
+            let phys_addr = program_header.physical_addr();
+            
+            // 清零整个段内存区域（包括.bss）
             unsafe {
                 let dest = phys_addr as *mut u8;
-                let src = kernel_data.as_ptr().add(file_offset as usize);
-                core::ptr::copy_nonoverlapping(src, dest, file_size as usize);
+                core::ptr::write_bytes(dest, 0, mem_size as usize);
             }
             
-            info!("Loaded segment: virt=0x{:x}, phys=0x{:x}, size=0x{:x}", virt_addr, phys_addr, mem_size);
+            // 复制段数据（file_size可能小于mem_size，剩余部分已清零）
+            if file_size > 0 {
+                unsafe {
+                    let dest = phys_addr as *mut u8;
+                    let src = kernel_data.as_ptr().add(file_offset as usize);
+                    core::ptr::copy_nonoverlapping(src, dest, file_size as usize);
+                }
+            }
+            
+            info!("Loaded segment: virt=0x{:x}, phys=0x{:x}, filesz=0x{:x}, memsz=0x{:x}",
+                  virt_addr, phys_addr, file_size, mem_size);
         }
 
         // 验证内核代码已加载到物理地址
         unsafe {
             // 检查物理地址处的内容
             let phys_entry = if entry_point >= 0xffffffff80000000 {
-                0x100000 + (entry_point - 0xffffffff80000000)
+                actual_phys_base + (entry_point - min_addr)
             } else {
                 entry_point
             };
@@ -218,38 +226,47 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let pd_ptr = pd_frame as *mut PageTable;
         core::ptr::write_bytes(pd_ptr as *mut u8, 0, 4096);
 
-        // 建立 2MiB 大页映射
-        // 映射物理地址 0x0 - 0x1000000 (16MB) 到虚拟地址 0xffffffff80000000
-        for i in 0..8usize {
-            let phys_addr = PhysAddr::new((i as u64) * 0x200000);  // 每个大页2MB，从0开始
+        // **关键修复**: 由于2MB大页必须对齐到2MB边界，我们映射整个低内存区域
+        // 虚拟地址 0xffffffff80000000 映射到物理地址 0x0
+        // 这样内核的物理地址 0x100000 对应虚拟地址 0xffffffff80100000
+        // 但是ELF入口点是 0xffffffff80000000，所以我们需要调整...
+        //
+        // 实际上，最简单的方法是：映射从物理0开始，这样就不会有对齐问题
+        for i in 0..512usize {
+            let phys_addr = PhysAddr::new((i as u64) * 0x200000);
             (&mut *pd_ptr)[i].set_addr(phys_addr, Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE);
         }
 
         // PDPT的第510项指向PD（对应虚拟地址的第30-38位）
+        // 这映射虚拟地址 0xffffffff80000000-0xffffffffbfffffff (1GB) 到物理地址 0x0-0x3fffffff
         (&mut *pdpt_high_ptr)[510].set_addr(PhysAddr::new(pd_frame as u64), Flags::PRESENT | Flags::WRITABLE);
 
         // PML4的第511项指向高半区PDPT
         (&mut *pml4_ptr)[511].set_addr(PhysAddr::new(pdpt_high_frame as u64), Flags::PRESENT | Flags::WRITABLE);
 
-        // 同时建立恒等映射以防止切换页表时崩溃
+        // 建立恒等映射以防止切换页表时崩溃
         let pdpt_low_frame = boot_services.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
             .expect("Failed to allocate low PDPT");
         let pdpt_low_ptr = pdpt_low_frame as *mut PageTable;
         core::ptr::write_bytes(pdpt_low_ptr as *mut u8, 0, 4096);
 
-        let pd_low_frame = boot_services.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
-            .expect("Failed to allocate low PD");
-        let pd_low_ptr = pd_low_frame as *mut PageTable;
-        core::ptr::write_bytes(pd_low_ptr as *mut u8, 0, 4096);
+        // 恒等映射前 4GB（需要4个PD，每个PD映射1GB）
+        // 这样可以确保 bootloader 代码、UEFI 固件、硬件MMIO（包括APIC在0xfee00000）都能访问
+        for pdpt_idx in 0..4usize {
+            let pd_low_frame = boot_services.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+                .expect("Failed to allocate low PD");
+            let pd_low_ptr = pd_low_frame as *mut PageTable;
+            core::ptr::write_bytes(pd_low_ptr as *mut u8, 0, 4096);
 
-        // 恒等映射前 1GB (512 个 2MB 页，填满整个 PD)
-        // 这样可以确保 bootloader 代码、UEFI 数据和内核都能访问
-        for i in 0..512usize {
-            let phys_addr = PhysAddr::new((i as u64) * 0x200000);
-            (&mut *pd_low_ptr)[i].set_addr(phys_addr, Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE);
+            // 每个PD映射512个2MB页（1GB）
+            for i in 0..512usize {
+                let phys_addr = PhysAddr::new(((pdpt_idx * 512 + i) as u64) * 0x200000);
+                (&mut *pd_low_ptr)[i].set_addr(phys_addr, Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE);
+            }
+            
+            (&mut *pdpt_low_ptr)[pdpt_idx].set_addr(PhysAddr::new(pd_low_frame as u64), Flags::PRESENT | Flags::WRITABLE);
         }
         
-        (&mut *pdpt_low_ptr)[0].set_addr(PhysAddr::new(pd_low_frame as u64), Flags::PRESENT | Flags::WRITABLE);
         (&mut *pml4_ptr)[0].set_addr(PhysAddr::new(pdpt_low_frame as u64), Flags::PRESENT | Flags::WRITABLE);
 
         // 在切换前写 VGA 测试
