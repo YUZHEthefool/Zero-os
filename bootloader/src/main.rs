@@ -128,7 +128,7 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             core::ptr::write_bytes(actual_phys_base as *mut u8, 0, kernel_size);
         }
         
-        // 加载所有程序段 - 使用ELF指定的物理地址
+        // 加载所有程序段到物理地址 0x100000
         for program_header in elf.program_iter() {
             if program_header.get_type() != Ok(Type::Load) {
                 continue;
@@ -139,8 +139,9 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             let file_size = program_header.file_size();
             let file_offset = program_header.offset();
             
-            // 使用ELF程序头中指定的物理地址
-            let phys_addr = program_header.physical_addr();
+            // 计算物理地址：虚拟地址 - 虚拟基址 + 物理基址
+            // 虚拟基址是 min_addr (0xffffffff80000000)，物理基址是 actual_phys_base (0x100000)
+            let phys_addr = actual_phys_base + (virt_addr - min_addr);
             
             // 清零整个段内存区域（包括.bss）
             unsafe {
@@ -163,17 +164,14 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
         // 验证内核代码已加载到物理地址
         unsafe {
-            // 检查物理地址处的内容
-            let phys_entry = if entry_point >= 0xffffffff80000000 {
-                actual_phys_base + (entry_point - min_addr)
-            } else {
-                entry_point
-            };
-            let kernel_start = phys_entry as *const u8;
+            let kernel_start = actual_phys_base as *const u8;
             let first_bytes = core::slice::from_raw_parts(kernel_start, 16);
-            info!("First 16 bytes at phys entry 0x{:x}: {:x?}", phys_entry, first_bytes);
+            info!("First 16 bytes at phys 0x{:x}: {:x?}", actual_phys_base, first_bytes);
         }
         
+        // 链接脚本现在将入口点设置为 0xffffffff80100000
+        // 这对应物理地址 0x100000，通过页表映射正确
+        info!("Using ELF entry point: 0x{:x}", entry_point);
         entry_point
     };
     
@@ -226,12 +224,11 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let pd_ptr = pd_frame as *mut PageTable;
         core::ptr::write_bytes(pd_ptr as *mut u8, 0, 4096);
 
-        // **关键修复**: 由于2MB大页必须对齐到2MB边界，我们映射整个低内存区域
-        // 虚拟地址 0xffffffff80000000 映射到物理地址 0x0
-        // 这样内核的物理地址 0x100000 对应虚拟地址 0xffffffff80100000
-        // 但是ELF入口点是 0xffffffff80000000，所以我们需要调整...
-        //
-        // 实际上，最简单的方法是：映射从物理0开始，这样就不会有对齐问题
+        // 使用2MB大页映射内核
+        // 虚拟地址 0xffffffff80000000 映射到物理地址 0x100000
+        // 由于使用2MB大页，必须从2MB边界开始，所以实际映射：
+        // 虚拟 0xffffffff80000000 → 物理 0x0 (包含0x100000)
+        // 这样内核在物理 0x100000 处的代码对应虚拟地址 0xffffffff80100000
         for i in 0..512usize {
             let phys_addr = PhysAddr::new((i as u64) * 0x200000);
             (&mut *pd_ptr)[i].set_addr(phys_addr, Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE);

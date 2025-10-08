@@ -43,9 +43,18 @@ unsafe fn serial_write_str(s: &str) {
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // 最简化的测试：只写 VGA 然后 halt
+    // 禁用中断 - 必须首先做！
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack));
+    }
+    
+    // 发送串口消息表示内核已启动
+    unsafe {
+        serial_write_str("Kernel _start entered\n");
+    }
+    
     // VGA 缓冲区在物理地址 0xb8000
-    // 由于我们的页表将虚拟 0xffffffff80000000 映射到物理 0x0
+    // 由于页表映射 0xffffffff80000000 -> 物理0x0
     // 所以虚拟地址 0xffffffff800b8000 对应物理地址 0xb8000
     unsafe {
         let vga = 0xffffffff800b8000 as *mut u16;
@@ -62,6 +71,8 @@ pub extern "C" fn _start() -> ! {
         for (i, &byte) in addr_msg.iter().enumerate() {
             *vga.offset((second_line + i) as isize) = (byte as u16) | (0x0E << 8);  // 黄色文字
         }
+        
+        serial_write_str("VGA write completed\n");
     }
     
     // 无限循环，使用 hlt 降低CPU使用率

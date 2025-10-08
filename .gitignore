@@ -4,6 +4,7 @@ Cargo.lock
 
 
 # Binaries
+/.kilocode
 /esp
 /bootloader-target
 /kernel-target
