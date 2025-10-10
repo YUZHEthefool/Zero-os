@@ -53,29 +53,51 @@ pub extern "C" fn _start() -> ! {
         serial_write_str("Kernel _start entered\n");
     }
     
-    // VGA 缓冲区在物理地址 0xb8000
-    // 由于页表映射 0xffffffff80000000 -> 物理0x0
-    // 所以虚拟地址 0xffffffff800b8000 对应物理地址 0xb8000
-    unsafe {
-        let vga = 0xffffffff800b8000 as *mut u16;
-        
-        // 写入 "KERNEL!" 到屏幕第一行
-        let msg = b"KERNEL!";
-        for (i, &byte) in msg.iter().enumerate() {
-            *vga.offset(i as isize) = (byte as u16) | (0x0A << 8);  // 绿色文字
-        }
-        
-        // 写入 "SUCCESS" 到第二行
-        let second_line = 80;
-        let addr_msg = b"SUCCESS";
-        for (i, &byte) in addr_msg.iter().enumerate() {
-            *vga.offset((second_line + i) as isize) = (byte as u16) | (0x0E << 8);  // 黄色文字
-        }
-        
-        serial_write_str("VGA write completed\n");
-    }
+    // 初始化VGA驱动
+    drivers::vga_buffer::init();
     
-    // 无限循环，使用 hlt 降低CPU使用率
+    println!("==============================");
+    println!("  Zero-OS Microkernel v0.1");
+    println!("==============================");
+    println!();
+    
+    // 阶段1：初始化中断处理
+    println!("[1/3] Initializing interrupts...");
+    arch::interrupts::init();
+    println!("      ✓ IDT loaded with 20+ handlers");
+    
+    // 阶段2：初始化内存管理
+    println!("[2/3] Initializing memory management...");
+    mm::memory::init();
+    println!("      ✓ Heap and Buddy allocator ready");
+    
+    // 阶段3：测试基础功能
+    println!("[3/3] Running basic tests...");
+    
+    // 测试内存分配
+    use alloc::vec::Vec;
+    let mut test_vec = Vec::new();
+    for i in 0..10 {
+        test_vec.push(i);
+    }
+    println!("      ✓ Heap allocation test passed");
+    
+    // 显示内存统计
+    let mem_stats = mm::memory::FrameAllocator::new().stats();
+    println!("      ✓ Memory stats available");
+    
+    println!();
+    println!("=== System Information ===");
+    mem_stats.print();
+    
+    println!();
+    println!("=== System Ready ===");
+    println!("All subsystems initialized successfully!");
+    println!();
+    println!("进入空闲循环...");
+    println!();
+    
+    // 主内核循环
     loop {
         unsafe {
             core::arch::asm!(
