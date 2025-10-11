@@ -1,9 +1,17 @@
 .PHONY: all build run clean
 
-# 使用找到的OVMF路径
-OVMF_PATH = /usr/share/OVMF/OVMF_CODE.fd
+OVMF_PATH = $(shell \
+	if [ -f /usr/share/qemu/OVMF.fd ]; then \
+		echo /usr/share/qemu/OVMF.fd; \
+	elif [ -f /usr/share/ovmf/OVMF.fd ]; then \
+		echo /usr/share/ovmf/OVMF.fd; \
+	elif [ -f /usr/share/OVMF/OVMF_CODE.fd ]; then \
+		echo /usr/share/OVMF/OVMF_CODE.fd; \
+	else \
+		find /usr/share/OVMF/ -type f -name "OVMF_CODE*.fd" 2>/dev/null | head -n 1; \
+	fi)
 QEMU = qemu-system-x86_64
-ESP_DIR = esp/EFI/BOOT
+ESP_DIR = $(shell pwd)/esp/EFI/BOOT
 KERNEL_LD = $(shell pwd)/kernel/kernel.ld
 
 all: build
