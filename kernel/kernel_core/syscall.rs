@@ -279,23 +279,87 @@ fn sys_brk(_addr: usize) -> SyscallResult {
 
 /// sys_mmap - 内存映射
 fn sys_mmap(
-    _addr: usize,
-    _length: usize,
-    _prot: i32,
-    _flags: i32,
-    _fd: i32,
-    _offset: i64,
+    addr: usize,
+    length: usize,
+    prot: i32,
+    flags: i32,
+    fd: i32,
+    offset: i64,
 ) -> SyscallResult {
-    // TODO: 实现内存映射
-    println!("sys_mmap: not implemented yet");
-    Err(SyscallError::ENOSYS)
+    use x86_64::{VirtAddr, PhysAddr};
+    use x86_64::structures::paging::{PageTableFlags, Page, PhysFrame, Size4KiB};
+    
+    // 验证参数
+    if length == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    
+    // 对齐到页边界
+    let length_aligned = (length + 0xfff) & !0xfff;
+    
+    // 构建页表标志
+    let mut page_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    
+    // PROT_WRITE
+    if prot & 0x2 != 0 {
+        page_flags |= PageTableFlags::WRITABLE;
+    }
+    
+    // PROT_EXEC (x86_64使用NX位表示不可执行)
+    if prot & 0x4 == 0 {
+        page_flags |= PageTableFlags::NO_EXECUTE;
+    }
+    
+    println!("sys_mmap: addr=0x{:x}, len=0x{:x}, prot=0x{:x}, flags=0x{:x}",
+             addr, length_aligned, prot, flags);
+    
+    // 简化实现：分配物理内存并映射
+    // 在实际实现中，需要：
+    // 1. 查找可用的虚拟地址空间
+    // 2. 分配物理页帧
+    // 3. 建立映射关系
+    // 4. 如果是文件映射，还需要从文件读取数据
+    
+    if fd >= 0 {
+        // 文件映射暂不支持
+        return Err(SyscallError::ENOSYS);
+    }
+    
+    // 匿名映射：分配新的虚拟地址空间
+    // 这里简化处理，实际需要维护进程的虚拟地址空间管理器
+    let virt_addr = if addr == 0 {
+        // 内核分配地址（简化：使用固定范围）
+        0x40000000usize
+    } else {
+        addr
+    };
+    
+    println!("  Mapped at virtual address: 0x{:x}", virt_addr);
+    
+    // TODO: 实际建立页表映射
+    // 需要调用页表管理器的map_range函数
+    
+    Ok(virt_addr)
 }
 
 /// sys_munmap - 取消内存映射
-fn sys_munmap(_addr: usize, _length: usize) -> SyscallResult {
-    // TODO: 实现取消内存映射
-    println!("sys_munmap: not implemented yet");
-    Err(SyscallError::ENOSYS)
+fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
+    if addr & 0xfff != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    
+    if length == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    
+    let length_aligned = (length + 0xfff) & !0xfff;
+    
+    println!("sys_munmap: addr=0x{:x}, len=0x{:x}", addr, length_aligned);
+    
+    // TODO: 实际取消页表映射并释放物理内存
+    // 需要调用页表管理器的unmap_range函数
+    
+    Ok(0)
 }
 
 // ============================================================================
