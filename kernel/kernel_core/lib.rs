@@ -11,6 +11,9 @@ pub use drivers::vga_buffer;
 
 pub mod process;
 pub mod syscall;
+pub mod fork;
+
+pub use fork::{sys_fork, ForkError, ForkResult};
 
 pub fn init() {
     println!("Kernel core module initialized");

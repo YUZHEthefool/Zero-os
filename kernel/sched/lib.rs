@@ -6,12 +6,18 @@ extern crate alloc;
 #[macro_use]
 extern crate drivers;
 
+extern crate kernel_core;
+extern crate lazy_static;
+extern crate spin;
+
 pub use kernel_core::process;
 
 pub mod scheduler;
+pub mod enhanced_scheduler;
 
 pub fn init() {
     println!("Scheduler module initialized");
+    enhanced_scheduler::init();
 }
 
 pub fn schedule() {

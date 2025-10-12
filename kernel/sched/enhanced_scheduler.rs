@@ -1,11 +1,15 @@
 //! 增强型调度器
-//! 
+//!
 //! 实现多级反馈队列调度和时钟中断集成
 
 use alloc::collections::BTreeMap;
-use crate::process::{ProcessControlBlock, Pid, ProcessState};
+use kernel_core::process::{Process, ProcessId, ProcessState};
 use spin::Mutex;
 use lazy_static::lazy_static;
+
+// 类型别名以保持兼容性
+pub type Pid = ProcessId;
+pub type ProcessControlBlock = Process;
 
 /// 全局就绪队列 - 按优先级维护就绪进程
 lazy_static! {
@@ -101,9 +105,15 @@ impl Scheduler {
         // 当前运行的进程消耗一个时间片
         if let Some(current_pid) = *CURRENT_PROCESS.lock() {
             if let Some(pcb) = queue.get_mut(&current_pid) {
-                if pcb.consume_time_slice() {
-                    // 时间片已用完，标记为就绪态
-                    pcb.set_ready();
+                // 减少时间片
+                if pcb.time_slice > 0 {
+                    pcb.time_slice -= 1;
+                }
+                
+                // 时间片已用完，标记为就绪态
+                if pcb.time_slice == 0 {
+                    pcb.state = ProcessState::Ready;
+                    pcb.reset_time_slice();
                 }
             }
         }
@@ -128,14 +138,14 @@ impl Scheduler {
                 if let Some(current_id) = current_pid {
                     if let Some(pcb) = queue.get_mut(&current_id) {
                         if pcb.state == ProcessState::Running {
-                            pcb.set_ready();
+                            pcb.state = ProcessState::Ready;
                         }
                     }
                 }
                 
                 // 设置新进程为运行态
                 if let Some(pcb) = queue.get_mut(&next_pid) {
-                    pcb.set_running();
+                    pcb.state = ProcessState::Running;
                     pcb.reset_time_slice();
                 }
                 drop(queue);
@@ -157,7 +167,7 @@ impl Scheduler {
         if let Some(pid) = Self::get_current() {
             let mut queue = READY_QUEUE.lock();
             if let Some(pcb) = queue.get_mut(&pid) {
-                pcb.set_ready();
+                pcb.state = ProcessState::Ready;
             }
             drop(queue);
         }
