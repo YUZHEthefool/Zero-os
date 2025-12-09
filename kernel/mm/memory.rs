@@ -1,6 +1,6 @@
 use linked_list_allocator::LockedHeap;
 use x86_64::{
-    structures::paging::PhysFrame,
+    structures::paging::{PhysFrame, Size4KiB, FrameAllocator as X64FrameAllocator},
     PhysAddr,
 };
 use crate::buddy_allocator;
@@ -66,7 +66,7 @@ impl FrameAllocator {
     pub fn deallocate_contiguous_frames(&mut self, frame: PhysFrame, count: usize) {
         buddy_allocator::free_physical_pages(frame, count);
     }
-    
+
     /// 获取内存统计信息
     pub fn stats(&self) -> MemoryStats {
         let buddy_stats = buddy_allocator::get_allocator_stats()
@@ -87,6 +87,13 @@ impl FrameAllocator {
             },
             heap_total_bytes: HEAP_SIZE,
         }
+    }
+}
+
+/// 实现 x86_64 FrameAllocator trait 以便与页表管理器配合使用
+unsafe impl X64FrameAllocator<Size4KiB> for FrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        self.allocate_frame()
     }
 }
 

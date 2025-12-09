@@ -12,9 +12,12 @@ pub use drivers::vga_buffer;
 pub mod process;
 pub mod syscall;
 pub mod fork;
+pub mod time;
 
 pub use fork::{sys_fork, ForkError, ForkResult};
+pub use time::{current_timestamp_ms, get_ticks, on_timer_tick};
 
 pub fn init() {
+    time::init();
     println!("Kernel core module initialized");
 }

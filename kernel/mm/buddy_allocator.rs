@@ -129,24 +129,46 @@ impl BuddyAllocator {
     }
     
     /// 释放内存块
-    /// 
-    /// # 参数
+    ///
+    /// # Arguments
     /// * `frame` - 要释放的物理帧
     /// * `order` - 块的阶数
+    ///
+    /// # Safety
+    /// 调用者必须确保该帧确实是之前分配的，且未被双重释放
     pub fn free_pages(&mut self, frame: PhysFrame, order: usize) {
         if order >= MAX_ORDER {
             return;
         }
-        
+
         let addr = frame.start_address();
+
+        // 验证地址在管理范围内
+        if addr < self.base_addr {
+            return;
+        }
+
         let block_idx = ((addr - self.base_addr) / PAGE_SIZE as u64) as usize;
         let pages = 1 << order;
-        
+
+        // 范围验证：确保不超出管理的内存区域
+        if block_idx + pages > self.total_pages {
+            return;
+        }
+
+        // 双重释放检测：如果任意页已标记为空闲，则拒绝释放
+        for i in 0..pages {
+            if block_idx + i < self.bitmap.len() && !self.bitmap[block_idx + i] {
+                // 页面已经是空闲状态，可能是双重释放
+                return;
+            }
+        }
+
         // 标记块为空闲
         self.mark_free(block_idx, pages);
         self.free_pages += pages;
-        
-        // 尝试与buddy合并
+
+        // 尝试与 buddy 合并
         self.merge_blocks(block_idx, order);
     }
     
@@ -271,15 +293,20 @@ pub fn init_buddy_allocator(base_addr: PhysAddr, size: usize) {
 }
 
 /// 分配物理页面
-/// 
-/// # 参数
-/// * `count` - 需要分配的页面数量
-/// 
-/// # 返回
-/// 成功返回物理帧，失败返回None
+///
+/// # Arguments
+/// * `count` - 需要分配的页面数量（必须 > 0）
+///
+/// # Returns
+/// 成功返回物理帧，失败返回 None
 pub fn alloc_physical_pages(count: usize) -> Option<PhysFrame> {
+    // 处理无效输入：count=0 时直接返回 None
+    if count == 0 {
+        return None;
+    }
+
     let order = count.next_power_of_two().trailing_zeros() as usize;
-    
+
     BUDDY_ALLOCATOR
         .lock()
         .as_mut()
