@@ -1,12 +1,19 @@
-use alloc::{vec::Vec, string::String, sync::Arc};
+use alloc::{collections::BTreeMap, vec, vec::Vec, string::String, sync::Arc};
 use spin::Mutex;
 use x86_64::VirtAddr;
+use crate::time;
 
 /// 进程ID类型
 pub type ProcessId = usize;
 
 /// 进程优先级（0-139，数值越小优先级越高）
 pub type Priority = u8;
+
+/// mmap 默认起始地址
+const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
+
+/// 调度器清理回调类型
+type SchedulerCleanupCallback = fn(ProcessId);
 
 /// 进程状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +98,13 @@ pub struct Process {
     
     /// 内存空间（页表基址）
     pub memory_space: usize,
-    
+
+    /// mmap 区域跟踪 (起始地址 -> 长度)
+    pub mmap_regions: BTreeMap<usize, usize>,
+
+    /// 下一个自动分配的 mmap 起始地址
+    pub next_mmap_addr: usize,
+
     /// 退出码
     pub exit_code: Option<i32>,
     
@@ -120,10 +133,12 @@ impl Process {
             kernel_stack: VirtAddr::new(0),
             user_stack: None,
             memory_space: 0,
+            mmap_regions: BTreeMap::new(),
+            next_mmap_addr: DEFAULT_MMAP_BASE,
             exit_code: None,
             children: Vec::new(),
             cpu_time: 0,
-            created_at: 0, // TODO: 实现时间戳
+            created_at: time::current_timestamp_ms(),
         }
     }
     
@@ -166,8 +181,12 @@ fn calculate_time_slice(priority: Priority) -> u32 {
 }
 
 /// 全局进程表
+///
+/// 使用 Option<Arc<Mutex<Process>>> 以支持 PID 作为直接索引。
+/// 索引 0 保留为空（PID 从 1 开始），实际进程存储在其 PID 对应的索引位置。
 lazy_static::lazy_static! {
-    pub static ref PROCESS_TABLE: Mutex<Vec<Arc<Mutex<Process>>>> = Mutex::new(Vec::new());
+    pub static ref PROCESS_TABLE: Mutex<Vec<Option<Arc<Mutex<Process>>>>> = Mutex::new(vec![None]); // 索引0预留
+    static ref SCHEDULER_CLEANUP: Mutex<Option<SchedulerCleanupCallback>> = Mutex::new(None);
 }
 
 /// 当前运行的进程ID
@@ -177,28 +196,42 @@ static CURRENT_PID: Mutex<Option<ProcessId>> = Mutex::new(None);
 static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
 
 /// 创建新进程
+///
+/// # Arguments
+/// * `name` - 进程名称
+/// * `ppid` - 父进程 ID（0 表示无父进程）
+/// * `priority` - 进程优先级
+///
+/// # Returns
+/// 新创建进程的 PID
 pub fn create_process(name: String, ppid: ProcessId, priority: Priority) -> ProcessId {
     let mut next_pid = NEXT_PID.lock();
     let pid = *next_pid;
     *next_pid += 1;
     drop(next_pid);
-    
-    let process = Arc::new(Mutex::new(Process::new(pid, ppid, name, priority)));
-    
+
+    let process = Arc::new(Mutex::new(Process::new(pid, ppid, name.clone(), priority)));
+
     let mut table = PROCESS_TABLE.lock();
-    
+
+    // 确保进程表有足够的空间存储新进程
+    // PID 直接作为索引使用，因此表长度需要 >= pid + 1
+    while table.len() <= pid {
+        table.push(None);
+    }
+
+    // 将新进程存储在其 PID 对应的索引位置
+    table[pid] = Some(process.clone());
+
     // 如果有父进程，将此进程添加到父进程的子进程列表
-    if ppid > 0 && ppid < table.len() {
-        if let Some(parent) = table.get(ppid) {
+    if ppid > 0 {
+        if let Some(Some(parent)) = table.get(ppid) {
             parent.lock().children.push(pid);
         }
     }
-    
-    table.push(process);
-    
-    println!("Created process: PID={}, Name={}, Priority={}", pid, 
-             table[pid].lock().name, priority);
-    
+
+    println!("Created process: PID={}, Name={}, Priority={}", pid, name, priority);
+
     pid
 }
 
@@ -213,22 +246,80 @@ pub fn set_current_pid(pid: Option<ProcessId>) {
 }
 
 /// 获取进程
+///
+/// # Arguments
+/// * `pid` - 进程 ID
+///
+/// # Returns
+/// 如果进程存在，返回进程的 Arc 引用；否则返回 None
 pub fn get_process(pid: ProcessId) -> Option<Arc<Mutex<Process>>> {
     let table = PROCESS_TABLE.lock();
-    table.get(pid).cloned()
+    table.get(pid).and_then(|slot| slot.clone())
+}
+
+/// 注册调度器的清理回调，用于在 PCB 删除时同步调度器状态
+pub fn register_cleanup_notifier(callback: SchedulerCleanupCallback) {
+    *SCHEDULER_CLEANUP.lock() = Some(callback);
+}
+
+/// 通知调度器进程已被移除
+fn notify_scheduler_process_removed(pid: ProcessId) {
+    let callback = *SCHEDULER_CLEANUP.lock();
+    if let Some(cb) = callback {
+        cb(pid);
+    }
 }
 
 /// 终止进程
 pub fn terminate_process(pid: ProcessId, exit_code: i32) {
     if let Some(process) = get_process(pid) {
-        let mut proc = process.lock();
-        proc.state = ProcessState::Zombie;
-        proc.exit_code = Some(exit_code);
-        
+        let children_to_reparent: Vec<ProcessId>;
+
+        {
+            let mut proc = process.lock();
+            proc.state = ProcessState::Zombie;
+            proc.exit_code = Some(exit_code);
+            children_to_reparent = proc.children.clone();
+            proc.children.clear();
+        }
+
         println!("Process {} terminated with exit code {}", pid, exit_code);
-        
+
+        // 将孤儿进程重新分配给 init 进程 (PID 1)
+        if !children_to_reparent.is_empty() {
+            reparent_orphans(&children_to_reparent);
+        }
+
         // TODO: 唤醒等待此进程的父进程
-        // TODO: 将孤儿进程重新分配给init进程
+    }
+}
+
+/// 将孤儿进程重新分配给 init 进程 (PID 1)
+fn reparent_orphans(orphans: &[ProcessId]) {
+    const INIT_PID: ProcessId = 1;
+
+    // 获取 init 进程
+    if let Some(init_process) = get_process(INIT_PID) {
+        let mut init_proc = init_process.lock();
+
+        for &child_pid in orphans {
+            // 更新子进程的 ppid
+            if let Some(child_process) = get_process(child_pid) {
+                let mut child = child_process.lock();
+                child.ppid = INIT_PID;
+            }
+
+            // 将子进程添加到 init 的 children 列表
+            if !init_proc.children.contains(&child_pid) {
+                init_proc.children.push(child_pid);
+            }
+        }
+
+        if !orphans.is_empty() {
+            println!("Reparented {} orphan process(es) to init (PID 1)", orphans.len());
+        }
+    } else {
+        // init 进程不存在（早期启动阶段），静默忽略
     }
 }
 
@@ -244,13 +335,35 @@ pub fn wait_process(pid: ProcessId) -> Option<i32> {
 }
 
 /// 清理僵尸进程
+///
+/// 完全移除进程：
+/// 1. 从 PROCESS_TABLE 中移除
+/// 2. 通知调度器移除该进程
 pub fn cleanup_zombie(pid: ProcessId) {
-    if let Some(process) = get_process(pid) {
-        let mut proc = process.lock();
-        if proc.state == ProcessState::Zombie {
-            proc.state = ProcessState::Terminated;
-            println!("Cleaned up zombie process {}", pid);
+    let removed = {
+        let mut table = PROCESS_TABLE.lock();
+        if let Some(slot) = table.get_mut(pid) {
+            if let Some(process) = slot {
+                let mut proc = process.lock();
+                if proc.state == ProcessState::Zombie {
+                    proc.state = ProcessState::Terminated;
+                    drop(proc);
+                    *slot = None;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
         }
+    };
+
+    if removed {
+        notify_scheduler_process_removed(pid);
+        println!("Cleaned up zombie process {}", pid);
     }
 }
 
@@ -258,21 +371,23 @@ pub fn cleanup_zombie(pid: ProcessId) {
 pub fn get_process_stats() -> ProcessStats {
     let table = PROCESS_TABLE.lock();
     let mut stats = ProcessStats::default();
-    
-    stats.total = table.len();
-    
-    for process in table.iter() {
-        let proc = process.lock();
-        match proc.state {
-            ProcessState::Ready => stats.ready += 1,
-            ProcessState::Running => stats.running += 1,
-            ProcessState::Blocked => stats.blocked += 1,
-            ProcessState::Sleeping => stats.sleeping += 1,
-            ProcessState::Zombie => stats.zombie += 1,
-            ProcessState::Terminated => stats.terminated += 1,
+
+    // 遍历进程表，跳过 None 值
+    for slot in table.iter() {
+        if let Some(process) = slot {
+            stats.total += 1;
+            let proc = process.lock();
+            match proc.state {
+                ProcessState::Ready => stats.ready += 1,
+                ProcessState::Running => stats.running += 1,
+                ProcessState::Blocked => stats.blocked += 1,
+                ProcessState::Sleeping => stats.sleeping += 1,
+                ProcessState::Zombie => stats.zombie += 1,
+                ProcessState::Terminated => stats.terminated += 1,
+            }
         }
     }
-    
+
     stats
 }
 

@@ -14,6 +14,21 @@ use uefi::Identify;
 use xmas_elf::program::Type;
 use xmas_elf::ElfFile;
 
+/// 内存映射信息，传递给内核
+#[repr(C)]
+pub struct MemoryMapInfo {
+    pub buffer: u64,           // 内存映射缓冲区地址
+    pub size: usize,           // 缓冲区大小
+    pub descriptor_size: usize, // 每个描述符的大小
+    pub descriptor_version: u32, // 描述符版本
+}
+
+/// 引导信息结构，传递给内核
+#[repr(C)]
+pub struct BootInfo {
+    pub memory_map: MemoryMapInfo,
+}
+
 #[entry]
 fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     uefi::helpers::init(&mut system_table).unwrap();
@@ -62,12 +77,23 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
         let mut kernel_data = Vec::with_capacity(file_size);
         kernel_data.resize(file_size, 0);
-        
-        let read_size = kernel_file
-            .read(&mut kernel_data)
-            .expect("Failed to read kernel file");
-        
-        info!("Kernel size: {} bytes", read_size);
+
+        // 循环读取直到完整读取整个文件
+        let mut total_read = 0usize;
+        while total_read < file_size {
+            let read_size = kernel_file
+                .read(&mut kernel_data[total_read..])
+                .expect("Failed to read kernel file");
+
+            if read_size == 0 {
+                // 读取返回0但文件未读完，说明发生了截断
+                panic!("Kernel file read truncated: expected {} bytes, got {} bytes",
+                       file_size, total_read);
+            }
+            total_read += read_size;
+        }
+
+        info!("Kernel loaded: {} bytes", total_read);
 
         info!("Parsing ELF...");
         let elf = ElfFile::new(&kernel_data).expect("Failed to parse ELF file");
@@ -104,23 +130,22 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         info!("Allocating {} pages ({} bytes) for kernel at 0x{:x}", pages, kernel_size, kernel_phys_base);
         
         // 尝试在指定地址分配整块内存
+        // 注意：页表映射硬编码依赖内核在 0x100000，因此必须在此地址分配成功
         let result = boot_services.allocate_pages(
             AllocateType::Address(kernel_phys_base),
             MemoryType::LOADER_DATA,
             pages,
         );
-        
-        let actual_phys_base = if result.is_err() {
-            info!("Failed to allocate at 0x{:x}, allocating at any address", kernel_phys_base);
-            boot_services.allocate_pages(
-                AllocateType::AnyPages,
-                MemoryType::LOADER_DATA,
-                pages,
-            ).expect("Failed to allocate memory for kernel")
-        } else {
-            kernel_phys_base
-        };
-        
+
+        if result.is_err() {
+            panic!("FATAL: Cannot allocate kernel memory at required address 0x{:x}. \
+                    Page table mappings require kernel at this fixed address. \
+                    Ensure no UEFI runtime or reserved regions overlap.", kernel_phys_base);
+        }
+
+        // 使用固定的物理基址（页表映射依赖此值）
+        let actual_phys_base = kernel_phys_base;
+
         info!("Kernel memory allocated at 0x{:x}", actual_phys_base);
         
         // 清零整块内存
@@ -186,7 +211,16 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     }
     
     info!("Automatically jumping to kernel...");
-    
+
+    // 分配 BootInfo 结构的内存（在低于 4GiB 的位置，便于恒等映射访问）
+    let boot_info_ptr = {
+        let boot_services = system_table.boot_services();
+        let boot_info_page = boot_services
+            .allocate_pages(AllocateType::MaxAddress(0xFFFF_FFFF), MemoryType::LOADER_DATA, 1)
+            .expect("Failed to allocate boot info page");
+        boot_info_page as *mut BootInfo
+    };
+
     // 构建四级页表结构，将物理内核地址映射到高半区虚拟地址
     let (pml4_frame, entry_point_to_jump) = unsafe {
         // 最早的 VGA 写入 - 在任何其他操作之前
@@ -286,11 +320,64 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         
         (pml4_frame, entry_point)
     };
-    
-    // CR3 切换后，直接写 VGA
+
+    // 预先分配一块低地址缓冲区，用于在退出后保存内存映射副本，确保恒等映射可访问
+    // 64 页（256 KiB）足以容纳常见的内存映射
+    let (memory_map_copy_ptr, memory_map_copy_len) = {
+        let pages = 64usize;
+        let addr = system_table
+            .boot_services()
+            .allocate_pages(
+                AllocateType::MaxAddress(0xFFFF_FFFF),
+                MemoryType::LOADER_DATA,
+                pages,
+            )
+            .expect("Failed to allocate low memory map copy buffer");
+        (addr as *mut u8, pages * 0x1000)
+    };
+
+    // 退出 UEFI 引导服务，获取最终的内存映射
+    // 这必须在页表设置之后、跳转之前完成
+    let memory_map = unsafe {
+        let (_runtime_system_table, memory_map) = system_table
+            .exit_boot_services(MemoryType::LOADER_DATA);
+        memory_map
+    };
+
+    // 将内存映射信息填充到 BootInfo 结构中
+    // 需要将内存映射复制到低于4GiB的缓冲区，因为原始映射可能在高地址
+    unsafe {
+        let (memory_map_bytes, memory_map_meta) = memory_map.as_raw();
+
+        // 确保预分配的缓冲区足够大
+        assert!(
+            memory_map_meta.map_size <= memory_map_copy_len,
+            "Memory map larger than reserved copy buffer"
+        );
+
+        // 复制内存映射到低地址缓冲区
+        core::ptr::copy_nonoverlapping(
+            memory_map_bytes.as_ptr(),
+            memory_map_copy_ptr,
+            memory_map_meta.map_size,
+        );
+
+        *boot_info_ptr = BootInfo {
+            memory_map: MemoryMapInfo {
+                buffer: memory_map_copy_ptr as u64,
+                size: memory_map_meta.map_size,
+                descriptor_size: memory_map_meta.desc_size,
+                descriptor_version: memory_map_meta.desc_version,
+            },
+        };
+        // 阻止 memory_map 被释放，因为内核需要访问它
+        core::mem::forget(memory_map);
+    }
+
+    // CR3 切换后，直接写 VGA（exit_boot_services 后可能无法使用 UEFI 打印）
     unsafe {
         let vga = 0xb8000 as *mut u8;
-        let msg = b"JUMP->";
+        let msg = b"EXIT->";
         for (i, &byte) in msg.iter().enumerate() {
             *vga.offset(80 * 24 * 2 + (i + 6) as isize * 2) = byte;
             *vga.offset(80 * 24 * 2 + (i + 6) as isize * 2 + 1) = 0x0E;
@@ -298,9 +385,12 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     }
 
     // 跳转到内核入口点 - 使用内联汇编确保正确跳转
+    // 通过 rdi 传递 BootInfo 指针（System V AMD64 ABI 第一个参数）
     unsafe {
         core::arch::asm!(
+            "mov rdi, {boot_info}",
             "jmp {entry}",
+            boot_info = in(reg) boot_info_ptr as u64,
             entry = in(reg) entry_point_to_jump,
             options(noreturn)
         );

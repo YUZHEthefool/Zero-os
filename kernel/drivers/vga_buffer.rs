@@ -138,21 +138,47 @@ macro_rules! println {
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
 }
 
+// 串口端口地址
+const SERIAL_PORT: u16 = 0x3F8;
+
+/// 向串口写入一个字节
+unsafe fn serial_outb(port: u16, val: u8) {
+    core::arch::asm!(
+        "out dx, al",
+        in("dx") port,
+        in("al") val,
+    );
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
+
+    // 同时输出到VGA和串口
     WRITER.lock().write_fmt(args).unwrap();
+
+    // 将格式化后的文本也发送到串口，便于在-nographic模式下查看
+    struct SerialWriter;
+    impl Write for SerialWriter {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            for byte in s.bytes() {
+                unsafe { serial_outb(SERIAL_PORT, byte); }
+            }
+            Ok(())
+        }
+    }
+    SerialWriter.write_fmt(args).unwrap();
 }
 
 pub fn init() {
-   clear_screen();
+    clear_screen();
 }
 
 pub fn clear_screen() {
-   WRITER.lock().clear_row(0);
-   for row in 1..BUFFER_HEIGHT {
-       WRITER.lock().clear_row(row);
-   }
+    WRITER.lock().clear_row(0);
+    for row in 1..BUFFER_HEIGHT {
+        WRITER.lock().clear_row(row);
+    }
 }
 
 pub fn write_str(s: &str) {

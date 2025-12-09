@@ -53,10 +53,10 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         serial_write_str("Kernel _start entered\n");
     }
-    
+
     // 初始化VGA驱动
     drivers::vga_buffer::init();
-    
+
     println!("==============================");
     println!("  Zero-OS Microkernel v0.1");
     println!("==============================");
@@ -71,6 +71,13 @@ pub extern "C" fn _start() -> ! {
     println!("[2/3] Initializing memory management...");
     mm::memory::init();
     println!("      ✓ Heap and Buddy allocator ready");
+
+    // 初始化页表管理器
+    // Bootloader 创建了恒等映射（物理地址 == 虚拟地址），所以物理偏移量为 0
+    unsafe {
+        mm::page_table::init(x86_64::VirtAddr::new(0));
+    }
+    println!("      ✓ Page table manager initialized");
     
     // 阶段3：测试基础功能
     println!("[3/3] Running basic tests...");
@@ -139,7 +146,13 @@ pub extern "C" fn _start() -> ! {
     println!();
     println!("进入空闲循环...");
     println!();
-    
+
+    // 启用中断（IDT 已初始化完成）
+    // 注意：在启用中断前，确保所有中断处理程序已正确设置
+    unsafe {
+        core::arch::asm!("sti", options(nomem, nostack));
+    }
+
     // 主内核循环
     loop {
         unsafe {
@@ -159,9 +172,11 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     unsafe {
+        // 立即禁用中断，防止 panic 期间中断重入
+        core::arch::asm!("cli", options(nomem, nostack));
+
         serial_write_str("KERNEL PANIC: ");
         if let Some(location) = info.location() {
-            // 简单地输出位置信息
             serial_write_str(location.file());
         }
         serial_write_str("\n");

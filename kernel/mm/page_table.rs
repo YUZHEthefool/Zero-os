@@ -16,6 +16,25 @@ pub struct PageTableManager {
     mapper: OffsetPageTable<'static>,
 }
 
+/// 基于当前活动的 CR3 构建临时页表管理器
+///
+/// 此函数在每次调用时从当前 CR3 读取页表根地址，确保始终操作正确的地址空间。
+/// 这对于 COW 故障处理和 mmap/munmap 在多进程环境下正确工作至关重要。
+///
+/// # Safety
+///
+/// 调用者必须提供正确的物理内存偏移量。
+/// 在回调函数执行期间，不得发生导致 CR3 切换的上下文切换。
+pub unsafe fn with_current_manager<T, F>(physical_memory_offset: VirtAddr, f: F) -> T
+where
+    F: FnOnce(&mut PageTableManager) -> T,
+{
+    let level_4_table = active_level_4_table(physical_memory_offset);
+    let mapper = OffsetPageTable::new(level_4_table, physical_memory_offset);
+    let mut manager = PageTableManager { mapper };
+    f(&mut manager)
+}
+
 impl PageTableManager {
     /// 创建新的页表管理器
     /// 

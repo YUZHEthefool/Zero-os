@@ -1,9 +1,7 @@
 //! 系统调用接口
-//! 
+//!
 //! 实现类POSIX系统调用，提供用户程序与内核交互的接口
 
-use alloc::string::String;
-use alloc::vec::Vec;
 use crate::process::{ProcessId, terminate_process, create_process, current_pid, get_process};
 
 /// 系统调用号定义（参考Linux系统调用表）
@@ -86,6 +84,63 @@ impl SyscallError {
 /// 系统调用结果类型
 pub type SyscallResult = Result<usize, SyscallError>;
 
+/// 用户空间地址上界
+///
+/// x86_64 规范地址空间中，用户空间使用低半区（0x0000_0000_0000_0000 - 0x0000_7FFF_FFFF_FFFF）
+/// 内核空间使用高半区（0xFFFF_8000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF）
+const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
+
+// mmap 跟踪已移至 Process 结构体的 mmap_regions 和 next_mmap_addr 字段
+
+/// 验证用户空间指针
+///
+/// 检查指针是否：
+/// 1. 非空
+/// 2. 长度有效（非零）
+/// 3. 地址范围在用户空间内（不会访问内核内存）
+/// 4. 不会发生地址回绕
+///
+/// # Arguments
+/// * `ptr` - 用户提供的指针
+/// * `len` - 要访问的字节数
+///
+/// # Returns
+/// 如果指针有效返回 Ok(()), 否则返回 EFAULT 错误
+fn validate_user_ptr(ptr: *const u8, len: usize) -> Result<(), SyscallError> {
+    // 空指针检查
+    if ptr.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // 零长度检查
+    if len == 0 {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let start = ptr as usize;
+
+    // 地址回绕检查
+    let end = match start.checked_add(len) {
+        Some(e) => e,
+        None => return Err(SyscallError::EFAULT),
+    };
+
+    // 用户空间边界检查：确保整个缓冲区都在用户空间内
+    if end > USER_SPACE_TOP {
+        return Err(SyscallError::EFAULT);
+    }
+
+    Ok(())
+}
+
+/// 验证用户空间可写指针
+///
+/// 与 validate_user_ptr 相同的检查，用于写入操作
+#[inline]
+fn validate_user_ptr_mut(ptr: *mut u8, len: usize) -> Result<(), SyscallError> {
+    validate_user_ptr(ptr as *const u8, len)
+}
+
 /// 初始化系统调用处理器
 pub fn init() {
     println!("Syscall handler initialized");
@@ -154,17 +209,13 @@ fn sys_exit(exit_code: i32) -> SyscallResult {
 
 /// sys_fork - 创建子进程
 fn sys_fork() -> SyscallResult {
-    if let Some(parent_pid) = current_pid() {
-        // 创建子进程（简化版本，实际需要复制父进程的地址空间）
-        let child_pid = create_process("child".into(), parent_pid, 100);
-        
-        println!("Fork: parent={}, child={}", parent_pid, child_pid);
-        
-        // 父进程返回子进程PID，子进程返回0
-        // 这里简化处理，只返回子进程PID
-        Ok(child_pid)
-    } else {
-        Err(SyscallError::ESRCH)
+    if current_pid().is_none() {
+        return Err(SyscallError::ESRCH);
+    }
+    // 调用真正的 fork 实现（包含 COW 支持）
+    match crate::fork::sys_fork() {
+        Ok(child_pid) => Ok(child_pid),
+        Err(_) => Err(SyscallError::ENOMEM),
     }
 }
 
@@ -218,23 +269,21 @@ fn sys_kill(_pid: ProcessId, _sig: i32) -> SyscallResult {
 
 /// sys_read - 从文件描述符读取数据
 fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
-    if buf.is_null() {
-        return Err(SyscallError::EFAULT);
-    }
-    
+    // 验证用户缓冲区
+    validate_user_ptr_mut(buf, count)?;
+
     // TODO: 实现实际的文件读取
     println!("sys_read: fd={}, count={}", fd, count);
-    
+
     // 简化实现：返回0表示EOF
     Ok(0)
 }
 
 /// sys_write - 向文件描述符写入数据
 fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
-    if buf.is_null() {
-        return Err(SyscallError::EFAULT);
-    }
-    
+    // 验证用户缓冲区
+    validate_user_ptr(buf, count)?;
+
     // 简化实现：只支持stdout(1)和stderr(2)
     if fd == 1 || fd == 2 {
         unsafe {
@@ -278,87 +327,196 @@ fn sys_brk(_addr: usize) -> SyscallResult {
 }
 
 /// sys_mmap - 内存映射
+///
+/// 使用当前进程的地址空间进行映射，确保进程隔离
 fn sys_mmap(
     addr: usize,
     length: usize,
     prot: i32,
-    flags: i32,
+    _flags: i32,
     fd: i32,
-    offset: i64,
+    _offset: i64,
 ) -> SyscallResult {
-    use x86_64::{VirtAddr, PhysAddr};
-    use x86_64::structures::paging::{PageTableFlags, Page, PhysFrame, Size4KiB};
-    
+    use x86_64::VirtAddr;
+    use x86_64::structures::paging::{PageTableFlags, Page};
+    use mm::memory::FrameAllocator;
+    use mm::page_table::with_current_manager;
+
+    // 获取当前进程
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
     // 验证参数
     if length == 0 {
         return Err(SyscallError::EINVAL);
     }
-    
+
+    // 文件映射暂不支持
+    if fd >= 0 {
+        return Err(SyscallError::ENOSYS);
+    }
+
     // 对齐到页边界
     let length_aligned = (length + 0xfff) & !0xfff;
-    
+
     // 构建页表标志
     let mut page_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-    
+
     // PROT_WRITE
     if prot & 0x2 != 0 {
         page_flags |= PageTableFlags::WRITABLE;
     }
-    
+
     // PROT_EXEC (x86_64使用NX位表示不可执行)
     if prot & 0x4 == 0 {
         page_flags |= PageTableFlags::NO_EXECUTE;
     }
-    
-    println!("sys_mmap: addr=0x{:x}, len=0x{:x}, prot=0x{:x}, flags=0x{:x}",
-             addr, length_aligned, prot, flags);
-    
-    // 简化实现：分配物理内存并映射
-    // 在实际实现中，需要：
-    // 1. 查找可用的虚拟地址空间
-    // 2. 分配物理页帧
-    // 3. 建立映射关系
-    // 4. 如果是文件映射，还需要从文件读取数据
-    
-    if fd >= 0 {
-        // 文件映射暂不支持
-        return Err(SyscallError::ENOSYS);
-    }
-    
-    // 匿名映射：分配新的虚拟地址空间
-    // 这里简化处理，实际需要维护进程的虚拟地址空间管理器
-    let virt_addr = if addr == 0 {
-        // 内核分配地址（简化：使用固定范围）
-        0x40000000usize
-    } else {
-        addr
+
+    // 从进程 PCB 中选择地址并检查重叠
+    let (base, end, update_next) = {
+        let proc = process.lock();
+
+        // 选择起始虚拟地址
+        let chosen_base = if addr == 0 {
+            (proc.next_mmap_addr + 0xfff) & !0xfff
+        } else {
+            addr
+        };
+
+        // 检查地址对齐
+        if chosen_base & 0xfff != 0 {
+            return Err(SyscallError::EINVAL);
+        }
+
+        // 计算结束地址并检查用户空间边界
+        let end = chosen_base
+            .checked_add(length_aligned)
+            .ok_or(SyscallError::EFAULT)?;
+
+        if end > USER_SPACE_TOP {
+            return Err(SyscallError::EFAULT);
+        }
+
+        // 检查与现有映射的重叠
+        for (&region_base, &region_len) in proc.mmap_regions.iter() {
+            let region_end = region_base
+                .checked_add(region_len)
+                .ok_or(SyscallError::EFAULT)?;
+            if chosen_base < region_end && end > region_base {
+                return Err(SyscallError::EINVAL);
+            }
+        }
+
+        (chosen_base, end, addr == 0)
     };
-    
-    println!("  Mapped at virtual address: 0x{:x}", virt_addr);
-    
-    // TODO: 实际建立页表映射
-    // 需要调用页表管理器的map_range函数
-    
-    Ok(virt_addr)
+
+    // 使用基于当前 CR3 的页表管理器进行映射
+    let map_result: Result<(), SyscallError> = unsafe {
+        with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
+            let mut frame_alloc = FrameAllocator::new();
+
+            for offset in (0..length_aligned).step_by(0x1000) {
+                let page = Page::containing_address(VirtAddr::new((base + offset) as u64));
+                let frame = frame_alloc.allocate_frame().ok_or(SyscallError::ENOMEM)?;
+
+                // 安全：清零新分配的帧，防止泄漏其他进程的数据
+                core::ptr::write_bytes(frame.start_address().as_u64() as *mut u8, 0, 0x1000);
+
+                if let Err(_) = manager.map_page(page, frame, page_flags, &mut frame_alloc) {
+                    // 映射失败，清理已分配的页
+                    for cleanup_offset in (0..offset).step_by(0x1000) {
+                        let cleanup_page = Page::containing_address(VirtAddr::new((base + cleanup_offset) as u64));
+                        if let Ok(cleanup_frame) = manager.unmap_page(cleanup_page) {
+                            frame_alloc.deallocate_frame(cleanup_frame);
+                        }
+                    }
+                    return Err(SyscallError::ENOMEM);
+                }
+            }
+
+            Ok(())
+        })
+    };
+
+    map_result?;
+
+    // 记录映射到进程 PCB
+    {
+        let mut proc = process.lock();
+        proc.mmap_regions.insert(base, length_aligned);
+        if update_next {
+            proc.next_mmap_addr = end;
+        } else if proc.next_mmap_addr < end {
+            proc.next_mmap_addr = end;
+        }
+    }
+
+    println!("sys_mmap: pid={}, mapped {} bytes at 0x{:x}", pid, length_aligned, base);
+
+    Ok(base)
 }
 
 /// sys_munmap - 取消内存映射
+///
+/// 使用当前进程的地址空间进行取消映射，确保进程隔离
 fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
+    use x86_64::VirtAddr;
+    use x86_64::structures::paging::Page;
+    use mm::memory::FrameAllocator;
+    use mm::page_table::with_current_manager;
+
+    // 验证参数
     if addr & 0xfff != 0 {
         return Err(SyscallError::EINVAL);
     }
-    
+
     if length == 0 {
         return Err(SyscallError::EINVAL);
     }
-    
+
+    // 获取当前进程
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
     let length_aligned = (length + 0xfff) & !0xfff;
-    
-    println!("sys_munmap: addr=0x{:x}, len=0x{:x}", addr, length_aligned);
-    
-    // TODO: 实际取消页表映射并释放物理内存
-    // 需要调用页表管理器的unmap_range函数
-    
+
+    // 检查该区域是否在进程的 mmap 记录中
+    let recorded_length = {
+        let proc = process.lock();
+        *proc.mmap_regions.get(&addr).ok_or(SyscallError::EINVAL)?
+    };
+
+    // 验证长度匹配
+    if recorded_length != length_aligned {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // 使用基于当前 CR3 的页表管理器进行取消映射
+    let unmap_result: Result<(), SyscallError> = unsafe {
+        with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
+            let mut frame_alloc = FrameAllocator::new();
+
+            // 取消映射并释放物理帧
+            for offset in (0..length_aligned).step_by(0x1000) {
+                let page = Page::containing_address(VirtAddr::new((addr + offset) as u64));
+                if let Ok(frame) = manager.unmap_page(page) {
+                    frame_alloc.deallocate_frame(frame);
+                }
+            }
+
+            Ok(())
+        })
+    };
+
+    unmap_result?;
+
+    // 从进程 PCB 中移除映射记录
+    {
+        let mut proc = process.lock();
+        proc.mmap_regions.remove(&addr);
+    }
+
+    println!("sys_munmap: pid={}, unmapped {} bytes at 0x{:x}", pid, length_aligned, addr);
+
     Ok(0)
 }
 
