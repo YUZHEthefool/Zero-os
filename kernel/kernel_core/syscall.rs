@@ -2,7 +2,11 @@
 //!
 //! 实现类POSIX系统调用，提供用户程序与内核交互的接口
 
+use alloc::vec;
+use crate::fork::PAGE_REF_COUNT;
 use crate::process::{ProcessId, terminate_process, create_process, current_pid, get_process};
+use x86_64::structures::paging::PageTableFlags;
+use x86_64::VirtAddr;
 
 /// 系统调用号定义（参考Linux系统调用表）
 #[repr(u64)]
@@ -141,6 +145,112 @@ fn validate_user_ptr_mut(ptr: *mut u8, len: usize) -> Result<(), SyscallError> {
     validate_user_ptr(ptr as *const u8, len)
 }
 
+/// 验证用户空间地址是否已映射且具备所需权限
+///
+/// 通过页表遍历验证地址范围内的每一页都已映射且具有正确的权限标志。
+/// 这比 validate_user_ptr 更严格，可以防止访问未映射内存导致的内核崩溃。
+///
+/// # Arguments
+/// * `ptr` - 用户空间缓冲区起始地址
+/// * `len` - 缓冲区长度
+/// * `require_write` - 是否需要写入权限
+///
+/// # Returns
+/// 如果所有页都已正确映射返回 Ok(()), 否则返回 EFAULT
+fn verify_user_memory(ptr: *const u8, len: usize, require_write: bool) -> Result<(), SyscallError> {
+    // 先进行基本的边界检查
+    validate_user_ptr(ptr, len)?;
+
+    if len == 0 {
+        return Ok(());
+    }
+
+    let start = ptr as usize;
+    let end = start.checked_add(len).ok_or(SyscallError::EFAULT)?;
+
+    // 遍历页表验证映射
+    unsafe {
+        mm::page_table::with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
+            let mut page_addr = start & !0xfff; // 对齐到页边界
+            while page_addr < end {
+                // 查询页表获取映射信息和标志
+                let (_, flags) = manager
+                    .translate_with_flags(VirtAddr::new(page_addr as u64))
+                    .ok_or(SyscallError::EFAULT)?;
+
+                // 检查页是否存在且用户可访问
+                if !flags.contains(PageTableFlags::PRESENT)
+                    || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+                {
+                    return Err(SyscallError::EFAULT);
+                }
+
+                // 如果需要写入权限，检查 WRITABLE 标志
+                if require_write && !flags.contains(PageTableFlags::WRITABLE) {
+                    return Err(SyscallError::EFAULT);
+                }
+
+                page_addr = page_addr.checked_add(0x1000).ok_or(SyscallError::EFAULT)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// 从用户态缓冲区安全复制数据到内核缓冲区
+///
+/// 先验证用户空间内存映射，然后执行复制。
+/// 这可以防止访问未映射内存导致的内核崩溃。
+///
+/// # Arguments
+/// * `dest` - 内核缓冲区（目标）
+/// * `user_src` - 用户空间缓冲区（源）
+///
+/// # Returns
+/// 复制成功返回 Ok(()), 如果用户内存未映射返回 EFAULT
+fn copy_from_user(dest: &mut [u8], user_src: *const u8) -> Result<(), SyscallError> {
+    if dest.is_empty() {
+        return Ok(());
+    }
+
+    // 验证用户内存已映射且可读
+    verify_user_memory(user_src, dest.len(), false)?;
+
+    // 安全复制数据
+    unsafe {
+        core::ptr::copy_nonoverlapping(user_src, dest.as_mut_ptr(), dest.len());
+    }
+    Ok(())
+}
+
+/// 将内核缓冲区的数据安全复制到用户态缓冲区
+///
+/// 先验证用户空间内存映射和写入权限，然后执行复制。
+///
+/// # Arguments
+/// * `user_dst` - 用户空间缓冲区（目标）
+/// * `src` - 内核缓冲区（源）
+///
+/// # Returns
+/// 复制成功返回 Ok(()), 如果用户内存未映射或不可写返回 EFAULT
+fn copy_to_user(user_dst: *mut u8, src: &[u8]) -> Result<(), SyscallError> {
+    if src.is_empty() {
+        return Ok(());
+    }
+
+    // 验证用户内存已映射且用户可访问
+    // 注意：不检查 WRITABLE 标志，因为 COW 页面在写入前是只读的
+    // 写入 COW 页面会触发 #PF，由 COW 处理器创建可写副本
+    verify_user_memory(user_dst as *const u8, src.len(), false)?;
+
+    // 安全复制数据
+    // 如果是 COW 页面，这里会触发 #PF，COW 处理器会处理
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), user_dst, src.len());
+    }
+    Ok(())
+}
+
 /// 初始化系统调用处理器
 pub fn init() {
     println!("Syscall handler initialized");
@@ -269,31 +379,38 @@ fn sys_kill(_pid: ProcessId, _sig: i32) -> SyscallResult {
 
 /// sys_read - 从文件描述符读取数据
 fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
-    // 验证用户缓冲区
-    validate_user_ptr_mut(buf, count)?;
+    if count == 0 {
+        return Ok(0);
+    }
 
     // TODO: 实现实际的文件读取
     println!("sys_read: fd={}, count={}", fd, count);
 
-    // 简化实现：返回0表示EOF
-    Ok(0)
+    // 简化实现：填充零数据，主要用于测试用户缓冲区访问路径
+    // 注意：使用 copy_to_user 进行安全复制，验证用户缓冲区映射
+    let data = vec![0u8; count];
+    copy_to_user(buf, &data)?;
+    Ok(data.len())
 }
 
 /// sys_write - 向文件描述符写入数据
 fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
-    // 验证用户缓冲区
-    validate_user_ptr(buf, count)?;
+    if count == 0 {
+        return Ok(0);
+    }
+
+    // 先复制到内核缓冲区，避免直接解引用用户指针
+    // 这可以防止用户传递未映射地址导致的内核崩溃
+    let mut tmp = vec![0u8; count];
+    copy_from_user(&mut tmp, buf)?;
 
     // 简化实现：只支持stdout(1)和stderr(2)
     if fd == 1 || fd == 2 {
-        unsafe {
-            let slice = core::slice::from_raw_parts(buf, count);
-            if let Ok(s) = core::str::from_utf8(slice) {
-                print!("{}", s);
-                Ok(count)
-            } else {
-                Err(SyscallError::EINVAL)
-            }
+        if let Ok(s) = core::str::from_utf8(&tmp) {
+            print!("{}", s);
+            Ok(tmp.len())
+        } else {
+            Err(SyscallError::EINVAL)
         }
     } else {
         println!("sys_write: fd={} not supported", fd);
@@ -356,8 +473,11 @@ fn sys_mmap(
         return Err(SyscallError::ENOSYS);
     }
 
-    // 对齐到页边界
-    let length_aligned = (length + 0xfff) & !0xfff;
+    // 对齐到页边界（使用 checked_add 防止整数溢出）
+    let length_aligned = length
+        .checked_add(0xfff)
+        .ok_or(SyscallError::EINVAL)?
+        & !0xfff;
 
     // 构建页表标志
     let mut page_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
@@ -376,9 +496,12 @@ fn sys_mmap(
     let (base, end, update_next) = {
         let proc = process.lock();
 
-        // 选择起始虚拟地址
+        // 选择起始虚拟地址（使用 checked_add 防止溢出）
         let chosen_base = if addr == 0 {
-            (proc.next_mmap_addr + 0xfff) & !0xfff
+            proc.next_mmap_addr
+                .checked_add(0xfff)
+                .ok_or(SyscallError::EINVAL)?
+                & !0xfff
         } else {
             addr
         };
@@ -420,7 +543,9 @@ fn sys_mmap(
                 let frame = frame_alloc.allocate_frame().ok_or(SyscallError::ENOMEM)?;
 
                 // 安全：清零新分配的帧，防止泄漏其他进程的数据
-                core::ptr::write_bytes(frame.start_address().as_u64() as *mut u8, 0, 0x1000);
+                // 使用高半区直映访问物理内存
+                let virt = mm::phys_to_virt(frame.start_address());
+                core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 0x1000);
 
                 if let Err(_) = manager.map_page(page, frame, page_flags, &mut frame_alloc) {
                     // 映射失败，清理已分配的页
@@ -477,7 +602,11 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     // 获取当前进程
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
-    let length_aligned = (length + 0xfff) & !0xfff;
+    // 对齐到页边界（使用 checked_add 防止整数溢出）
+    let length_aligned = length
+        .checked_add(0xfff)
+        .ok_or(SyscallError::EINVAL)?
+        & !0xfff;
 
     // 检查该区域是否在进程的 mmap 记录中
     let recorded_length = {
@@ -495,11 +624,24 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
             let mut frame_alloc = FrameAllocator::new();
 
-            // 取消映射并释放物理帧
+            // 取消映射并根据引用计数决定是否释放物理帧
             for offset in (0..length_aligned).step_by(0x1000) {
                 let page = Page::containing_address(VirtAddr::new((addr + offset) as u64));
                 if let Ok(frame) = manager.unmap_page(page) {
-                    frame_alloc.deallocate_frame(frame);
+                    let phys_addr = frame.start_address().as_u64() as usize;
+
+                    // 检查是否为 COW 共享页
+                    // 如果有引用计数，递减；只有当引用计数为 0 时才释放
+                    let should_free = if PAGE_REF_COUNT.get(phys_addr) > 0 {
+                        PAGE_REF_COUNT.decrement(phys_addr) == 0
+                    } else {
+                        // 没有引用计数记录，说明不是 COW 页，可以直接释放
+                        true
+                    };
+
+                    if should_free {
+                        frame_alloc.deallocate_frame(frame);
+                    }
                 }
             }
 

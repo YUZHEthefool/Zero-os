@@ -3,9 +3,13 @@
 //! 实现多级反馈队列调度和时钟中断集成
 //!
 //! 使用 Arc<Mutex<Process>> 共享引用与 PROCESS_TABLE 同步状态
+//!
+//! 就绪队列使用优先级分桶：BTreeMap<Priority, BTreeMap<Pid, PCB>>
+//! - 外层按优先级排序（数值越小优先级越高）
+//! - 内层按 PID 排序实现同优先级的 FIFO
 
 use alloc::{collections::BTreeMap, sync::Arc};
-use kernel_core::process::{self, Process, ProcessId, ProcessState};
+use kernel_core::process::{self, Process, ProcessId, ProcessState, Priority};
 use spin::Mutex;
 use lazy_static::lazy_static;
 
@@ -13,9 +17,16 @@ use lazy_static::lazy_static;
 pub type Pid = ProcessId;
 pub type ProcessControlBlock = Arc<Mutex<Process>>;
 
-/// 全局就绪队列 - 按优先级维护就绪进程的 Arc 引用
+/// 优先级分桶的就绪队列类型
+///
+/// 结构: Priority -> (Pid -> ProcessControlBlock)
+/// - 按优先级从低到高排序（优先级数值越小越优先）
+/// - 同优先级内按 PID 先入先出
+type ReadyQueues = BTreeMap<Priority, BTreeMap<Pid, ProcessControlBlock>>;
+
+/// 全局就绪队列 - 按优先级分桶维护就绪进程
 lazy_static! {
-    pub static ref READY_QUEUE: Mutex<BTreeMap<Pid, ProcessControlBlock>> = Mutex::new(BTreeMap::new());
+    pub static ref READY_QUEUE: Mutex<ReadyQueues> = Mutex::new(BTreeMap::new());
     pub static ref CURRENT_PROCESS: Mutex<Option<Pid>> = Mutex::new(None);
     pub static ref SCHEDULER_STATS: Mutex<SchedulerStats> = Mutex::new(SchedulerStats::new());
 }
@@ -51,18 +62,56 @@ impl SchedulerStats {
 pub struct Scheduler;
 
 impl Scheduler {
+    // ========================================================================
+    // 内部辅助函数
+    // ========================================================================
+
+    /// 在优先级分桶中查找指定 PID 的进程
+    fn find_pcb(queue: &ReadyQueues, pid: Pid) -> Option<ProcessControlBlock> {
+        for bucket in queue.values() {
+            if let Some(pcb) = bucket.get(&pid) {
+                return Some(pcb.clone());
+            }
+        }
+        None
+    }
+
+    /// 选择优先级最高的就绪进程（内部实现，需要队列锁）
+    fn select_next_locked(queue: &ReadyQueues) -> Option<Pid> {
+        // BTreeMap 按 key 升序排列，所以优先级数值最小（最高优先级）的在前面
+        for (_priority, bucket) in queue.iter() {
+            for (&pid, pcb) in bucket.iter() {
+                if pcb.lock().state == ProcessState::Ready {
+                    return Some(pid);
+                }
+            }
+        }
+        None
+    }
+
+    // ========================================================================
+    // 公开 API
+    // ========================================================================
+
     /// 添加进程到就绪队列
+    ///
+    /// 将进程插入到其动态优先级对应的桶中
     ///
     /// 锁顺序：READY_QUEUE -> SCHEDULER_STATS
     pub fn add_process(pcb: ProcessControlBlock) {
-        let pid = {
+        let (pid, priority) = {
             let mut proc = pcb.lock();
             proc.state = ProcessState::Ready;
-            proc.pid
+            (proc.pid, proc.dynamic_priority)
         };
         {
             let mut queue = READY_QUEUE.lock();
-            queue.insert(pid, pcb);
+            // 先从所有桶中移除（防止重复）
+            for bucket in queue.values_mut() {
+                bucket.remove(&pid);
+            }
+            // 插入到正确的优先级桶
+            queue.entry(priority).or_default().insert(pid, pcb);
         }
 
         let mut stats = SCHEDULER_STATS.lock();
@@ -71,42 +120,42 @@ impl Scheduler {
 
     /// 移除进程
     ///
+    /// 从所有优先级桶中移除指定 PID
+    ///
     /// 锁顺序：READY_QUEUE -> SCHEDULER_STATS
     pub fn remove_process(pid: Pid) {
         {
             let mut queue = READY_QUEUE.lock();
-            queue.remove(&pid);
+            for bucket in queue.values_mut() {
+                bucket.remove(&pid);
+            }
+            // 清理空桶
+            queue.retain(|_, bucket| !bucket.is_empty());
         }
 
         let mut stats = SCHEDULER_STATS.lock();
         stats.processes_terminated += 1;
     }
-    
+
     /// 选择下一个要运行的进程
+    ///
+    /// 按优先级从高到低（数值从小到大）遍历，返回第一个就绪进程
     pub fn select_next() -> Option<Pid> {
         let queue = READY_QUEUE.lock();
-
-        // 查找优先级最高的就绪进程
-        for (&pid, pcb) in queue.iter().rev() {
-            if pcb.lock().state == ProcessState::Ready {
-                return Some(pid);
-            }
-        }
-
-        None
+        Self::select_next_locked(&queue)
     }
-    
+
     /// 更新当前运行的进程
     pub fn set_current(pid: Option<Pid>) {
         let mut current = CURRENT_PROCESS.lock();
         *current = pid;
     }
-    
+
     /// 获取当前运行的进程
     pub fn get_current() -> Option<Pid> {
         *CURRENT_PROCESS.lock()
     }
-    
+
     /// 处理时钟中断 - 进行进程调度
     ///
     /// 锁顺序：CURRENT_PROCESS -> READY_QUEUE -> SCHEDULER_STATS
@@ -118,7 +167,7 @@ impl Scheduler {
         // 获取当前进程的 Arc 引用并更新时间片
         if let Some(pcb) = {
             let queue = READY_QUEUE.lock();
-            current_pid.and_then(|pid| queue.get(&pid).cloned())
+            current_pid.and_then(|pid| Self::find_pcb(&queue, pid))
         } {
             let mut proc = pcb.lock();
 
@@ -127,9 +176,10 @@ impl Scheduler {
                 proc.time_slice -= 1;
             }
 
-            // 时间片已用完，标记为就绪态
+            // 时间片已用完，标记为就绪态并降低优先级
             if proc.time_slice == 0 {
                 proc.state = ProcessState::Ready;
+                proc.decrease_dynamic_priority(); // 惩罚 CPU 密集型进程
                 proc.reset_time_slice();
             }
         }
@@ -143,7 +193,7 @@ impl Scheduler {
         // 进行一次调度
         Self::schedule();
     }
-    
+
     /// 执行调度 - 选择下一个进程并进行上下文切换
     ///
     /// 锁顺序：CURRENT_PROCESS -> READY_QUEUE -> SCHEDULER_STATS
@@ -151,18 +201,18 @@ impl Scheduler {
         // 获取当前运行的进程
         let current_pid = *CURRENT_PROCESS.lock();
 
-        // 选择下一个要运行的进程
-        if let Some(next_pid) = Self::select_next() {
-            if Some(next_pid) != current_pid {
-                // 需要进行上下文切换
-                // 获取当前和下一个进程的 Arc 引用
-                let (current_proc, next_proc) = {
-                    let queue = READY_QUEUE.lock();
-                    let current_proc = current_pid.and_then(|pid| queue.get(&pid).cloned());
-                    let next_proc = queue.get(&next_pid).cloned();
-                    (current_proc, next_proc)
-                };
+        // 在单次锁定中获取所需的所有引用
+        let (next_pid, current_proc, next_proc) = {
+            let queue = READY_QUEUE.lock();
+            let next = Self::select_next_locked(&queue);
+            let current_proc = current_pid.and_then(|pid| Self::find_pcb(&queue, pid));
+            let next_proc = next.and_then(|pid| Self::find_pcb(&queue, pid));
+            (next, current_proc, next_proc)
+        };
 
+        // 选择下一个要运行的进程
+        if let Some(next_pid) = next_pid {
+            if Some(next_pid) != current_pid {
                 // 保存当前进程状态
                 if let Some(proc) = current_proc {
                     let mut pcb = proc.lock();
@@ -171,12 +221,18 @@ impl Scheduler {
                     }
                 }
 
-                // 设置新进程为运行态
-                if let Some(proc) = next_proc {
+                // 设置新进程为运行态并获取其地址空间
+                let next_memory_space = if let Some(proc) = next_proc {
                     let mut pcb = proc.lock();
                     pcb.state = ProcessState::Running;
                     pcb.reset_time_slice();
-                }
+                    pcb.memory_space
+                } else {
+                    0 // 默认使用引导页表
+                };
+
+                // 切换到目标进程的页表（0 表示继续使用引导页表）
+                process::activate_memory_space(next_memory_space);
 
                 // 更新当前进程
                 Self::set_current(Some(next_pid));
@@ -184,32 +240,37 @@ impl Scheduler {
                 let mut stats = SCHEDULER_STATS.lock();
                 stats.total_switches += 1;
 
-                println!("Scheduled process {} (next_pid: {})",
-                         current_pid.unwrap_or(0), next_pid);
+                // 注意：在中断上下文中避免过多输出
+                // println!("Scheduled: {} -> {}", current_pid.unwrap_or(0), next_pid);
             }
         }
     }
-    
+
     /// 主动让出CPU
     pub fn yield_cpu() {
         if let Some(pid) = Self::get_current() {
             if let Some(pcb) = {
                 let queue = READY_QUEUE.lock();
-                queue.get(&pid).cloned()
+                Self::find_pcb(&queue, pid)
             } {
                 let mut proc = pcb.lock();
                 proc.state = ProcessState::Ready;
+                proc.update_dynamic_priority(); // 奖励主动让出的进程
             }
         }
 
         Self::schedule();
     }
-    
+
     /// 获取进程数量
     pub fn process_count() -> usize {
-        READY_QUEUE.lock().len()
+        READY_QUEUE
+            .lock()
+            .values()
+            .map(|bucket| bucket.len())
+            .sum()
     }
-    
+
     /// 打印调度统计信息
     pub fn print_stats() {
         SCHEDULER_STATS.lock().print();

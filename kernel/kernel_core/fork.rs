@@ -4,11 +4,12 @@
 
 use crate::process::{ProcessId, ProcessState, current_pid, get_process, create_process};
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
 use mm::memory::FrameAllocator;
-use spin::Mutex;
+use spin::RwLock;
 use x86_64::{
     PhysAddr, VirtAddr,
-    instructions::tlb,
+    instructions::{interrupts, tlb},
     registers::control::Cr3,
     structures::paging::{page_table::PageTableEntry, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB},
 };
@@ -188,10 +189,12 @@ pub unsafe fn handle_cow_page_fault(
             .allocate_frame()
             .ok_or(ForkError::MemoryAllocationFailed)?;
 
-        // 复制页内容
+        // 复制页内容（使用高半区直映访问物理内存）
+        let old_virt = mm::phys_to_virt(old_frame.start_address());
+        let new_virt = mm::phys_to_virt(new_frame.start_address());
         core::ptr::copy_nonoverlapping(
-            old_frame.start_address().as_u64() as *const u8,
-            new_frame.start_address().as_u64() as *mut u8,
+            old_virt.as_ptr::<u8>(),
+            new_virt.as_mut_ptr::<u8>(),
             4096,
         );
 
@@ -220,41 +223,85 @@ pub unsafe fn handle_cow_page_fault(
 }
 
 /// 物理页引用计数管理
+///
+/// 使用 RwLock + AtomicU64 实现中断安全的引用计数：
+/// - 读取操作只需 RwLock 读锁，高并发友好
+/// - 原子操作确保增减引用不需要等待写锁
+/// - 新增条目时禁用中断获取写锁，避免死锁
 pub struct PhysicalPageRefCount {
-    // 物理页地址 -> 引用计数
-    ref_counts: Arc<Mutex<alloc::collections::BTreeMap<usize, usize>>>,
+    /// 物理页地址 -> 原子引用计数
+    /// 使用 AtomicU64 避免在中断上下文中获取锁
+    ref_counts: Arc<RwLock<alloc::collections::BTreeMap<usize, AtomicU64>>>,
 }
 
 impl PhysicalPageRefCount {
     pub fn new() -> Self {
         PhysicalPageRefCount {
-            ref_counts: Arc::new(Mutex::new(alloc::collections::BTreeMap::new())),
+            ref_counts: Arc::new(RwLock::new(alloc::collections::BTreeMap::new())),
         }
     }
-    
+
     /// 增加页的引用计数
-    pub fn increment(&self, phys_addr: usize) {
-        let mut counts = self.ref_counts.lock();
-        *counts.entry(phys_addr).or_insert(0) += 1;
-    }
-    
-    /// 减少页的引用计数
-    /// 
-    /// 返回新的引用计数，如果为0则可以释放该页
-    pub fn decrement(&self, phys_addr: usize) -> usize {
-        let mut counts = self.ref_counts.lock();
-        if let Some(count) = counts.get_mut(&phys_addr) {
-            *count = count.saturating_sub(1);
-            *count
-        } else {
-            0
+    ///
+    /// 快速路径：如果条目已存在，只需原子增加
+    /// 慢速路径：禁用中断并获取写锁创建新条目
+    pub fn increment(&self, phys_addr: usize) -> u64 {
+        // 快速路径：尝试读锁查找已存在的条目
+        if let Some(count) = self.ref_counts.read().get(&phys_addr) {
+            return count.fetch_add(1, Ordering::SeqCst) + 1;
         }
+
+        // 慢速路径：禁用中断以安全获取写锁
+        interrupts::without_interrupts(|| {
+            let mut counts = self.ref_counts.write();
+            // Double-check：可能在等待写锁期间被其他 CPU 创建
+            let entry = counts
+                .entry(phys_addr)
+                .or_insert_with(|| AtomicU64::new(0));
+            entry.fetch_add(1, Ordering::SeqCst) + 1
+        })
     }
-    
+
+    /// 减少页的引用计数
+    ///
+    /// 返回更新后的引用计数。如果为 0 则调用者可以释放该页。
+    /// 使用 CAS 循环确保原子性。
+    pub fn decrement(&self, phys_addr: usize) -> u64 {
+        if let Some(count) = self.ref_counts.read().get(&phys_addr) {
+            let mut prev = count.load(Ordering::SeqCst);
+            loop {
+                if prev == 0 {
+                    return 0;
+                }
+                match count.compare_exchange(
+                    prev,
+                    prev - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => return prev - 1,
+                    Err(actual) => prev = actual,
+                }
+            }
+        }
+        0
+    }
+
     /// 获取页的引用计数
-    pub fn get(&self, phys_addr: usize) -> usize {
-        let counts = self.ref_counts.lock();
-        counts.get(&phys_addr).copied().unwrap_or(0)
+    pub fn get(&self, phys_addr: usize) -> u64 {
+        self.ref_counts
+            .read()
+            .get(&phys_addr)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// 移除引用计数为 0 的条目（可选清理）
+    pub fn cleanup_zero_entries(&self) {
+        interrupts::without_interrupts(|| {
+            let mut counts = self.ref_counts.write();
+            counts.retain(|_, v| v.load(Ordering::Relaxed) > 0);
+        });
     }
 }
 
@@ -376,12 +423,14 @@ fn find_pte(addr: VirtAddr) -> Option<&'static mut PageTableEntry> {
 ///
 /// 调用者必须确保物理地址指向有效的页表
 unsafe fn phys_to_virt_table(phys: PhysAddr) -> &'static mut PageTable {
-    // 在恒等映射环境中，物理地址 == 虚拟地址
-    let ptr = phys.as_u64() as *mut PageTable;
+    // 使用高半区直映访问物理内存
+    let virt = mm::phys_to_virt(phys);
+    let ptr = virt.as_mut_ptr::<PageTable>();
     &mut *ptr
 }
 
 /// 将物理帧清零
 unsafe fn zero_table(frame: PhysFrame) {
-    core::ptr::write_bytes(frame.start_address().as_u64() as *mut u8, 0, 4096);
+    let virt = mm::phys_to_virt(frame.start_address());
+    core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 4096);
 }

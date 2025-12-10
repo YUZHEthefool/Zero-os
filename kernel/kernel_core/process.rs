@@ -1,7 +1,13 @@
 use alloc::{collections::BTreeMap, vec, vec::Vec, string::String, sync::Arc};
 use spin::Mutex;
-use x86_64::VirtAddr;
+use x86_64::{
+    PhysAddr, VirtAddr,
+    registers::control::{Cr3, Cr3Flags},
+    structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB},
+};
+use crate::fork::PAGE_REF_COUNT;
 use crate::time;
+use mm::memory::FrameAllocator;
 
 /// 进程ID类型
 pub type ProcessId = usize;
@@ -14,6 +20,9 @@ const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
 
 /// 调度器清理回调类型
 type SchedulerCleanupCallback = fn(ProcessId);
+
+/// IPC清理回调类型
+type IpcCleanupCallback = fn(ProcessId);
 
 /// 进程状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,11 +41,43 @@ pub enum ProcessState {
     Terminated,
 }
 
+/// FXSAVE 区域大小（512 字节）
+const FXSAVE_SIZE: usize = 512;
+
+/// 512 字节的 FXSAVE/FXRSTOR 区域
+/// 按 64 字节对齐以兼容 XSAVE 路径
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct FxSaveArea {
+    pub data: [u8; FXSAVE_SIZE],
+}
+
+impl core::fmt::Debug for FxSaveArea {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FxSaveArea").finish_non_exhaustive()
+    }
+}
+
+impl Default for FxSaveArea {
+    fn default() -> Self {
+        let mut area = FxSaveArea { data: [0; FXSAVE_SIZE] };
+        // 设置默认的 FCW（FPU Control Word）：双精度、所有异常屏蔽
+        area.data[0] = 0x7F;
+        area.data[1] = 0x03;
+        // 设置默认的 MXCSR（SSE Control/Status）：所有异常屏蔽
+        area.data[24] = 0x80;
+        area.data[25] = 0x1F;
+        area
+    }
+}
+
 /// CPU上下文（用于进程切换）
-#[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
+///
+/// 包含通用寄存器和 FPU/SIMD 状态，与 arch::Context 布局一致
+#[derive(Debug, Clone, Copy)]
+#[repr(C, align(64))]
 pub struct Context {
-    // 通用寄存器
+    // 通用寄存器 (偏移 0x00 - 0x7F)
     pub rax: u64,
     pub rbx: u64,
     pub rcx: u64,
@@ -53,14 +94,49 @@ pub struct Context {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
-    
-    // 指令指针和标志
+
+    // 指令指针和标志 (偏移 0x80 - 0x8F)
     pub rip: u64,
     pub rflags: u64,
-    
-    // 段寄存器
+
+    // 段寄存器 (偏移 0x90 - 0x9F)
     pub cs: u64,
     pub ss: u64,
+
+    // 填充以对齐 FxSaveArea 到 64 字节边界 (偏移 0xA0 - 0xBF)
+    _padding: [u64; 4],
+
+    /// FPU/SIMD 保存区 (偏移 0xC0)
+    pub fx: FxSaveArea,
+}
+
+impl Default for Context {
+    fn default() -> Self {
+        Context {
+            rax: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            rsp: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rip: 0,
+            rflags: 0x202, // IF (中断使能) 位设置
+            cs: 0x08,      // 内核代码段
+            ss: 0x10,      // 内核数据段
+            _padding: [0; 4],
+            fx: FxSaveArea::default(),
+        }
+    }
 }
 
 /// 进程控制块（PCB）
@@ -187,6 +263,9 @@ fn calculate_time_slice(priority: Priority) -> u32 {
 lazy_static::lazy_static! {
     pub static ref PROCESS_TABLE: Mutex<Vec<Option<Arc<Mutex<Process>>>>> = Mutex::new(vec![None]); // 索引0预留
     static ref SCHEDULER_CLEANUP: Mutex<Option<SchedulerCleanupCallback>> = Mutex::new(None);
+    static ref IPC_CLEANUP: Mutex<Option<IpcCleanupCallback>> = Mutex::new(None);
+    /// 缓存引导时的 CR3 值，用于内核进程或 memory_space == 0 的情况
+    static ref BOOT_CR3: (PhysFrame<Size4KiB>, Cr3Flags) = Cr3::read();
 }
 
 /// 当前运行的进程ID
@@ -194,6 +273,15 @@ static CURRENT_PID: Mutex<Option<ProcessId>> = Mutex::new(None);
 
 /// 下一个可用的PID
 static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
+
+/// 初始化进程子系统
+///
+/// 必须在任何进程创建或调度之前调用，以确保 BOOT_CR3 捕获正确的引导页表值。
+pub fn init() {
+    // 强制 BOOT_CR3 lazy_static 初始化，确保捕获当前（引导）CR3
+    let _ = *BOOT_CR3;
+    println!("  Process subsystem initialized (boot CR3 cached)");
+}
 
 /// 创建新进程
 ///
@@ -245,6 +333,39 @@ pub fn set_current_pid(pid: Option<ProcessId>) {
     *CURRENT_PID.lock() = pid;
 }
 
+/// 激活指定的地址空间
+///
+/// 切换到进程的页表。memory_space 为 0 时使用引导时的页表（内核共享页表）。
+/// 调用 Cr3::write 会刷新 TLB，确保新地址空间立即生效。
+///
+/// # Arguments
+/// * `memory_space` - 进程的 PML4 物理地址，0 表示使用引导页表
+///
+/// # Safety
+/// 这个函数会修改 CR3 寄存器，调用者必须确保：
+/// - memory_space 指向有效的 PML4 页表
+/// - 内核代码和数据在新旧页表中都有正确映射
+pub fn activate_memory_space(memory_space: usize) {
+    let (boot_frame, boot_flags) = *BOOT_CR3;
+    let (current_frame, _) = Cr3::read();
+
+    let (target_frame, target_flags) = if memory_space == 0 {
+        // 使用引导页表（内核进程或尚未分配独立页表的进程）
+        (boot_frame, boot_flags)
+    } else {
+        // 使用进程的独立页表
+        (
+            PhysFrame::containing_address(PhysAddr::new(memory_space as u64)),
+            boot_flags, // 使用相同的 CR3 标志
+        )
+    };
+
+    // 只有当目标页表与当前不同时才切换（避免不必要的 TLB 刷新）
+    if target_frame != current_frame {
+        unsafe { Cr3::write(target_frame, target_flags) };
+    }
+}
+
 /// 获取进程
 ///
 /// # Arguments
@@ -262,9 +383,22 @@ pub fn register_cleanup_notifier(callback: SchedulerCleanupCallback) {
     *SCHEDULER_CLEANUP.lock() = Some(callback);
 }
 
+/// 注册IPC清理回调，用于在进程退出时清理其端点
+pub fn register_ipc_cleanup(callback: IpcCleanupCallback) {
+    *IPC_CLEANUP.lock() = Some(callback);
+}
+
 /// 通知调度器进程已被移除
 fn notify_scheduler_process_removed(pid: ProcessId) {
     let callback = *SCHEDULER_CLEANUP.lock();
+    if let Some(cb) = callback {
+        cb(pid);
+    }
+}
+
+/// 通知IPC子系统清理进程端点
+fn notify_ipc_process_cleanup(pid: ProcessId) {
+    let callback = *IPC_CLEANUP.lock();
     if let Some(cb) = callback {
         cb(pid);
     }
@@ -337,8 +471,9 @@ pub fn wait_process(pid: ProcessId) -> Option<i32> {
 /// 清理僵尸进程
 ///
 /// 完全移除进程：
-/// 1. 从 PROCESS_TABLE 中移除
-/// 2. 通知调度器移除该进程
+/// 1. 释放进程持有的内存资源（mmap 区域）
+/// 2. 从 PROCESS_TABLE 中移除
+/// 3. 通知调度器移除该进程
 pub fn cleanup_zombie(pid: ProcessId) {
     let removed = {
         let mut table = PROCESS_TABLE.lock();
@@ -346,6 +481,8 @@ pub fn cleanup_zombie(pid: ProcessId) {
             if let Some(process) = slot {
                 let mut proc = process.lock();
                 if proc.state == ProcessState::Zombie {
+                    // 释放进程持有的内存资源
+                    free_process_resources(&mut proc);
                     proc.state = ProcessState::Terminated;
                     drop(proc);
                     *slot = None;
@@ -365,6 +502,150 @@ pub fn cleanup_zombie(pid: ProcessId) {
         notify_scheduler_process_removed(pid);
         println!("Cleaned up zombie process {}", pid);
     }
+}
+
+/// 释放进程持有的内核资源
+///
+/// - 清理 mmap 区域跟踪信息
+/// - 如果进程拥有独立页表（memory_space != 0），直接遍历该页表：
+///   * 仅处理用户空间 PML4 条目 0-255
+///   * 对叶子页减少 COW 引用计数并在归零时释放物理帧
+///   * 递归释放中间页表帧，最后释放 PML4 帧本身
+///
+/// 恒等映射 0-4GB 允许将物理地址当作虚拟地址解引用。
+///
+/// # 当前限制
+///
+/// - **内核栈**: 当前实现未动态分配 per-process 内核栈，所有进程共享 TSS 中的
+///   静态内核栈。若将来实现 per-process 内核栈分配，需在此处释放。
+/// - **HUGE_PAGE**: 用户空间应仅使用 4KB 页面。若存在 2MB/1GB 大页映射，
+///   当前实现会跳过以避免 buddy allocator 损坏。
+fn free_process_resources(proc: &mut Process) {
+    let region_count = proc.mmap_regions.len();
+    let total_size: usize = proc.mmap_regions.values().sum();
+
+    // 清理 mmap 区域跟踪
+    proc.mmap_regions.clear();
+
+    // 如果进程拥有独立的页表（memory_space != 0），释放页表及其管理的物理帧
+    if proc.memory_space != 0 {
+        unsafe {
+            let mut frame_alloc = FrameAllocator::new();
+            let root_frame: PhysFrame<Size4KiB> =
+                PhysFrame::containing_address(PhysAddr::new(proc.memory_space as u64));
+            let root_table = phys_to_virt_table(root_frame.start_address());
+
+            // 只遍历用户空间映射 (PML4 index 0-255)，内核高半区 (256-511) 共享无需处理
+            free_page_table_level(root_table, 4, &mut frame_alloc);
+
+            // 释放 PML4 帧本身
+            frame_alloc.deallocate_frame(root_frame);
+
+            println!("  Released page table hierarchy for process {} (root=0x{:x})",
+                proc.pid, proc.memory_space);
+        }
+        proc.memory_space = 0;
+    }
+
+    // TODO: 当实现 per-process 内核栈分配后，在此处释放内核栈：
+    // if proc.kernel_stack.as_u64() != 0 {
+    //     free_kernel_stack(proc.kernel_stack);
+    // }
+
+    // 通知 IPC 子系统清理进程端点（通过回调避免循环依赖）
+    notify_ipc_process_cleanup(proc.pid);
+
+    if region_count > 0 {
+        println!("  Cleared {} mmap regions ({} KB) for process {}",
+            region_count, total_size / 1024, proc.pid);
+    }
+}
+
+/// 递归释放页表层级
+///
+/// level: 4=PML4, 3=PDPT, 2=PD, 1=PT
+///
+/// 直接使用 memory_space 的物理地址，通过恒等映射访问页表，避免依赖当前 CR3。
+///
+/// # Safety
+///
+/// 调用者必须确保 `table` 指向有效的页表，且页表不再被任何进程使用。
+unsafe fn free_page_table_level(
+    table: &mut PageTable,
+    level: u8,
+    frame_alloc: &mut FrameAllocator,
+) {
+    // PML4 只处理用户空间条目 (0-255)，其他层级处理全部 512 条目
+    let idx_range = if level == 4 { 0..256 } else { 0..512 };
+
+    for idx in idx_range {
+        let entry = &mut table[idx];
+        if entry.is_unused() || !entry.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+
+        let entry_phys = entry.addr();
+
+        // 检查是否是大页 (2MB 或 1GB)
+        // 用户空间通常不使用大页，但为安全起见跳过处理
+        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            // 大页：当前 buddy allocator 仅支持 4KB 帧，跳过以避免损坏
+            // 注：若用户空间需要大页支持，需扩展此逻辑
+            continue;
+        }
+
+        if level == 1 {
+            // PT 层级的叶子节点：释放 4KB 物理帧
+            free_leaf_frame(entry_phys, frame_alloc);
+        } else {
+            // 中间节点：递归处理子页表
+            let next_table = phys_to_virt_table(entry_phys);
+            free_page_table_level(next_table, level - 1, frame_alloc);
+
+            // 释放子页表帧本身
+            let next_frame: PhysFrame<Size4KiB> =
+                PhysFrame::containing_address(entry_phys);
+            frame_alloc.deallocate_frame(next_frame);
+        }
+    }
+}
+
+/// 释放叶子页物理帧
+///
+/// 使用 COW 引用计数管理：减少引用计数，当计数归零时释放物理帧。
+/// 对于未被 COW 跟踪的页面（refcount=0），直接释放。
+fn free_leaf_frame(phys: PhysAddr, frame_alloc: &mut FrameAllocator) {
+    let phys_usize = phys.as_u64() as usize;
+
+    // 检查是否在 COW 跟踪中
+    let current_count = PAGE_REF_COUNT.get(phys_usize);
+
+    if current_count > 0 {
+        // COW 页面：减少引用计数
+        let remaining = PAGE_REF_COUNT.decrement(phys_usize);
+        if remaining == 0 {
+            // 最后一个引用，释放物理帧
+            let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(phys);
+            frame_alloc.deallocate_frame(frame);
+        }
+    } else {
+        // 未被 COW 跟踪的独占页面，直接释放
+        let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(phys);
+        frame_alloc.deallocate_frame(frame);
+    }
+}
+
+/// 将物理地址转换为页表引用（使用高半区直映）
+///
+/// # Safety
+///
+/// 调用者必须确保：
+/// - 物理地址指向有效的页表
+/// - 物理地址在 0-1GB 范围内（高半区直映覆盖的范围）
+unsafe fn phys_to_virt_table(phys: PhysAddr) -> &'static mut PageTable {
+    let virt = mm::phys_to_virt(phys);
+    let ptr = virt.as_mut_ptr::<PageTable>();
+    &mut *ptr
 }
 
 /// 获取进程统计信息

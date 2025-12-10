@@ -11,6 +11,26 @@ use x86_64::{
 };
 use spin::Mutex;
 
+/// 物理内存高半区偏移（bootloader 映射 0xffffffff80000000 -> 0）
+/// 覆盖物理地址 0-1GB
+pub const PHYSICAL_MEMORY_OFFSET: u64 = 0xffff_ffff_8000_0000;
+
+#[inline]
+fn get_phys_offset() -> VirtAddr {
+    VirtAddr::new(PHYSICAL_MEMORY_OFFSET)
+}
+
+/// 将物理地址转换为可访问的虚拟地址（通过高半区直映）
+///
+/// # Safety
+///
+/// 调用者必须确保物理地址在 0-1GB 范围内（高半区直映覆盖的范围）
+/// 超出此范围的物理地址将导致无效的虚拟地址
+#[inline]
+pub fn phys_to_virt(phys: PhysAddr) -> VirtAddr {
+    VirtAddr::new(phys.as_u64() + PHYSICAL_MEMORY_OFFSET)
+}
+
 /// 页表管理器
 pub struct PageTableManager {
     mapper: OffsetPageTable<'static>,
@@ -29,22 +49,26 @@ pub unsafe fn with_current_manager<T, F>(physical_memory_offset: VirtAddr, f: F)
 where
     F: FnOnce(&mut PageTableManager) -> T,
 {
-    let level_4_table = active_level_4_table(physical_memory_offset);
-    let mapper = OffsetPageTable::new(level_4_table, physical_memory_offset);
+    let _ = physical_memory_offset; // 调用方参数保持兼容，实际使用固定偏移
+    let phys_offset = get_phys_offset();
+    let level_4_table = active_level_4_table(phys_offset);
+    let mapper = OffsetPageTable::new(level_4_table, phys_offset);
     let mut manager = PageTableManager { mapper };
     f(&mut manager)
 }
 
 impl PageTableManager {
     /// 创建新的页表管理器
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// 调用者必须确保物理内存偏移量是正确的
     pub unsafe fn new(physical_memory_offset: VirtAddr) -> Self {
-        let level_4_table = active_level_4_table(physical_memory_offset);
-        let mapper = OffsetPageTable::new(level_4_table, physical_memory_offset);
-        
+        let _ = physical_memory_offset; // 保持接口兼容
+        let phys_offset = get_phys_offset();
+        let level_4_table = active_level_4_table(phys_offset);
+        let mapper = OffsetPageTable::new(level_4_table, phys_offset);
+
         PageTableManager { mapper }
     }
     
@@ -91,7 +115,7 @@ impl PageTableManager {
     /// 转换虚拟地址到物理地址
     pub fn translate_addr(&self, addr: VirtAddr) -> Option<PhysAddr> {
         use x86_64::structures::paging::mapper::TranslateResult;
-        
+
         match self.mapper.translate(addr) {
             TranslateResult::Mapped { frame, offset, .. } => {
                 Some(frame.start_address() + offset)
@@ -99,7 +123,19 @@ impl PageTableManager {
             TranslateResult::NotMapped | TranslateResult::InvalidFrameAddress(_) => None,
         }
     }
-    
+
+    /// 转换虚拟地址到物理地址并返回页表标志
+    pub fn translate_with_flags(&self, addr: VirtAddr) -> Option<(PhysAddr, PageTableFlags)> {
+        use x86_64::structures::paging::mapper::TranslateResult;
+
+        match self.mapper.translate(addr) {
+            TranslateResult::Mapped { frame, offset, flags, .. } => {
+                Some((frame.start_address() + offset, flags))
+            }
+            TranslateResult::NotMapped | TranslateResult::InvalidFrameAddress(_) => None,
+        }
+    }
+
     /// 修改页的标志位
     pub fn update_flags(
         &mut self,
@@ -206,15 +242,16 @@ lazy_static::lazy_static! {
 }
 
 /// 初始化页表管理器
-/// 
+///
 /// # Safety
-/// 
+///
 /// 只能调用一次，且必须在内核初始化早期调用
 pub unsafe fn init(physical_memory_offset: VirtAddr) {
-    let manager = PageTableManager::new(physical_memory_offset);
+    let _ = physical_memory_offset; // 保持接口兼容
+    let manager = PageTableManager::new(get_phys_offset());
     *PAGE_TABLE_MANAGER.lock() = Some(manager);
-    
-    println!("Page table manager initialized");
+
+    println!("Page table manager initialized (PHYS_OFFSET: 0x{:x})", PHYSICAL_MEMORY_OFFSET);
 }
 
 /// 获取全局页表管理器

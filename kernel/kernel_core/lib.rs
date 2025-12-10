@@ -14,10 +14,12 @@ pub mod syscall;
 pub mod fork;
 pub mod time;
 
-pub use fork::{sys_fork, ForkError, ForkResult};
+pub use fork::{sys_fork, ForkError, ForkResult, PAGE_REF_COUNT};
+pub use process::register_ipc_cleanup;
 pub use time::{current_timestamp_ms, get_ticks, on_timer_tick};
 
 pub fn init() {
+    process::init(); // 必须最先初始化，确保 BOOT_CR3 被缓存
     time::init();
     println!("Kernel core module initialized");
 }

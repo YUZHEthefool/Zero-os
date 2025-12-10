@@ -4,6 +4,7 @@
 
 extern crate alloc;
 use core::panic::PanicInfo;
+use mm::memory::BootInfo;
 
 // 引入模块化子系统，drivers需要在最前面以便使用其宏
 #[macro_use]
@@ -20,6 +21,7 @@ mod process_demo;
 mod syscall_demo;
 mod interrupt_demo;
 mod integration_test;
+mod stack_guard;
 
 // 串口端口
 const SERIAL_PORT: u16 = 0x3F8;
@@ -43,7 +45,7 @@ unsafe fn serial_write_str(s: &str) {
 }
 
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // 禁用中断 - 必须首先做！
     unsafe {
         core::arch::asm!("cli", options(nomem, nostack));
@@ -61,7 +63,16 @@ pub extern "C" fn _start() -> ! {
     println!("  Zero-OS Microkernel v0.1");
     println!("==============================");
     println!();
-    
+
+    // 解析 Bootloader 传递的 BootInfo 指针
+    // Bootloader 通过 rdi 寄存器传递 BootInfo 指针（System V AMD64 ABI）
+    // 由于 identity mapping 仍然有效，可以直接访问该地址
+    let boot_info: Option<&BootInfo> = if boot_info_ptr != 0 {
+        unsafe { (boot_info_ptr as *const BootInfo).as_ref() }
+    } else {
+        None
+    };
+
     // 阶段1：初始化中断处理
     println!("[1/3] Initializing interrupts...");
     arch::interrupts::init();
@@ -69,8 +80,14 @@ pub extern "C" fn _start() -> ! {
     
     // 阶段2：初始化内存管理
     println!("[2/3] Initializing memory management...");
-    mm::memory::init();
-    println!("      ✓ Heap and Buddy allocator ready");
+    if let Some(info) = boot_info {
+        mm::memory::init_with_bootinfo(info);
+        println!("      ✓ Heap and Buddy allocator ready (using BootInfo)");
+    } else {
+        println!("      ! BootInfo missing, using fallback initialization");
+        mm::memory::init();
+        println!("      ✓ Heap and Buddy allocator ready (fallback mode)");
+    }
 
     // 初始化页表管理器
     // Bootloader 创建了恒等映射（物理地址 == 虚拟地址），所以物理偏移量为 0
@@ -78,6 +95,20 @@ pub extern "C" fn _start() -> ! {
         mm::page_table::init(x86_64::VirtAddr::new(0));
     }
     println!("      ✓ Page table manager initialized");
+
+    // 安装内核栈守护页（必须在 mm 初始化后、启用中断前）
+    println!("[2.5/3] Installing kernel stack guard pages...");
+    unsafe {
+        match stack_guard::install() {
+            Ok(()) => {
+                println!("      ✓ Guard pages installed for kernel stacks");
+            }
+            Err(e) => {
+                println!("      ! Failed to install guard pages: {:?}", e);
+                println!("      ! Continuing with static stacks (less safe)");
+            }
+        }
+    }
     
     // 阶段3：测试基础功能
     println!("[3/3] Running basic tests...");
@@ -117,8 +148,10 @@ pub extern "C" fn _start() -> ! {
     println!("      ✓ System calls framework ready");
     println!("      ✓ Fork/COW implementation compiled");
     
-    println!("[7/8] Verifying IPC...");
-    println!("      ✓ ipc crate loaded");
+    println!("[7/8] Initializing IPC...");
+    ipc::init();  // 初始化IPC子系统并注册清理回调
+    println!("      ✓ Capability-based endpoints enabled");
+    println!("      ✓ Process cleanup callback registered");
     
     println!("[8/8] Verifying memory management...");
     println!("      ✓ Page table manager compiled");
@@ -137,12 +170,14 @@ pub extern "C" fn _start() -> ! {
     println!("   • Interrupt Handling (20+ handlers)");
     println!("   • Memory Management (Heap + Buddy allocator)");
     println!("   • Page Table Manager");
+    println!("   • Kernel Stack Guard Pages");
     println!("   • Process Control Block");
     println!("   • Enhanced Scheduler (Multi-level feedback queue)");
     println!("   • Context Switch (176-byte context)");
     println!("   • System Calls (50+ defined)");
     println!("   • Fork with COW");
     println!("   • Memory Mapping (mmap/munmap)");
+    println!("   • Capability-based IPC");
     println!();
     println!("进入空闲循环...");
     println!();

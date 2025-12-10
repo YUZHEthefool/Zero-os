@@ -5,6 +5,9 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use lazy_static::lazy_static;
+use sched::enhanced_scheduler::Scheduler;
+use crate::gdt;
+use crate::context_switch;
 
 /// 中断统计信息快照（用于外部查询）
 #[derive(Debug, Default, Clone, Copy)]
@@ -129,7 +132,14 @@ lazy_static! {
         idt.bound_range_exceeded.set_handler_fn(bound_range_exceeded_handler);
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
         idt.device_not_available.set_handler_fn(device_not_available_handler);
-        idt.double_fault.set_handler_fn(double_fault_handler);
+
+        // 双重错误使用 IST 栈，防止栈溢出导致三重错误
+        unsafe {
+            idt.double_fault
+                .set_handler_fn(double_fault_handler)
+                .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+        }
+
         idt.invalid_tss.set_handler_fn(invalid_tss_handler);
         idt.segment_not_present.set_handler_fn(segment_not_present_handler);
         idt.stack_segment_fault.set_handler_fn(stack_segment_fault_handler);
@@ -151,6 +161,12 @@ lazy_static! {
 
 /// 初始化中断处理
 pub fn init() {
+    // 首先初始化 GDT 和 TSS（IDT 的 IST 依赖 TSS）
+    gdt::init();
+
+    // 初始化 FPU/SIMD 支持（必须在使用 FXSAVE/FXRSTOR 前）
+    context_switch::init_fpu();
+
     // 初始化 8259 PIC，重映射 IRQ 向量避免与 CPU 异常冲突
     unsafe { pic_init(); }
 
@@ -158,8 +174,9 @@ pub fn init() {
     IDT.load();
 
     println!("Interrupt Descriptor Table (IDT) loaded");
-    println!("  Exception handlers: 20");
+    println!("  Exception handlers: 20 (double fault uses IST)");
     println!("  Hardware interrupt handlers: 2 (Timer, Keyboard)");
+    println!("  FPU/SIMD support enabled (FXSAVE/FXRSTOR ready)");
 }
 
 /// 获取中断统计信息
@@ -333,16 +350,24 @@ extern "x86-interrupt" fn virtualization_handler(_stack_frame: InterruptStackFra
 // ============================================================================
 
 /// IRQ 0 - Timer Interrupt (定时器中断)
+///
+/// 每次定时器中断时执行：
+/// 1. 更新中断统计
+/// 2. 更新系统时钟
+/// 3. 调用调度器处理时间片（启用抢占式调度）
+/// 4. 发送 EOI
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     INTERRUPT_STATS.timer.fetch_add(1, Ordering::Relaxed);
 
     // 更新系统时钟计数器
     kernel_core::on_timer_tick();
 
-    // TODO: 调用调度器的 tick 函数
-    // sched::scheduler::tick();
+    // 调用调度器的时钟 tick 处理
+    // 这将更新当前进程的时间片，并在时间片耗尽时触发调度
+    Scheduler::on_clock_tick();
 
     // 发送 EOI (End of Interrupt) 到 PIC
+    // 必须在调度器处理之后发送，确保中断在调度完成后才能再次触发
     unsafe {
         core::arch::asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
     }
