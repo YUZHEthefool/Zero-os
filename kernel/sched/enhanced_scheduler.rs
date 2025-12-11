@@ -9,9 +9,16 @@
 //! - 内层按 PID 排序实现同优先级的 FIFO
 
 use alloc::{collections::BTreeMap, sync::Arc};
+use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_core::process::{self, Process, ProcessId, ProcessState, Priority};
 use spin::Mutex;
 use lazy_static::lazy_static;
+use x86_64::instructions::interrupts;
+
+// 导入arch模块的上下文切换功能
+use arch::switch_context;
+use arch::{set_kernel_stack, default_kernel_stack_top};
+use arch::Context as ArchContext;
 
 // 类型别名以保持兼容性
 pub type Pid = ProcessId;
@@ -23,6 +30,15 @@ pub type ProcessControlBlock = Arc<Mutex<Process>>;
 /// - 按优先级从低到高排序（优先级数值越小越优先）
 /// - 同优先级内按 PID 先入先出
 type ReadyQueues = BTreeMap<Priority, BTreeMap<Pid, ProcessControlBlock>>;
+
+/// 需要重新调度标志
+///
+/// 当定时器中断确定需要调度时设置此标志，但不在中断上下文中执行实际的调度/CR3切换。
+/// 真正的上下文切换应在受控路径（如系统调用返回）中执行。
+static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
+
+/// 用于首次调度的哑上下文（内核启动上下文的保存位置，无需恢复）
+static BOOTSTRAP_CONTEXT: Mutex<ArchContext> = Mutex::new(ArchContext::new());
 
 /// 全局就绪队列 - 按优先级分桶维护就绪进程
 lazy_static! {
@@ -99,23 +115,25 @@ impl Scheduler {
     ///
     /// 锁顺序：READY_QUEUE -> SCHEDULER_STATS
     pub fn add_process(pcb: ProcessControlBlock) {
-        let (pid, priority) = {
-            let mut proc = pcb.lock();
-            proc.state = ProcessState::Ready;
-            (proc.pid, proc.dynamic_priority)
-        };
-        {
-            let mut queue = READY_QUEUE.lock();
-            // 先从所有桶中移除（防止重复）
-            for bucket in queue.values_mut() {
-                bucket.remove(&pid);
+        interrupts::without_interrupts(|| {
+            let (pid, priority) = {
+                let mut proc = pcb.lock();
+                proc.state = ProcessState::Ready;
+                (proc.pid, proc.dynamic_priority)
+            };
+            {
+                let mut queue = READY_QUEUE.lock();
+                // 先从所有桶中移除（防止重复）
+                for bucket in queue.values_mut() {
+                    bucket.remove(&pid);
+                }
+                // 插入到正确的优先级桶
+                queue.entry(priority).or_default().insert(pid, pcb);
             }
-            // 插入到正确的优先级桶
-            queue.entry(priority).or_default().insert(pid, pcb);
-        }
 
-        let mut stats = SCHEDULER_STATS.lock();
-        stats.processes_created += 1;
+            let mut stats = SCHEDULER_STATS.lock();
+            stats.processes_created += 1;
+        });
     }
 
     /// 移除进程
@@ -124,25 +142,29 @@ impl Scheduler {
     ///
     /// 锁顺序：READY_QUEUE -> SCHEDULER_STATS
     pub fn remove_process(pid: Pid) {
-        {
-            let mut queue = READY_QUEUE.lock();
-            for bucket in queue.values_mut() {
-                bucket.remove(&pid);
+        interrupts::without_interrupts(|| {
+            {
+                let mut queue = READY_QUEUE.lock();
+                for bucket in queue.values_mut() {
+                    bucket.remove(&pid);
+                }
+                // 清理空桶
+                queue.retain(|_, bucket| !bucket.is_empty());
             }
-            // 清理空桶
-            queue.retain(|_, bucket| !bucket.is_empty());
-        }
 
-        let mut stats = SCHEDULER_STATS.lock();
-        stats.processes_terminated += 1;
+            let mut stats = SCHEDULER_STATS.lock();
+            stats.processes_terminated += 1;
+        });
     }
 
     /// 选择下一个要运行的进程
     ///
     /// 按优先级从高到低（数值从小到大）遍历，返回第一个就绪进程
     pub fn select_next() -> Option<Pid> {
-        let queue = READY_QUEUE.lock();
-        Self::select_next_locked(&queue)
+        interrupts::without_interrupts(|| {
+            let queue = READY_QUEUE.lock();
+            Self::select_next_locked(&queue)
+        })
     }
 
     /// 更新当前运行的进程
@@ -156,124 +178,261 @@ impl Scheduler {
         *CURRENT_PROCESS.lock()
     }
 
-    /// 处理时钟中断 - 进行进程调度
+    /// 处理时钟中断 - 更新时间片并设置重调度标志
     ///
     /// 锁顺序：CURRENT_PROCESS -> READY_QUEUE -> SCHEDULER_STATS
     /// 所有调度器函数必须遵循此顺序以避免死锁
-    pub fn on_clock_tick() {
-        // 统一锁顺序：先获取 CURRENT_PROCESS
-        let current_pid = *CURRENT_PROCESS.lock();
-
-        // 获取当前进程的 Arc 引用并更新时间片
-        if let Some(pcb) = {
-            let queue = READY_QUEUE.lock();
-            current_pid.and_then(|pid| Self::find_pcb(&queue, pid))
-        } {
-            let mut proc = pcb.lock();
-
-            // 减少时间片
-            if proc.time_slice > 0 {
-                proc.time_slice -= 1;
-            }
-
-            // 时间片已用完，标记为就绪态并降低优先级
-            if proc.time_slice == 0 {
-                proc.state = ProcessState::Ready;
-                proc.decrease_dynamic_priority(); // 惩罚 CPU 密集型进程
-                proc.reset_time_slice();
-            }
-        }
-
-        // 最后更新 SCHEDULER_STATS
-        {
-            let mut stats = SCHEDULER_STATS.lock();
-            stats.total_ticks += 1;
-        }
-
-        // 进行一次调度
-        Self::schedule();
-    }
-
-    /// 执行调度 - 选择下一个进程并进行上下文切换
     ///
-    /// 锁顺序：CURRENT_PROCESS -> READY_QUEUE -> SCHEDULER_STATS
-    pub fn schedule() {
-        // 获取当前运行的进程
-        let current_pid = *CURRENT_PROCESS.lock();
+    /// **重要**: 此函数在中断上下文中运行，只设置 NEED_RESCHED 标志，
+    /// 不执行实际的调度/CR3切换。这避免了在中断返回时运行在错误地址空间的问题。
+    pub fn on_clock_tick() {
+        // 使用 without_interrupts 确保在持有锁期间不会被嵌套中断打断
+        interrupts::without_interrupts(|| {
+            // 统一锁顺序：先获取 CURRENT_PROCESS
+            let current_pid = *CURRENT_PROCESS.lock();
 
-        // 在单次锁定中获取所需的所有引用
-        let (next_pid, current_proc, next_proc) = {
-            let queue = READY_QUEUE.lock();
-            let next = Self::select_next_locked(&queue);
-            let current_proc = current_pid.and_then(|pid| Self::find_pcb(&queue, pid));
-            let next_proc = next.and_then(|pid| Self::find_pcb(&queue, pid));
-            (next, current_proc, next_proc)
-        };
+            // 获取当前进程的 Arc 引用并更新时间片
+            if let Some(pcb) = {
+                let queue = READY_QUEUE.lock();
+                current_pid.and_then(|pid| Self::find_pcb(&queue, pid))
+            } {
+                let mut proc = pcb.lock();
 
-        // 选择下一个要运行的进程
-        if let Some(next_pid) = next_pid {
-            if Some(next_pid) != current_pid {
-                // 保存当前进程状态
-                if let Some(proc) = current_proc {
-                    let mut pcb = proc.lock();
-                    if pcb.state == ProcessState::Running {
-                        pcb.state = ProcessState::Ready;
-                    }
+                // 减少时间片
+                if proc.time_slice > 0 {
+                    proc.time_slice -= 1;
                 }
 
-                // 设置新进程为运行态并获取其地址空间
-                let next_memory_space = if let Some(proc) = next_proc {
-                    let mut pcb = proc.lock();
-                    pcb.state = ProcessState::Running;
-                    pcb.reset_time_slice();
-                    pcb.memory_space
-                } else {
-                    0 // 默认使用引导页表
-                };
-
-                // 切换到目标进程的页表（0 表示继续使用引导页表）
-                process::activate_memory_space(next_memory_space);
-
-                // 更新当前进程
-                Self::set_current(Some(next_pid));
-
-                let mut stats = SCHEDULER_STATS.lock();
-                stats.total_switches += 1;
-
-                // 注意：在中断上下文中避免过多输出
-                // println!("Scheduled: {} -> {}", current_pid.unwrap_or(0), next_pid);
+                // 时间片已用完，标记为就绪态并降低优先级
+                if proc.time_slice == 0 {
+                    proc.state = ProcessState::Ready;
+                    proc.decrease_dynamic_priority(); // 惩罚 CPU 密集型进程
+                    proc.reset_time_slice();
+                    // 设置重调度标志，不在中断上下文中直接切换
+                    NEED_RESCHED.store(true, Ordering::SeqCst);
+                }
             }
-        }
+
+            // 最后更新 SCHEDULER_STATS
+            {
+                let mut stats = SCHEDULER_STATS.lock();
+                stats.total_ticks += 1;
+            }
+        });
+        // 注意：不再在中断上下文中调用 schedule()
+        // 真正的上下文切换需要在受控路径中执行（如系统调用返回或显式调度点）
+    }
+
+    /// 查询是否需要重新调度
+    pub fn need_resched() -> bool {
+        NEED_RESCHED.load(Ordering::SeqCst)
+    }
+
+    /// 清除重调度标志
+    pub fn clear_resched() {
+        NEED_RESCHED.store(false, Ordering::SeqCst);
+    }
+
+    /// 执行调度 - 选择下一个进程并更新状态
+    ///
+    /// 锁顺序：CURRENT_PROCESS -> READY_QUEUE -> SCHEDULER_STATS
+    ///
+    /// **重要**: 此函数只更新进程状态和当前进程标识，不切换CR3。
+    /// CR3切换必须与完整的寄存器上下文切换（switch_context）配合执行。
+    /// 当前内核尚未实现真正的进程切换，所有"进程"共享内核地址空间。
+    ///
+    /// 返回值：如果发生进程切换，返回 (新进程PID, 新进程地址空间)
+    pub fn schedule() -> Option<(Pid, usize)> {
+        interrupts::without_interrupts(|| {
+            // 清除重调度标志
+            NEED_RESCHED.store(false, Ordering::SeqCst);
+
+            // 获取当前运行的进程
+            let current_pid = *CURRENT_PROCESS.lock();
+
+            // 在单次锁定中获取所需的所有引用
+            let (next_pid, current_proc, next_proc) = {
+                let queue = READY_QUEUE.lock();
+                let next = Self::select_next_locked(&queue);
+                let current_proc = current_pid.and_then(|pid| Self::find_pcb(&queue, pid));
+                let next_proc = next.and_then(|pid| Self::find_pcb(&queue, pid));
+                (next, current_proc, next_proc)
+            };
+
+            // 选择下一个要运行的进程
+            if let Some(next_pid) = next_pid {
+                if Some(next_pid) != current_pid {
+                    // 保存当前进程状态
+                    if let Some(proc) = current_proc {
+                        let mut pcb = proc.lock();
+                        if pcb.state == ProcessState::Running {
+                            pcb.state = ProcessState::Ready;
+                        }
+                    }
+
+                    // 设置新进程为运行态并获取其地址空间
+                    let next_memory_space = if let Some(proc) = next_proc {
+                        let mut pcb = proc.lock();
+                        pcb.state = ProcessState::Running;
+                        pcb.reset_time_slice();
+                        pcb.memory_space
+                    } else {
+                        0 // 默认使用引导页表
+                    };
+
+                    // 注意：不在此处切换 CR3
+                    // CR3 切换必须与 switch_context 配合执行，否则会导致：
+                    // 1. 中断返回后运行在错误的地址空间
+                    // 2. 被中断的代码访问错误的内存映射
+                    //
+                    // TODO: 实现完整的上下文切换路径后，在此处或调用方处理 CR3
+                    // process::activate_memory_space(next_memory_space);
+
+                    // 更新当前进程
+                    Self::set_current(Some(next_pid));
+
+                    let mut stats = SCHEDULER_STATS.lock();
+                    stats.total_switches += 1;
+
+                    return Some((next_pid, next_memory_space));
+                }
+            }
+            None
+        })
     }
 
     /// 主动让出CPU
-    pub fn yield_cpu() {
-        if let Some(pid) = Self::get_current() {
-            if let Some(pcb) = {
-                let queue = READY_QUEUE.lock();
-                Self::find_pcb(&queue, pid)
-            } {
-                let mut proc = pcb.lock();
-                proc.state = ProcessState::Ready;
-                proc.update_dynamic_priority(); // 奖励主动让出的进程
+    ///
+    /// 返回值：如果发生进程切换，返回 (新进程PID, 新进程地址空间)
+    pub fn yield_cpu() -> Option<(Pid, usize)> {
+        interrupts::without_interrupts(|| {
+            if let Some(pid) = Self::get_current() {
+                if let Some(pcb) = {
+                    let queue = READY_QUEUE.lock();
+                    Self::find_pcb(&queue, pid)
+                } {
+                    let mut proc = pcb.lock();
+                    proc.state = ProcessState::Ready;
+                    proc.update_dynamic_priority(); // 奖励主动让出的进程
+                }
             }
-        }
+        });
 
-        Self::schedule();
+        Self::schedule()
     }
 
     /// 获取进程数量
     pub fn process_count() -> usize {
-        READY_QUEUE
-            .lock()
-            .values()
-            .map(|bucket| bucket.len())
-            .sum()
+        interrupts::without_interrupts(|| {
+            READY_QUEUE
+                .lock()
+                .values()
+                .map(|bucket| bucket.len())
+                .sum()
+        })
     }
 
     /// 打印调度统计信息
     pub fn print_stats() {
-        SCHEDULER_STATS.lock().print();
+        interrupts::without_interrupts(|| {
+            SCHEDULER_STATS.lock().print();
+        });
+    }
+
+    /// 在安全上下文中执行完整上下文切换（含 CR3）
+    ///
+    /// # Arguments
+    /// * `force` - true 无视 NEED_RESCHED 立即尝试切换（用于 sys_yield）
+    ///           - false 只有 NEED_RESCHED 置位时才切换（用于系统调用返回点）
+    ///
+    /// 此函数是调度器的核心入口点，负责：
+    /// 1. 检查是否需要调度
+    /// 2. 选择下一个进程
+    /// 3. 保存旧进程上下文（在旧地址空间中）
+    /// 4. 切换地址空间（CR3）
+    /// 5. 恢复新进程上下文并跳转
+    ///
+    /// **警告**: 此函数可能不会返回（如果发生上下文切换）
+    pub fn reschedule_now(force: bool) {
+        interrupts::without_interrupts(|| {
+            // 如果不是强制调度，检查 NEED_RESCHED 标志
+            if !force && !NEED_RESCHED.swap(false, Ordering::SeqCst) {
+                return;
+            }
+
+            // 保存当前进程 PID
+            let old_pid = *CURRENT_PROCESS.lock();
+
+            // 执行调度决策
+            let sched_decision = Self::schedule();
+            let (next_pid, next_space) = match sched_decision {
+                Some(v) => v,
+                None => return, // 没有可调度的进程
+            };
+
+            // 如果新旧进程相同，无需切换
+            if old_pid == Some(next_pid) {
+                return;
+            }
+
+            // 获取新进程的 PCB（必须存在）
+            let next_pcb = match process::get_process(next_pid) {
+                Some(p) => p,
+                None => return,
+            };
+
+            // 获取旧进程的上下文指针
+            // 首次调度时 old_pid 为 None，使用哑上下文保存内核启动状态
+            let old_ctx_ptr: *mut ArchContext = match old_pid.and_then(process::get_process) {
+                Some(old_pcb) => {
+                    let mut guard = old_pcb.lock();
+                    &mut guard.context as *mut _ as *mut ArchContext
+                }
+                None => {
+                    // 首次调度：保存到哑上下文（不会被恢复）
+                    let mut bootstrap = BOOTSTRAP_CONTEXT.lock();
+                    &mut *bootstrap as *mut ArchContext
+                }
+            };
+
+            // 获取新进程的上下文指针和内核栈顶
+            let (new_ctx_ptr, next_kstack_top): (*const ArchContext, u64) = {
+                let guard = next_pcb.lock();
+                let ctx = &guard.context as *const _ as *const ArchContext;
+                let kstack_top = guard.kernel_stack_top.as_u64();
+                (ctx, kstack_top)
+            };
+
+            // 执行上下文切换
+            // switch_context 内部流程：
+            // 1. 保存当前寄存器到 old_ctx（在当前/旧地址空间中完成）
+            // 2. 恢复新进程寄存器（包括 rsp）
+            // 3. 跳转到新进程的 rip
+            //
+            // 注意：CR3 切换在 switch_context 之后执行会有问题，因为跳转后
+            // 已在新进程的执行路径中。因此我们在切换前激活新地址空间。
+            //
+            // 安全性说明：当前内核使用共享内核地址空间模型，所有进程的
+            // 内核映射（高地址半区）相同，因此 CR3 切换后仍能访问所有 PCB。
+
+            // 更新 TSS.rsp0 为新进程的内核栈顶
+            // 这确保从用户态中断/异常返回时使用正确的内核栈
+            // 如果进程没有专用内核栈，回退到默认内核栈以避免使用旧进程的栈
+            let effective_kstack_top = if next_kstack_top != 0 {
+                next_kstack_top
+            } else {
+                default_kernel_stack_top()
+            };
+            unsafe { set_kernel_stack(effective_kstack_top); }
+
+            process::activate_memory_space(next_space);
+
+            // 执行上下文切换
+            // 对于旧进程，函数会在下次被调度时从这里"返回"
+            unsafe {
+                switch_context(old_ctx_ptr, new_ctx_ptr);
+            }
+        });
     }
 }
 
@@ -282,7 +441,14 @@ pub fn init() {
     // 注册进程清理回调，确保进程终止时调度器同步更新
     process::register_cleanup_notifier(Scheduler::remove_process);
 
+    // 注册定时器回调，让 arch 模块的定时器中断能调用调度器
+    kernel_core::register_timer_callback(Scheduler::on_clock_tick);
+
+    // 注册重调度回调，让系统调用返回时能触发调度
+    kernel_core::register_resched_callback(Scheduler::reschedule_now);
+
     println!("Enhanced scheduler initialized");
     println!("  Ready queue capacity: unlimited");
     println!("  Scheduling algorithm: Priority-based with time slice");
+    println!("  Context switch: Enabled with CR3 switching");
 }

@@ -5,7 +5,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use lazy_static::lazy_static;
-use sched::enhanced_scheduler::Scheduler;
+use kernel_core::on_scheduler_tick;
 use crate::gdt;
 use crate::context_switch;
 
@@ -354,22 +354,39 @@ extern "x86-interrupt" fn virtualization_handler(_stack_frame: InterruptStackFra
 /// 每次定时器中断时执行：
 /// 1. 更新中断统计
 /// 2. 更新系统时钟
-/// 3. 调用调度器处理时间片（启用抢占式调度）
+/// 3. 通过钩子调用调度器处理时间片
 /// 4. 发送 EOI
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+/// 5. 如果从用户态返回且需要重调度，执行抢占
+///
+/// 注意：必须先发送 EOI 再执行抢占，避免上下文切换后 IRQ0 被屏蔽。
+/// 内核态中断不抢占，以避免持锁时发生调度。
+extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
     INTERRUPT_STATS.timer.fetch_add(1, Ordering::Relaxed);
 
     // 更新系统时钟计数器
     kernel_core::on_timer_tick();
 
-    // 调用调度器的时钟 tick 处理
-    // 这将更新当前进程的时间片，并在时间片耗尽时触发调度
-    Scheduler::on_clock_tick();
+    // 通过钩子调用调度器的时钟 tick 处理
+    // 调度器会更新时间片并设置 NEED_RESCHED 标志（如需要）
+    on_scheduler_tick();
 
-    // 发送 EOI (End of Interrupt) 到 PIC
-    // 必须在调度器处理之后发送，确保中断在调度完成后才能再次触发
+    // 先发送 EOI (End of Interrupt) 到 PIC
+    // 必须在抢占之前发送，避免上下文切换后 IRQ0 长时间被屏蔽
     unsafe {
         core::arch::asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
+    }
+
+    // 检查是否即将返回用户态（RPL == 3）
+    // CS 的低 2 位是请求特权级 (RPL)
+    let returning_to_user = (stack_frame.code_segment.0 & 0x3) == 3;
+
+    // 【关键修复】返回用户态前仅标记需要调度，避免在中断栈上直接 switch_context
+    // 在中断上下文中调用 switch_context 会导致：
+    // 1. 使用中断栈而非进程内核栈
+    // 2. 没有正确的 iret 降权路径
+    // 实际调度延迟到安全路径（syscall 返回）执行
+    if returning_to_user {
+        kernel_core::request_resched_from_irq();
     }
 }
 

@@ -8,6 +8,7 @@ use x86_64::{
 use crate::fork::PAGE_REF_COUNT;
 use crate::time;
 use mm::memory::FrameAllocator;
+use mm::page_table;
 
 /// 进程ID类型
 pub type ProcessId = usize;
@@ -18,11 +19,98 @@ pub type Priority = u8;
 /// mmap 默认起始地址
 const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
 
+/// 页大小
+const PAGE_SIZE: u64 = 0x1000;
+
+/// 每进程内核栈基址（PML4[511]/PDPT[508]，在共享内核空间内）
+pub const KSTACK_BASE: u64 = 0xFFFF_FFFF_0000_0000;
+
+/// 每进程内核栈步长（16KB 栈 + 4KB 守护页 = 20KB）
+pub const KSTACK_STRIDE: u64 = 0x5000;
+
+/// 内核栈页数（16KB = 4 页）
+const KSTACK_PAGES: usize = 4;
+
+/// 守护页数
+const KSTACK_GUARD_PAGES: usize = 1;
+
 /// 调度器清理回调类型
 type SchedulerCleanupCallback = fn(ProcessId);
 
 /// IPC清理回调类型
 type IpcCleanupCallback = fn(ProcessId);
+
+/// 内核栈分配错误
+#[derive(Debug, Clone, Copy)]
+pub enum KernelStackError {
+    /// 栈地址已被映射（PID 复用时可能发生）
+    AlreadyMapped,
+    /// 物理内存分配失败
+    AllocationFailed,
+    /// 页表映射失败
+    MapFailed,
+}
+
+/// 计算指定 PID 的内核栈虚拟地址范围
+///
+/// 返回 (栈底, 栈顶)，栈向下生长，栈顶用于 TSS.rsp0
+#[inline]
+pub fn kernel_stack_slot(pid: ProcessId) -> (VirtAddr, VirtAddr) {
+    let guard_base = VirtAddr::new(KSTACK_BASE + pid as u64 * KSTACK_STRIDE);
+    let stack_base = guard_base + (KSTACK_GUARD_PAGES as u64 * PAGE_SIZE);
+    let stack_top = stack_base + (KSTACK_PAGES as u64 * PAGE_SIZE);
+    (stack_base, stack_top)
+}
+
+/// 为指定 PID 分配并映射带守护页的内核栈
+///
+/// 在共享的内核页表上映射，所有进程地址空间均可见。
+/// 守护页不映射物理帧，访问时会触发页错误。
+///
+/// # Returns
+///
+/// 成功返回 (栈底, 栈顶)，失败返回错误
+pub fn allocate_kernel_stack(pid: ProcessId) -> Result<(VirtAddr, VirtAddr), KernelStackError> {
+    let (stack_base, stack_top) = kernel_stack_slot(pid);
+    let guard_base = VirtAddr::new(KSTACK_BASE + pid as u64 * KSTACK_STRIDE);
+
+    let mut frame_alloc = FrameAllocator::new();
+
+    unsafe {
+        page_table::with_current_manager(VirtAddr::new(0), |mgr| {
+            // 检查整个 slot（守护页 + 栈页）是否已被映射
+            let total_pages = KSTACK_PAGES + KSTACK_GUARD_PAGES;
+            for i in 0..total_pages {
+                let addr = guard_base + (i as u64 * PAGE_SIZE);
+                if mgr.translate_addr(addr).is_some() {
+                    return Err(KernelStackError::AlreadyMapped);
+                }
+            }
+
+            // 分配连续物理帧
+            let phys_start = frame_alloc
+                .allocate_contiguous_frames(KSTACK_PAGES)
+                .ok_or(KernelStackError::AllocationFailed)?
+                .start_address();
+
+            // 内核栈页标志：可写、不可执行、全局（跨 CR3 有效）
+            let flags = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::NO_EXECUTE
+                | PageTableFlags::GLOBAL;
+
+            // 映射栈页（守护页不映射，自动触发页错误）
+            let stack_size = (KSTACK_PAGES as u64 * PAGE_SIZE) as usize;
+            mgr.map_range(stack_base, phys_start, stack_size, flags, &mut frame_alloc)
+                .map_err(|_| KernelStackError::MapFailed)?;
+
+            // 清零栈区域
+            core::ptr::write_bytes(stack_base.as_mut_ptr::<u8>(), 0, stack_size);
+
+            Ok((stack_base, stack_top))
+        })
+    }
+}
 
 /// 进程状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,9 +254,12 @@ pub struct Process {
     /// CPU上下文
     pub context: Context,
     
-    /// 内核栈指针
+    /// 内核栈指针（栈底）
     pub kernel_stack: VirtAddr,
-    
+
+    /// 内核栈顶（用于 TSS.rsp0）
+    pub kernel_stack_top: VirtAddr,
+
     /// 用户栈指针（如果是用户进程）
     pub user_stack: Option<VirtAddr>,
     
@@ -183,7 +274,10 @@ pub struct Process {
 
     /// 退出码
     pub exit_code: Option<i32>,
-    
+
+    /// 等待的子进程（Some(0) 表示等待任意子进程，Some(pid) 表示等待特定子进程）
+    pub waiting_child: Option<ProcessId>,
+
     /// 子进程列表
     pub children: Vec<ProcessId>,
     
@@ -207,11 +301,13 @@ impl Process {
             time_slice: calculate_time_slice(priority),
             context: Context::default(),
             kernel_stack: VirtAddr::new(0),
+            kernel_stack_top: VirtAddr::new(0),
             user_stack: None,
             memory_space: 0,
             mmap_regions: BTreeMap::new(),
             next_mmap_addr: DEFAULT_MMAP_BASE,
             exit_code: None,
+            waiting_child: None,
             children: Vec::new(),
             cpu_time: 0,
             created_at: time::current_timestamp_ms(),
@@ -299,6 +395,20 @@ pub fn create_process(name: String, ppid: ProcessId, priority: Priority) -> Proc
     drop(next_pid);
 
     let process = Arc::new(Mutex::new(Process::new(pid, ppid, name.clone(), priority)));
+
+    // 为进程分配内核栈
+    match allocate_kernel_stack(pid) {
+        Ok((stack_base, stack_top)) => {
+            let mut proc = process.lock();
+            proc.kernel_stack = stack_base;
+            proc.kernel_stack_top = stack_top;
+            drop(proc);
+        }
+        Err(e) => {
+            println!("Warning: Failed to allocate kernel stack for PID {}: {:?}", pid, e);
+            // 内核栈分配失败时使用默认栈（回退到共享内核栈）
+        }
+    }
 
     let mut table = PROCESS_TABLE.lock();
 
@@ -408,11 +518,13 @@ fn notify_ipc_process_cleanup(pid: ProcessId) {
 pub fn terminate_process(pid: ProcessId, exit_code: i32) {
     if let Some(process) = get_process(pid) {
         let children_to_reparent: Vec<ProcessId>;
+        let parent_pid: ProcessId;
 
         {
             let mut proc = process.lock();
             proc.state = ProcessState::Zombie;
             proc.exit_code = Some(exit_code);
+            parent_pid = proc.ppid;
             children_to_reparent = proc.children.clone();
             proc.children.clear();
         }
@@ -424,7 +536,28 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             reparent_orphans(&children_to_reparent);
         }
 
-        // TODO: 唤醒等待此进程的父进程
+        // 唤醒等待此进程的父进程
+        let mut wake_parent = false;
+
+        if parent_pid > 0 {
+            if let Some(parent) = get_process(parent_pid) {
+                let mut parent_proc = parent.lock();
+                let waiting = parent_proc.waiting_child;
+                // 父进程正在等待，且等待的是任意子进程(0)或此特定子进程
+                if parent_proc.state == ProcessState::Blocked
+                    && (waiting == Some(0) || waiting == Some(pid))
+                {
+                    parent_proc.state = ProcessState::Ready;
+                    parent_proc.waiting_child = None;
+                    wake_parent = true;
+                }
+            }
+        }
+
+        // 在释放锁后触发调度，让被唤醒的父进程有机会运行
+        if wake_parent {
+            crate::force_reschedule();
+        }
     }
 }
 
@@ -506,6 +639,7 @@ pub fn cleanup_zombie(pid: ProcessId) {
 
 /// 释放进程持有的内核资源
 ///
+/// - 释放 per-process 内核栈（取消映射并归还物理帧）
 /// - 清理 mmap 区域跟踪信息
 /// - 如果进程拥有独立页表（memory_space != 0），直接遍历该页表：
 ///   * 仅处理用户空间 PML4 条目 0-255
@@ -516,41 +650,29 @@ pub fn cleanup_zombie(pid: ProcessId) {
 ///
 /// # 当前限制
 ///
-/// - **内核栈**: 当前实现未动态分配 per-process 内核栈，所有进程共享 TSS 中的
-///   静态内核栈。若将来实现 per-process 内核栈分配，需在此处释放。
 /// - **HUGE_PAGE**: 用户空间应仅使用 4KB 页面。若存在 2MB/1GB 大页映射，
 ///   当前实现会跳过以避免 buddy allocator 损坏。
 fn free_process_resources(proc: &mut Process) {
     let region_count = proc.mmap_regions.len();
     let total_size: usize = proc.mmap_regions.values().sum();
 
+    // 释放 per-process 内核栈
+    if proc.kernel_stack.as_u64() != 0 {
+        free_kernel_stack(proc.pid, proc.kernel_stack);
+        proc.kernel_stack = VirtAddr::new(0);
+        proc.kernel_stack_top = VirtAddr::new(0);
+    }
+
     // 清理 mmap 区域跟踪
     proc.mmap_regions.clear();
 
     // 如果进程拥有独立的页表（memory_space != 0），释放页表及其管理的物理帧
     if proc.memory_space != 0 {
-        unsafe {
-            let mut frame_alloc = FrameAllocator::new();
-            let root_frame: PhysFrame<Size4KiB> =
-                PhysFrame::containing_address(PhysAddr::new(proc.memory_space as u64));
-            let root_table = phys_to_virt_table(root_frame.start_address());
-
-            // 只遍历用户空间映射 (PML4 index 0-255)，内核高半区 (256-511) 共享无需处理
-            free_page_table_level(root_table, 4, &mut frame_alloc);
-
-            // 释放 PML4 帧本身
-            frame_alloc.deallocate_frame(root_frame);
-
-            println!("  Released page table hierarchy for process {} (root=0x{:x})",
-                proc.pid, proc.memory_space);
-        }
+        free_address_space(proc.memory_space);
+        println!("  Released page table hierarchy for process {} (root=0x{:x})",
+            proc.pid, proc.memory_space);
         proc.memory_space = 0;
     }
-
-    // TODO: 当实现 per-process 内核栈分配后，在此处释放内核栈：
-    // if proc.kernel_stack.as_u64() != 0 {
-    //     free_kernel_stack(proc.kernel_stack);
-    // }
 
     // 通知 IPC 子系统清理进程端点（通过回调避免循环依赖）
     notify_ipc_process_cleanup(proc.pid);
@@ -558,6 +680,81 @@ fn free_process_resources(proc: &mut Process) {
     if region_count > 0 {
         println!("  Cleared {} mmap regions ({} KB) for process {}",
             region_count, total_size / 1024, proc.pid);
+    }
+}
+
+/// 释放指定进程的内核栈
+///
+/// 取消内核栈页面的映射并归还物理帧。守护页从未映射故无需处理。
+///
+/// # Arguments
+///
+/// * `pid` - 进程 ID（用于日志）
+/// * `stack_base` - 内核栈底地址
+///
+/// # Safety Notes
+///
+/// 如果当前 CPU 正在使用该栈，则跳过释放以避免自踩栈导致崩溃
+pub fn free_kernel_stack(pid: ProcessId, stack_base: VirtAddr) {
+    use core::arch::asm;
+    use x86_64::structures::paging::Page;
+
+    // 【关键修复】检查当前 CPU 是否正在使用该栈
+    let current_rsp: u64;
+    unsafe { asm!("mov {}, rsp", out(reg) current_rsp, options(nomem, preserves_flags)); }
+
+    let stack_bottom = stack_base.as_u64();
+    let stack_top = stack_bottom + (KSTACK_PAGES as u64 * PAGE_SIZE);
+
+    if current_rsp >= stack_bottom && current_rsp < stack_top {
+        // 当前 CPU 正在使用此栈，不能释放（会导致自踩栈崩溃）
+        // 这种情况不应该发生（进程应在不同栈上清理自己的栈），但防御性编程
+        println!("  WARNING: Skip releasing kernel stack for PID {} (in use by current CPU, RSP=0x{:x})",
+            pid, current_rsp);
+        return;
+    }
+
+    let mut frame_alloc = FrameAllocator::new();
+
+    unsafe {
+        page_table::with_current_manager(VirtAddr::new(0), |mgr| {
+            for i in 0..KSTACK_PAGES {
+                let addr = stack_base + (i as u64 * PAGE_SIZE);
+                let page = Page::containing_address(addr);
+
+                if let Ok(frame) = mgr.unmap_page(page) {
+                    frame_alloc.deallocate_frame(frame);
+                }
+            }
+        });
+    }
+
+    println!("  Released kernel stack for PID {} at 0x{:x}", pid, stack_base.as_u64());
+}
+
+/// 释放独立用户地址空间（PML4 物理地址）
+///
+/// - 仅遍历用户空间映射 (PML4[0..255])
+/// - 使用 COW 引用计数安全地释放叶子页
+/// - 最后释放 PML4 帧本身
+///
+/// 调用者必须确保该地址空间不再被任何 CPU 使用。
+pub fn free_address_space(memory_space: usize) {
+    if memory_space == 0 {
+        return;
+    }
+
+    unsafe {
+        let mut frame_alloc = FrameAllocator::new();
+        let root_frame: PhysFrame<Size4KiB> =
+            PhysFrame::containing_address(PhysAddr::new(memory_space as u64));
+        let root_table = phys_to_virt_table(root_frame.start_address());
+
+        // 只遍历用户空间映射 (PML4 index 0-255)，内核高半区 (256-511) 共享无需处理
+        free_page_table_level(root_table, 4, &mut frame_alloc);
+
+        // 释放 PML4 帧本身
+        frame_alloc.deallocate_frame(root_frame);
     }
 }
 

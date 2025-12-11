@@ -2,7 +2,7 @@
 //!
 //! 实现完整的进程复制功能，包含写时复制(COW)机制
 
-use crate::process::{ProcessId, ProcessState, current_pid, get_process, create_process};
+use crate::process::{ProcessId, ProcessState, current_pid, get_process, create_process, free_address_space, free_kernel_stack};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use mm::memory::FrameAllocator;
@@ -38,35 +38,57 @@ pub enum ForkError {
 }
 
 /// 执行fork系统调用
-/// 
+///
 /// 创建当前进程的完整副本，包括：
 /// - 进程控制块（PCB）
 /// - CPU上下文
 /// - 内存空间（使用写时复制COW）
 /// - 文件描述符表
-/// 
+///
 /// # 返回值
-/// 
+///
 /// - 父进程：返回子进程的PID
 /// - 子进程：返回0
 /// - 错误：返回错误码
 pub fn sys_fork() -> Result<ProcessId, ForkError> {
     let current = current_pid().ok_or(ForkError::NoCurrentProcess)?;
     let parent_process = get_process(current).ok_or(ForkError::ProcessNotFound)?;
-    let mut parent = parent_process.lock();
 
-    // 获取父进程页表根地址
-    let parent_root = if parent.memory_space == 0 {
-        let (cr3, _) = Cr3::read();
-        cr3.start_address().as_u64() as usize
-    } else {
-        parent.memory_space
+    // 捕获父进程信息后释放锁，避免 create_process 再次获取锁导致潜在问题
+    let (parent_root, parent_pid, parent_prio, child_name) = {
+        let parent = parent_process.lock();
+        let root = if parent.memory_space == 0 {
+            let (cr3, _) = Cr3::read();
+            cr3.start_address().as_u64() as usize
+        } else {
+            parent.memory_space
+        };
+        (root, parent.pid, parent.priority, alloc::format!("{}-child", parent.name))
     };
 
-    // 创建子进程
-    let child_name = alloc::format!("{}-child", parent.name);
-    let child_pid = create_process(child_name, parent.pid, parent.priority);
+    // 创建子进程（此时未持有父进程锁，避免死锁）
+    let child_pid = create_process(child_name, parent_pid, parent_prio);
 
+    // 重新获取父进程锁执行真正的 fork
+    let mut parent = parent_process.lock();
+    let result = fork_inner(&mut parent, child_pid, parent_root);
+
+    if result.is_err() {
+        // 从父进程子列表移除失败的占位 PID，防止悬挂
+        parent.children.retain(|&pid| pid != child_pid);
+        drop(parent);
+        cleanup_partial_child(child_pid);
+    }
+
+    result
+}
+
+/// Fork 的内部实现，便于错误处理和回滚
+fn fork_inner(
+    parent: &mut crate::process::Process,
+    child_pid: ProcessId,
+    parent_root: usize,
+) -> Result<ProcessId, ForkError> {
     if let Some(child_process) = get_process(child_pid) {
         let mut child = child_process.lock();
 
@@ -79,18 +101,64 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
 
         // 复制页表并设置 COW
         unsafe {
-            copy_page_table_cow(
+            if let Err(e) = copy_page_table_cow(
                 parent_root,
                 child_root_frame.start_address().as_u64() as usize,
-            )?;
+            ) {
+                // 页表复制失败，释放已分配的页表树
+                // 注意：copy_page_table_cow 可能已经分配了部分子页表
+                free_address_space(child_root_frame.start_address().as_u64() as usize);
+                return Err(e);
+            }
         }
 
         child.memory_space = child_root_frame.start_address().as_u64() as usize;
 
-        // 复制 CPU 上下文
+        // 复制 CPU 上下文（RAX 在下方置 0）
         child.context = parent.context;
-        child.kernel_stack = parent.kernel_stack;
         child.user_stack = parent.user_stack;
+
+        // 子进程使用自己的内核栈（由 create_process -> allocate_kernel_stack 分配）
+        // 复制父进程内核栈内容以保持返回路径一致
+        let parent_top = parent.kernel_stack_top.as_u64();
+        let parent_rsp = parent.context.rsp;
+        let child_top = child.kernel_stack_top.as_u64();
+
+        // 计算父进程已使用的栈空间
+        let used = parent_top.saturating_sub(parent_rsp);
+        let parent_stack_size = parent_top.saturating_sub(parent.kernel_stack.as_u64());
+
+        if child_top != 0 && used > 0 && used <= parent_stack_size {
+            // 子进程栈顶减去相同使用量 = 子进程 RSP
+            let child_rsp = child_top - used;
+
+            // 复制父栈内容到子栈
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    parent_rsp as *const u8,
+                    child_rsp as *mut u8,
+                    used as usize,
+                );
+            }
+
+            child.context.rsp = child_rsp;
+
+            // 调整 RBP（如果它指向父栈范围内）
+            if parent.context.rbp >= parent_rsp && parent.context.rbp <= parent_top {
+                // RBP 相对偏移保持不变
+                let rbp_offset = parent.context.rbp - parent_rsp;
+                child.context.rbp = child_rsp + rbp_offset;
+            } else {
+                // RBP 不在栈范围内，直接使用子栈顶
+                child.context.rbp = child_rsp;
+            }
+        } else if child_top != 0 {
+            // 无法复制栈，使用子栈顶作为起点
+            child.context.rsp = child_top;
+            child.context.rbp = child_top;
+        }
+        // 如果 child_top == 0，保持父进程的 rsp/rbp（回退到共享栈）
+
         child.time_slice = parent.time_slice;
         child.cpu_time = 0;
         child.context.rax = 0; // 子进程返回值 0
@@ -101,6 +169,43 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
     } else {
         Err(ForkError::ProcessNotFound)
     }
+}
+
+/// 清理失败的 fork 创建的部分子进程
+fn cleanup_partial_child(child_pid: ProcessId) {
+    use crate::process::PROCESS_TABLE;
+
+    // 预先收集需要释放的资源，避免长时间持有 PROCESS_TABLE 锁
+    let (kstack, addr_space) = {
+        let mut table = PROCESS_TABLE.lock();
+        if let Some(slot) = table.get_mut(child_pid) {
+            if let Some(process) = slot.take() {
+                let proc = process.lock();
+                (
+                    if proc.kernel_stack.as_u64() != 0 {
+                        Some(proc.kernel_stack)
+                    } else {
+                        None
+                    },
+                    proc.memory_space,
+                )
+            } else {
+                (None, 0)
+            }
+        } else {
+            (None, 0)
+        }
+    };
+
+    // 在 PROCESS_TABLE 锁外释放资源
+    if let Some(stack_base) = kstack {
+        free_kernel_stack(child_pid, stack_base);
+    }
+    if addr_space != 0 {
+        free_address_space(addr_space);
+    }
+
+    println!("Fork failed: cleaned up partial child PID {}", child_pid);
 }
 
 /// 实现写时复制(Copy-On-Write)的页表复制
@@ -382,6 +487,15 @@ fn clone_leaf(
         // 增加引用计数（父进程和子进程各一次）
         PAGE_REF_COUNT.increment(addr_usize);
         PAGE_REF_COUNT.increment(addr_usize);
+    } else if flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+        // 【关键修复】只读用户页面（如代码段）也在进程间共享
+        // 缺少引用计数会导致父进程退出时页面被释放，而子进程仍在使用
+        let prev = PAGE_REF_COUNT.get(addr_usize);
+        PAGE_REF_COUNT.increment(addr_usize);  // 子进程持有引用
+        if prev == 0 {
+            // 首次跟踪此页面时，补记父进程的持有
+            PAGE_REF_COUNT.increment(addr_usize);
+        }
     }
 
     // 子进程使用相同的映射
@@ -433,4 +547,45 @@ unsafe fn phys_to_virt_table(phys: PhysAddr) -> &'static mut PageTable {
 unsafe fn zero_table(frame: PhysFrame) {
     let virt = mm::phys_to_virt(frame.start_address());
     core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 4096);
+}
+
+/// 创建新的用户地址空间
+///
+/// 分配新的 PML4 页表并复制内核高半区映射（索引 256-511）。
+/// 用户空间（索引 0-255）为空，供后续 ELF 加载使用。
+///
+/// # Returns
+///
+/// 成功返回新 PML4 的物理帧和物理地址，失败返回 ForkError
+///
+/// # Safety
+///
+/// 返回的页表必须在使用完毕后释放，否则会内存泄漏。
+pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), ForkError> {
+    let mut frame_alloc = FrameAllocator::new();
+
+    // 分配新的 PML4 帧
+    let new_pml4_frame = frame_alloc
+        .allocate_frame()
+        .ok_or(ForkError::MemoryAllocationFailed)?;
+
+    // 清零新页表
+    unsafe { zero_table(new_pml4_frame); }
+
+    // 获取当前页表根（复制内核映射）
+    let (current_frame, _) = Cr3::read();
+
+    unsafe {
+        let current_pml4 = phys_to_virt_table(current_frame.start_address());
+        let new_pml4 = phys_to_virt_table(new_pml4_frame.start_address());
+
+        // 复制内核高半区映射（索引 256-511）
+        // 这些映射在所有进程间共享
+        for i in 256..512 {
+            new_pml4[i] = current_pml4[i].clone();
+        }
+    }
+
+    let phys_addr = new_pml4_frame.start_address().as_u64() as usize;
+    Ok((new_pml4_frame, phys_addr))
 }

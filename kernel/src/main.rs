@@ -138,15 +138,15 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("      ✓ arch crate loaded");
     println!("      ✓ Context switch module available");
     
-    println!("[5/8] Verifying scheduler...");
-    println!("      ✓ sched crate loaded");
-    println!("      ✓ Enhanced scheduler compiled");
-    
-    println!("[6/8] Verifying kernel core...");
-    println!("      ✓ kernel_core crate loaded");
+    println!("[5/8] Initializing kernel core...");
+    kernel_core::init();  // 初始化进程管理和 BOOT_CR3 缓存（必须在调度器前）
     println!("      ✓ Process management ready");
     println!("      ✓ System calls framework ready");
     println!("      ✓ Fork/COW implementation compiled");
+
+    println!("[6/8] Initializing scheduler...");
+    sched::enhanced_scheduler::init();  // 注册定时器和重调度回调
+    println!("      ✓ Enhanced scheduler initialized");
     
     println!("[7/8] Initializing IPC...");
     ipc::init();  // 初始化IPC子系统并注册清理回调

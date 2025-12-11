@@ -165,3 +165,12 @@ pub unsafe fn set_ist_stack(index: usize, stack_top: VirtAddr) {
     let tss_ptr = &*TSS as *const TaskStateSegment as *mut TaskStateSegment;
     (*tss_ptr).interrupt_stack_table[index] = stack_top;
 }
+
+/// 获取默认内核栈顶地址
+///
+/// 当进程没有分配专用内核栈时，可使用此默认栈。
+/// 返回 GDT 初始化时配置的 TSS.rsp0 默认值。
+pub fn default_kernel_stack_top() -> u64 {
+    let stack_start = VirtAddr::from_ptr(unsafe { &raw const KERNEL_STACK.0 });
+    (stack_start + KERNEL_STACK_SIZE as u64).as_u64()
+}
