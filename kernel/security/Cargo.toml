@@ -1,0 +1,15 @@
+[package]
+name = "security"
+version = "0.1.0"
+edition = "2021"
+description = "Security hardening module for Zero-OS kernel"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+spin = "0.9"
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
+x86_64 = "0.15"
+mm = { path = "../mm" }
+drivers = { path = "../drivers" }

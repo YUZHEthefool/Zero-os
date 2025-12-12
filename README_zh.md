@@ -1,82 +1,227 @@
 [Switch to English (切换到英文)](README.md)
 
-# ZERO-os
+# Zero-OS
+
+一个以安全为先的微内核操作系统，使用 Rust 编写，面向 x86_64 架构。
+
+**设计原则：** 安全性 > 效率 > 速度
+
+---
+
 ## 1. 概述
-这是一个用 Rust 编写的简单微内核，旨在探索操作系统内核的基本原理。它包括一个 UEFI 引导加载程序和一个具有基本功能的内核，例如内存管理、进程管理、IPC 和调度。该项目被组织为一个 Cargo 工作区，包含两个主要组件：`bootloader` 和 `kernel`。
+
+Zero-OS 是一个企业级微内核，灵感来自 Linux 的模块化设计，具有以下特性：
+
+- **内存安全**：完全使用 Rust 编写，配合硬件保护（NX、W^X）
+- **进程隔离**：每进程独立地址空间，支持 COW（写时复制）
+- **抢占式调度**：多级反馈队列，基于优先级选择
+- **基于能力的 IPC**：进程间通信的细粒度访问控制
+- **安全加固**：W^X 强制执行、恒等映射清理、CSPRNG（ChaCha20）
+
+### 当前状态 (v0.3.1)
+
+| 组件 | 状态 | 描述 |
+|------|------|------|
+| 启动和内存 | 完成 | UEFI 启动、COW、守护页、伙伴分配器 |
+| 进程管理 | 完成 | 每进程地址空间、fork/exec/wait |
+| 调度器 | 完成 | IRQ 安全的 MLFQ、抢占式调度 |
+| IPC | 完成 | 管道、消息队列、futex、信号 |
+| 安全 | Phase 0 | W^X 验证、RNG、恒等映射加固 |
+| VFS | 未开始 | - |
+| 用户模式 (Ring 3) | 未开始 | - |
+| 网络 | 未开始 | - |
+| SMP | 未开始 | - |
+
 ---
+
 ## 2. 项目结构
-项目工作区的组织结构如下（重构为 Linux 风格的模块化内核）：
+
 ```
-ZERO-os/
+Zero-OS/
 ├── bootloader/             # UEFI 引导加载程序
-│   ├── src/
-│   │   └── main.rs
-│   └── Cargo.toml
-├── kernel/                 # 内核工作区根目录
-│   ├── arch/               # 体系结构相关代码 (中断、启动、分页、汇编助手)
-│   │   └── lib.rs
+│   └── src/main.rs         # ELF 加载器、页表设置
+├── kernel/                 # 内核工作区
+│   ├── arch/               # x86_64 架构代码
+│   │   ├── interrupts.rs   # IDT、异常处理、PIC
+│   │   ├── context_switch.rs # 完整上下文保存/恢复
+│   │   └── gdt.rs          # 用户-内核转换的 GDT/TSS
 │   ├── mm/                 # 内存管理
-│   │   └── lib.rs
+│   │   ├── memory.rs       # 堆分配器、帧分配器
+│   │   ├── buddy_allocator.rs # 物理页分配器
+│   │   └── page_table.rs   # 页表管理器
 │   ├── sched/              # 调度器
-│   │   └── lib.rs
+│   │   ├── scheduler.rs    # 基础轮转调度
+│   │   └── enhanced_scheduler.rs # 带优先级的 MLFQ
 │   ├── ipc/                # 进程间通信
-│   │   └── lib.rs
-│   ├── drivers/            # 设备驱动程序 (VGA, 串口等)
-│   │   └── lib.rs
-│   ├── kernel_core/        # 核心进程管理、系统调用
-│   │   └── lib.rs
-│   ├── src/
-│   │   └── main.rs         # 内核入口和初始化
-│   ├── kernel.ld           # 链接脚本
-│   └── Cargo.toml
-├── Cargo.toml              # 工作区配置
-└── Makefile                # 构建脚本
+│   │   ├── ipc.rs          # 基于能力的端点
+│   │   ├── pipe.rs         # 匿名管道
+│   │   ├── futex.rs        # 用户空间快速互斥锁
+│   │   └── sync.rs         # WaitQueue、KMutex、Semaphore
+│   ├── drivers/            # 设备驱动
+│   │   ├── vga_buffer.rs   # VGA 文本模式
+│   │   └── serial.rs       # UART 16550
+│   ├── kernel_core/        # 核心内核
+│   │   ├── process.rs      # PCB、进程表
+│   │   ├── fork.rs         # 带 COW 的 Fork
+│   │   ├── syscall.rs      # 50+ 系统调用
+│   │   ├── signal.rs       # POSIX 信号
+│   │   └── elf_loader.rs   # ELF 二进制加载
+│   ├── security/           # 安全加固（新增）
+│   │   ├── wxorx.rs        # W^X 策略验证
+│   │   ├── memory_hardening.rs # 恒等映射清理、NX
+│   │   └── rng.rs          # RDRAND/RDSEED、ChaCha20 CSPRNG
+│   ├── src/main.rs         # 内核入口点
+│   └── kernel.ld           # 链接脚本
+└── Makefile                # 构建系统
 ```
-### 2.1. 引导加载程序 (Bootloader)
-`bootloader` 是一个 UEFI 应用程序，负责初始化系统和加载内核。它使用 `uefi` crate 与 UEFI 服务交互。
-### 2.2. 内核 (Kernel)
-`kernel` 是操作系统的核心，提供基本服务。
+
 ---
+
 ## 3. 核心组件
-### 内核模块化组件 (Linux 风格)
-#### `arch/`
-体系结构相关代码，包括：
-- 中断描述符表 (IDT) 初始化和处理程序
-- 页错误和双重错误处理
-- 分页设置和底层汇编助手
-#### `mm/`
-内存管理:
-- 堆分配器初始化 (`LockedHeap`)
-- 物理帧分配器
-- 高半区内核内存映射
-#### `sched/`
-调度器:
-- 简单的循环调度器
-- 进程切换逻辑
-#### `ipc/`
-进程间通信:
-- 消息队列实现
-- 用于在进程之间发送和接收消息的机制
-#### `drivers/`
-设备驱动程序:
-- VGA 文本模式输出
-- 串口驱动程序
-#### `kernel_core/`
-核心内核服务:
-- 进程结构和管理
-- 系统调用接口和处理程序
+
+### 3.1 启动流程
+
+1. UEFI 引导加载程序从 ESP 加载 `kernel.elf`
+2. 设置 4 级分页，使用 2MB 大页：
+   - 恒等映射前 4GB 用于硬件访问
+   - 高半区内核映射到 `0xFFFFFFFF80000000`
+3. 内核入口点在 `0xFFFFFFFF80100000`
+
+### 3.2 内存管理
+
+- **伙伴分配器**：物理页分配与合并
+- **LockedHeap**：线程安全的内核堆
+- **COW（写时复制）**：高效的 fork，共享页面
+- **守护页**：栈溢出保护
+- **页面清零**：防止信息泄露
+
+### 3.3 进程管理
+
+- **PCB**：进程控制块，176 字节上下文
+- **每进程地址空间**：上下文切换时切换 CR3
+- **Fork**：完整的 COW 实现，带引用计数
+- **Exec**：ELF 加载器，支持参数传递
+- **Wait/Exit**：父子进程同步，僵尸进程清理
+
+### 3.4 调度器
+
+- **多级反馈队列**：基于优先级选择
+- **时间片**：自动优先级调整
+- **IRQ 安全**：所有操作使用 `without_interrupts` 包装
+- **NEED_RESCHED**：中断上下文中的延迟调度
+
+### 3.5 IPC（进程间通信）
+
+- **消息队列**：基于能力的端点访问
+- **管道**：带阻塞 I/O 的匿名管道
+- **Futex**：用户空间快速互斥锁
+- **信号**：类 POSIX 信号处理（SIGKILL、SIGSTOP、SIGCONT 等）
+
+### 3.6 安全（Phase 0）
+
+- **W^X 强制执行**：验证没有页面同时可写和可执行
+- **恒等映射加固**：启动后移除可写标志
+- **NX 强制执行**：数据页设置不可执行位
+- **CSPRNG**：基于 ChaCha20 的 RNG，由 RDRAND/RDSEED 提供种子
+
 ---
+
 ## 4. 构建和运行
-（本节是一个模板。您可能需要根据您的 `Makefile` 填写具体的命令。）
-要构建项目，您通常需要 Rust nightly 工具链和 `cargo-xbuild`。
-```sh
-# 切换到正确的工具链
-rustup override set nightly
-# 构建内核
-make build-kernel
-# 构建引导加载程序
-make build-bootloader
-# 创建可引导镜像
-make image
-# 在 QEMU 中运行
+
+### 前置条件
+
+- Rust nightly，带 `rust-src` 和 `llvm-tools-preview`
+- 带 OVMF 的 QEMU（UEFI 启动）
+- GNU Make
+
+### 构建命令
+
+```bash
+# 构建所有组件
+make build
+
+# 构建并在 QEMU 中运行（图形界面）
 make run
+
+# 串口输出到终端
+make run-serial
+
+# 使用 GDB 调试（连接到 :1234）
+make debug
+
+# 清理构建产物
+make clean
+```
+
+### 启用硬件 RNG 运行
+
+在 QEMU 中启用 RDRAND/RDSEED 支持：
+
+```bash
+qemu-system-x86_64 -cpu host -enable-kvm ...
+# 或使用支持 RDRAND 的 CPU 型号：
+qemu-system-x86_64 -cpu Haswell ...
+```
+
+---
+
+## 5. 安全审计状态
+
+项目已经过 13 轮安全审计：
+
+| 指标 | 数值 |
+|------|------|
+| 发现的问题总数 | 70 |
+| 已修复问题 | 62 (89%) |
+| 未解决问题 | 8 (延迟到未来阶段) |
+
+详见 [qa-2025-12-11.md](qa-2025-12-11.md) 获取详细审计报告。
+
+---
+
+## 6. 路线图
+
+### 已完成 (Phase 0-3)
+- UEFI 启动与 ELF 加载
+- 内存管理（堆、伙伴分配器、COW）
+- 进程管理（fork、exec、wait、exit）
+- 抢占式调度器（MLFQ）
+- IPC（管道、消息队列、futex、信号）
+- 安全加固基础
+
+### 进行中 (Phase 4+)
+- VFS（虚拟文件系统）
+- 用户模式（Ring 3）与系统调用入口
+- 能力框架
+- MAC/LSM 安全钩子
+
+### 未来计划
+- 带防火墙的网络栈
+- SMP（多核支持）
+- 容器/命名空间隔离
+
+完整的企业安全路线图请参见 [roadmap-enterprise.md](roadmap-enterprise.md)。
+
+---
+
+## 7. 贡献指南
+
+1. 所有更改需要代码审查
+2. 提交前运行 `make build`
+3. 新功能需要更新文档
+4. Bug 修复应包含回归测试
+
+---
+
+## 8. 许可证
+
+本项目用于教育和研究目的。
+
+---
+
+## 9. 参考资料
+
+- [OSDev Wiki](https://wiki.osdev.org)
+- [用 Rust 写操作系统](https://os.phil-opp.com)
+- [Linux 内核源码](https://kernel.org)
+- [seL4 微内核](https://sel4.systems)

@@ -198,19 +198,58 @@ impl PageTableManager {
 }
 
 /// 获取活动的4级页表
-/// 
+///
 /// # Safety
-/// 
+///
 /// 调用者必须确保物理内存偏移量是正确的
 unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
     use x86_64::registers::control::Cr3;
-    
+
     let (level_4_table_frame, _) = Cr3::read();
     let phys = level_4_table_frame.start_address();
     let virt = physical_memory_offset + phys.as_u64();
     let page_table_ptr: *mut PageTable = virt.as_mut_ptr();
-    
+
     &mut *page_table_ptr
+}
+
+/// 以闭包方式访问当前活动的 PML4 页表
+///
+/// 此函数用于安全模块进行页表遍历和验证。
+/// 它直接读取 CR3 获取当前活动的页表根。
+///
+/// # Safety
+///
+/// - 调用者必须确保在闭包执行期间 CR3 不会被切换
+/// - 物理偏移量必须正确
+/// - 不应在闭包中修改会导致当前执行路径无法访问的映射
+///
+/// # Example
+///
+/// ```rust,ignore
+/// unsafe {
+///     with_active_level_4_table(|pml4| {
+///         for entry in pml4.iter() {
+///             // Process entries...
+///         }
+///     });
+/// }
+/// ```
+pub unsafe fn with_active_level_4_table<T, F>(f: F) -> T
+where
+    F: FnOnce(&mut PageTable) -> T,
+{
+    let phys_offset = get_phys_offset();
+    let level_4_table = active_level_4_table(phys_offset);
+    f(level_4_table)
+}
+
+/// 获取物理内存偏移量
+///
+/// 返回高半区直映的物理内存偏移量，用于安全模块访问页表。
+#[inline]
+pub fn get_physical_memory_offset() -> VirtAddr {
+    get_phys_offset()
 }
 
 /// 页表映射错误

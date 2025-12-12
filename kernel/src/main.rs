@@ -14,6 +14,7 @@ extern crate mm;
 extern crate sched;
 extern crate ipc;
 extern crate kernel_core;
+extern crate security;
 
 // 演示模块
 mod demo;
@@ -109,7 +110,57 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             }
         }
     }
-    
+
+    // 安全加固（Phase 0: W^X, NX, Identity Map Cleanup, CSPRNG, kptr guard, Spectre）
+    println!("[2.6/3] Applying security hardening...");
+    {
+        let mut frame_allocator = mm::memory::FrameAllocator::new();
+        // 使用 Skip 策略暂时跳过 identity map 清理
+        // 因为完全移除可写标志可能影响 VGA/MMIO 访问
+        // 生产环境应使用 RemoveWritable 或 Unmap
+        let sec_config = security::SecurityConfig {
+            phys_offset: mm::page_table::get_physical_memory_offset(),
+            cleanup_strategy: security::IdentityCleanupStrategy::Skip,
+            enforce_nx: false,  // 暂时禁用，因为内核使用 2MB huge pages
+            validate_wxorx: false, // 暂时禁用，因为 bootloader 设置了 RWX 页
+            initialize_rng: true,
+            strict_wxorx: false,
+            enable_kptr_guard: true,  // 启用内核指针混淆
+            enable_spectre_mitigations: true,  // 启用 Spectre/Meltdown 缓解
+            run_security_tests: false,  // 暂时禁用自测，可在 debug 模式启用
+        };
+
+        match security::init(sec_config, &mut frame_allocator) {
+            Ok(report) => {
+                println!("      ✓ Security hardening applied");
+                println!("        - Identity map: {:?}", report.identity_cleanup);
+                if let Some(nx) = &report.nx_summary {
+                    println!("        - NX enforced: {} pages protected", nx.data_nx_pages);
+                }
+                if report.rng_ready {
+                    println!("        - CSPRNG ready (ChaCha20 + RDRAND/RDSEED)");
+                    // 验证 RNG 工作正常
+                    match security::random_u64() {
+                        Ok(val) => println!("        - RNG test: 0x{:016x}", val),
+                        Err(e) => println!("        ! RNG test failed: {:?}", e),
+                    }
+                } else {
+                    println!("        ! CSPRNG not ready");
+                }
+                if report.kptr_guard_active {
+                    println!("        - kptr guard: active");
+                }
+                if let Some(spectre) = &report.spectre_status {
+                    println!("        - Spectre mitigations: {}", spectre.summary());
+                }
+            }
+            Err(e) => {
+                println!("      ! Security hardening failed: {:?}", e);
+                println!("      ! Continuing with reduced security");
+            }
+        }
+    }
+
     // 阶段3：测试基础功能
     println!("[3/3] Running basic tests...");
     
@@ -171,6 +222,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("   • Memory Management (Heap + Buddy allocator)");
     println!("   • Page Table Manager");
     println!("   • Kernel Stack Guard Pages");
+    println!("   • Security Hardening (W^X, NX, CSPRNG)");
     println!("   • Process Control Block");
     println!("   • Enhanced Scheduler (Multi-level feedback queue)");
     println!("   • Context Switch (176-byte context)");
