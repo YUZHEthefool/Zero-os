@@ -54,7 +54,8 @@ pub enum SyscallNumber {
     // 时间相关
     Time = 201,         // 获取时间
     Sleep = 35,         // 睡眠
-    
+    Futex = 202,        // 快速用户空间互斥锁
+
     // 其他
     Yield = 24,         // 主动让出CPU
     GetCwd = 79,        // 获取当前工作目录
@@ -87,6 +88,7 @@ pub enum SyscallError {
     EINVAL = -22,       // 无效参数
     ENFILE = -23,       // 系统打开文件过多
     EMFILE = -24,       // 进程打开文件过多
+    EPIPE = -32,        // 管道破裂
     ENOSYS = -38,       // 功能未实现
 }
 
@@ -98,6 +100,72 @@ impl SyscallError {
 
 /// 系统调用结果类型
 pub type SyscallResult = Result<usize, SyscallError>;
+
+/// 管道创建回调类型
+///
+/// 由 ipc 模块注册，返回 (read_fd, write_fd) 或错误
+pub type PipeCreateCallback = fn() -> Result<(i32, i32), SyscallError>;
+
+/// 文件描述符读取回调类型
+///
+/// 由 ipc 模块注册，处理管道等文件描述符的读取
+/// 参数: (fd, buf, count) -> bytes_read 或错误
+pub type FdReadCallback = fn(i32, &mut [u8]) -> Result<usize, SyscallError>;
+
+/// 文件描述符写入回调类型
+///
+/// 由 ipc 模块注册，处理管道等文件描述符的写入
+/// 参数: (fd, buf) -> bytes_written 或错误
+pub type FdWriteCallback = fn(i32, &[u8]) -> Result<usize, SyscallError>;
+
+/// 文件描述符关闭回调类型
+///
+/// 由 ipc 模块注册，处理文件描述符的关闭
+pub type FdCloseCallback = fn(i32) -> Result<(), SyscallError>;
+
+/// Futex 操作回调类型
+///
+/// 由 ipc 模块注册，处理 FUTEX_WAIT 和 FUTEX_WAKE 操作
+/// 参数: (uaddr, op, val, current_value) -> result 或错误
+pub type FutexCallback = fn(usize, i32, u32, u32) -> Result<usize, SyscallError>;
+
+lazy_static::lazy_static! {
+    /// 管道创建回调
+    static ref PIPE_CREATE_CALLBACK: spin::Mutex<Option<PipeCreateCallback>> = spin::Mutex::new(None);
+    /// 文件描述符读取回调
+    static ref FD_READ_CALLBACK: spin::Mutex<Option<FdReadCallback>> = spin::Mutex::new(None);
+    /// 文件描述符写入回调
+    static ref FD_WRITE_CALLBACK: spin::Mutex<Option<FdWriteCallback>> = spin::Mutex::new(None);
+    /// 文件描述符关闭回调
+    static ref FD_CLOSE_CALLBACK: spin::Mutex<Option<FdCloseCallback>> = spin::Mutex::new(None);
+    /// Futex 操作回调
+    static ref FUTEX_CALLBACK: spin::Mutex<Option<FutexCallback>> = spin::Mutex::new(None);
+}
+
+/// 注册管道创建回调
+pub fn register_pipe_callback(cb: PipeCreateCallback) {
+    *PIPE_CREATE_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册文件描述符读取回调
+pub fn register_fd_read_callback(cb: FdReadCallback) {
+    *FD_READ_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册文件描述符写入回调
+pub fn register_fd_write_callback(cb: FdWriteCallback) {
+    *FD_WRITE_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册文件描述符关闭回调
+pub fn register_fd_close_callback(cb: FdCloseCallback) {
+    *FD_CLOSE_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 Futex 操作回调
+pub fn register_futex_callback(cb: FutexCallback) {
+    *FUTEX_CALLBACK.lock() = Some(cb);
+}
 
 /// 用户空间地址上界
 ///
@@ -383,11 +451,15 @@ pub fn syscall_dispatcher(
         1 => sys_write(arg0 as i32, arg1 as *const u8, arg2 as usize),
         2 => sys_open(arg0 as *const u8, arg1 as i32, arg2 as u32),
         3 => sys_close(arg0 as i32),
+        22 => sys_pipe(arg0 as *mut i32),
 
         // 内存管理
         12 => sys_brk(arg0 as usize),
         9 => sys_mmap(arg0 as usize, arg1 as usize, arg2 as i32, arg3 as i32, arg4 as i32, arg5 as i64),
         11 => sys_munmap(arg0 as usize, arg1 as usize),
+
+        // Futex
+        202 => sys_futex(arg0 as usize, arg1 as i32, arg2 as u32),
 
         // 其他
         24 => sys_yield(),
@@ -812,15 +884,97 @@ fn sys_getppid() -> SyscallResult {
 }
 
 /// sys_kill - 发送信号给进程
-fn sys_kill(_pid: ProcessId, _sig: i32) -> SyscallResult {
-    // TODO: 实现信号发送
-    println!("sys_kill: not implemented yet");
-    Err(SyscallError::ENOSYS)
+///
+/// # Arguments
+///
+/// * `pid` - 目标进程 ID
+/// * `sig` - 信号编号（1-64）
+///
+/// # Returns
+///
+/// 成功返回 0，失败返回错误码
+fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
+    use crate::signal::{Signal, send_signal, signal_name};
+
+    // 验证信号编号
+    let signal = Signal::from_raw(sig)?;
+
+    // 发送信号
+    let action = send_signal(pid, signal)?;
+
+    println!(
+        "sys_kill: sent {} to PID {} (action: {:?})",
+        signal_name(signal),
+        pid,
+        action
+    );
+
+    Ok(0)
 }
 
 // ============================================================================
 // 文件I/O系统调用
 // ============================================================================
+
+/// sys_pipe - 创建匿名管道
+///
+/// 创建一个管道，返回两个文件描述符：
+/// - fds[0]: 读端
+/// - fds[1]: 写端
+///
+/// # Arguments
+///
+/// * `fds` - 指向用户空间的 i32[2] 数组，用于返回文件描述符
+///
+/// # Returns
+///
+/// 成功返回 0，失败返回错误码
+fn sys_pipe(fds: *mut i32) -> SyscallResult {
+    // 验证用户指针
+    if fds.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // 预先验证用户缓冲区可写
+    // 这避免了创建管道后因 copy_to_user 失败导致的 fd 泄漏
+    validate_user_ptr(fds as *const u8, core::mem::size_of::<[i32; 2]>())?;
+    verify_user_memory(fds as *const u8, core::mem::size_of::<[i32; 2]>(), true)?;
+
+    // 获取回调函数指针并立即释放锁
+    // 避免在持有锁时执行可能耗时的回调
+    let create_fn = {
+        let callback = PIPE_CREATE_CALLBACK.lock();
+        *callback.as_ref().ok_or(SyscallError::ENOSYS)?
+    };
+
+    // 调用管道创建回调
+    let (read_fd, write_fd) = create_fn()?;
+
+    // 将文件描述符写回用户空间
+    let fd_array = [read_fd, write_fd];
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            fd_array.as_ptr() as *const u8,
+            core::mem::size_of::<[i32; 2]>(),
+        )
+    };
+
+    // copy_to_user 失败时回滚：关闭已创建的文件描述符
+    if let Err(e) = copy_to_user(fds as *mut u8, bytes) {
+        // 尝试关闭已分配的 fd（通过关闭回调）
+        let close_fn = {
+            let callback = FD_CLOSE_CALLBACK.lock();
+            callback.as_ref().copied()
+        };
+        if let Some(close) = close_fn {
+            let _ = close(read_fd);
+            let _ = close(write_fd);
+        }
+        return Err(e);
+    }
+
+    Ok(0)
+}
 
 /// sys_read - 从文件描述符读取数据
 fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
@@ -828,14 +982,31 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
         return Ok(0);
     }
 
-    // TODO: 实现实际的文件读取
-    println!("sys_read: fd={}, count={}", fd, count);
+    // stdin (fd 0): 简化实现，返回零填充数据
+    if fd == 0 {
+        let data = vec![0u8; count];
+        copy_to_user(buf, &data)?;
+        return Ok(data.len());
+    }
 
-    // 简化实现：填充零数据，主要用于测试用户缓冲区访问路径
-    // 注意：使用 copy_to_user 进行安全复制，验证用户缓冲区映射
-    let data = vec![0u8; count];
-    copy_to_user(buf, &data)?;
-    Ok(data.len())
+    // stdout/stderr 不支持读取
+    if fd == 1 || fd == 2 {
+        return Err(SyscallError::EBADF);
+    }
+
+    // 获取回调函数指针并立即释放锁
+    let read_fn = {
+        let callback = FD_READ_CALLBACK.lock();
+        *callback.as_ref().ok_or(SyscallError::EBADF)?
+    };
+
+    // 分配临时缓冲区并执行读取（在锁外）
+    let mut tmp = vec![0u8; count];
+    let bytes_read = read_fn(fd, &mut tmp)?;
+
+    // 复制到用户空间
+    copy_to_user(buf, &tmp[..bytes_read])?;
+    Ok(bytes_read)
 }
 
 /// sys_write - 向文件描述符写入数据
@@ -845,11 +1016,10 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
     }
 
     // 先复制到内核缓冲区，避免直接解引用用户指针
-    // 这可以防止用户传递未映射地址导致的内核崩溃
     let mut tmp = vec![0u8; count];
     copy_from_user(&mut tmp, buf)?;
 
-    // 简化实现：只支持stdout(1)和stderr(2)
+    // stdout(1)/stderr(2): 直接打印
     if fd == 1 || fd == 2 {
         if let Ok(s) = core::str::from_utf8(&tmp) {
             print!("{}", s);
@@ -857,9 +1027,18 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
         } else {
             Err(SyscallError::EINVAL)
         }
-    } else {
-        println!("sys_write: fd={} not supported", fd);
+    } else if fd == 0 {
+        // stdin 不支持写入
         Err(SyscallError::EBADF)
+    } else {
+        // 获取回调函数指针并立即释放锁
+        let write_fn = {
+            let callback = FD_WRITE_CALLBACK.lock();
+            *callback.as_ref().ok_or(SyscallError::EBADF)?
+        };
+
+        // 在锁外执行写入
+        write_fn(fd, &tmp)
     }
 }
 
@@ -871,10 +1050,21 @@ fn sys_open(_path: *const u8, _flags: i32, _mode: u32) -> SyscallResult {
 }
 
 /// sys_close - 关闭文件描述符
-fn sys_close(_fd: i32) -> SyscallResult {
-    // TODO: 实现文件关闭
-    println!("sys_close: not implemented yet");
-    Err(SyscallError::ENOSYS)
+fn sys_close(fd: i32) -> SyscallResult {
+    // 标准流不能关闭（简化实现）
+    if fd <= 2 {
+        return Err(SyscallError::EBADF);
+    }
+
+    // 获取回调函数指针并立即释放锁
+    let close_fn = {
+        let callback = FD_CLOSE_CALLBACK.lock();
+        *callback.as_ref().ok_or(SyscallError::EBADF)?
+    };
+
+    // 在锁外执行关闭
+    close_fn(fd)?;
+    Ok(0)
 }
 
 // ============================================================================
@@ -1133,6 +1323,61 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     println!("sys_munmap: pid={}, unmapped {} bytes at 0x{:x}", pid, length_aligned, addr);
 
     Ok(0)
+}
+
+// ============================================================================
+// Futex 系统调用
+// ============================================================================
+
+/// sys_futex - 快速用户空间互斥锁操作
+///
+/// 实现 FUTEX_WAIT 和 FUTEX_WAKE 操作，用于用户空间高效同步。
+///
+/// # Arguments
+///
+/// * `uaddr` - 用户空间 futex 地址（指向 u32）
+/// * `op` - 操作码：0=FUTEX_WAIT, 1=FUTEX_WAKE
+/// * `val` - FUTEX_WAIT: 期望值；FUTEX_WAKE: 最大唤醒数量
+///
+/// # Returns
+///
+/// * FUTEX_WAIT: 成功阻塞并被唤醒返回 0，值不匹配返回 EAGAIN
+/// * FUTEX_WAKE: 返回实际唤醒的进程数量
+fn sys_futex(uaddr: usize, op: i32, val: u32) -> SyscallResult {
+    const FUTEX_WAIT: i32 = 0;
+    const FUTEX_WAKE: i32 = 1;
+
+    // 验证用户指针
+    if uaddr == 0 {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // 检查地址对齐（u32 需要 4 字节对齐）
+    if uaddr % 4 != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // 验证用户内存可访问
+    verify_user_memory(uaddr as *const u8, core::mem::size_of::<u32>(), op == FUTEX_WAIT)?;
+
+    // 获取回调函数
+    let futex_fn = {
+        let callback = FUTEX_CALLBACK.lock();
+        *callback.as_ref().ok_or(SyscallError::ENOSYS)?
+    };
+
+    // 对于 FUTEX_WAIT，需要先读取当前值
+    let current_value = if op == FUTEX_WAIT {
+        // 读取 futex 字（安全：已验证用户内存）
+        let mut value_bytes = [0u8; 4];
+        copy_from_user(&mut value_bytes, uaddr as *const u8)?;
+        u32::from_ne_bytes(value_bytes)
+    } else {
+        0 // FUTEX_WAKE 不需要当前值
+    };
+
+    // 调用 IPC 模块的 futex 实现
+    futex_fn(uaddr, op, val, current_value)
 }
 
 // ============================================================================

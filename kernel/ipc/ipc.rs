@@ -395,3 +395,124 @@ pub fn get_queue_length(endpoint_id: EndpointId) -> Result<usize, IpcError> {
 
     Ok(endpoint.queue.len())
 }
+
+// ============================================================================
+// 阻塞IPC扩展
+// ============================================================================
+
+use crate::sync::WaitQueue;
+use alloc::collections::BTreeMap as WaitQueueMap;
+
+lazy_static::lazy_static! {
+    /// 每端点等待队列：用于阻塞接收
+    static ref ENDPOINT_WAIT_QUEUES: spin::Mutex<WaitQueueMap<EndpointId, WaitQueue>> =
+        spin::Mutex::new(WaitQueueMap::new());
+}
+
+/// 获取或创建端点的等待队列
+fn get_or_create_wait_queue(endpoint_id: EndpointId) -> &'static WaitQueue {
+    let mut queues = ENDPOINT_WAIT_QUEUES.lock();
+    if !queues.contains_key(&endpoint_id) {
+        // 由于WaitQueue不是Copy，我们需要使用lazy初始化
+        queues.insert(endpoint_id, WaitQueue::new());
+    }
+    // 这里的生命周期是安全的，因为ENDPOINT_WAIT_QUEUES是静态的
+    // 但Rust的借用检查器不允许直接返回引用，所以我们需要用裸指针
+    let ptr = queues.get(&endpoint_id).unwrap() as *const WaitQueue;
+    unsafe { &*ptr }
+}
+
+/// 发送消息并唤醒等待的接收者
+///
+/// 与send_message相同，但会唤醒在此端点上阻塞等待的进程。
+pub fn send_message_notify(endpoint_id: EndpointId, data: Vec<u8>) -> Result<(), IpcError> {
+    // 发送消息
+    send_message(endpoint_id, data)?;
+
+    // 唤醒等待者
+    let queues = ENDPOINT_WAIT_QUEUES.lock();
+    if let Some(wq) = queues.get(&endpoint_id) {
+        wq.wake_one();
+    }
+
+    Ok(())
+}
+
+/// 阻塞接收消息
+///
+/// 如果队列为空，当前进程会阻塞直到有消息到达。
+///
+/// # Arguments
+///
+/// * `endpoint_id` - 端点ID
+///
+/// # Returns
+///
+/// * `Ok(msg)` - 成功接收消息
+/// * `Err(...)` - 发生错误
+pub fn receive_message_blocking(endpoint_id: EndpointId) -> Result<ReceivedMessage, IpcError> {
+    // 确保等待队列存在
+    {
+        let mut queues = ENDPOINT_WAIT_QUEUES.lock();
+        if !queues.contains_key(&endpoint_id) {
+            queues.insert(endpoint_id, WaitQueue::new());
+        }
+    }
+
+    loop {
+        // 尝试接收
+        match receive_message(endpoint_id)? {
+            Some(msg) => return Ok(msg),
+            None => {
+                // 队列为空，阻塞等待
+                // 获取等待队列的指针（安全：ENDPOINT_WAIT_QUEUES是静态的）
+                let wq_ptr = {
+                    let queues = ENDPOINT_WAIT_QUEUES.lock();
+                    queues.get(&endpoint_id).map(|wq| wq as *const WaitQueue)
+                };
+
+                if let Some(ptr) = wq_ptr {
+                    // 安全：指针指向静态存储
+                    unsafe { (*ptr).wait() };
+                }
+            }
+        }
+    }
+}
+
+/// 带超时的接收消息（简化版：仅支持重试次数）
+///
+/// # Arguments
+///
+/// * `endpoint_id` - 端点ID
+/// * `max_retries` - 最大重试次数（每次重试会yield）
+///
+/// # Returns
+///
+/// * `Ok(Some(msg))` - 成功接收消息
+/// * `Ok(None)` - 超时（达到最大重试次数）
+/// * `Err(...)` - 发生错误
+pub fn receive_message_with_retries(
+    endpoint_id: EndpointId,
+    max_retries: usize,
+) -> Result<Option<ReceivedMessage>, IpcError> {
+    for _ in 0..max_retries {
+        match receive_message(endpoint_id)? {
+            Some(msg) => return Ok(Some(msg)),
+            None => {
+                // 让出CPU
+                kernel_core::force_reschedule();
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// 清理端点的等待队列（端点销毁时调用）
+fn cleanup_wait_queue(endpoint_id: EndpointId) {
+    let mut queues = ENDPOINT_WAIT_QUEUES.lock();
+    if let Some(wq) = queues.remove(&endpoint_id) {
+        // 唤醒所有等待者，让它们收到EndpointNotFound错误
+        wq.wake_all();
+    }
+}

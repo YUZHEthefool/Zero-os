@@ -159,6 +159,11 @@ fn fork_inner(
         }
         // 如果 child_top == 0，保持父进程的 rsp/rbp（回退到共享栈）
 
+        // 克隆文件描述符表（每个 fd 调用 clone_box）
+        for (&fd, desc) in parent.fd_table.iter() {
+            child.fd_table.insert(fd, desc.clone_box());
+        }
+
         child.time_slice = parent.time_slice;
         child.cpu_time = 0;
         child.context.rax = 0; // 子进程返回值 0
@@ -371,25 +376,54 @@ impl PhysicalPageRefCount {
     ///
     /// 返回更新后的引用计数。如果为 0 则调用者可以释放该页。
     /// 使用 CAS 循环确保原子性。
+    /// 【M-15 修复】当引用计数归零时，自动从映射中移除条目以防止内存泄漏
     pub fn decrement(&self, phys_addr: usize) -> u64 {
-        if let Some(count) = self.ref_counts.read().get(&phys_addr) {
-            let mut prev = count.load(Ordering::SeqCst);
-            loop {
-                if prev == 0 {
-                    return 0;
+        // 第一阶段：在读锁下进行CAS操作
+        let (should_remove, remaining) = {
+            let guard = self.ref_counts.read();
+            if let Some(count) = guard.get(&phys_addr) {
+                let mut prev = count.load(Ordering::SeqCst);
+                loop {
+                    if prev == 0 {
+                        break (false, 0); // 已经为0，不需要移除
+                    }
+                    match count.compare_exchange(
+                        prev,
+                        prev - 1,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => {
+                            let new_val = prev - 1;
+                            break (new_val == 0, new_val); // CAS成功，返回是否需要移除和新值
+                        }
+                        Err(actual) => prev = actual,
+                    }
                 }
-                match count.compare_exchange(
-                    prev,
-                    prev - 1,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) => return prev - 1,
-                    Err(actual) => prev = actual,
+            } else {
+                (false, 0)
+            }
+        }; // 读锁在这里释放
+
+        // 第二阶段：如果需要移除，在写锁下执行（读锁已释放，避免死锁）
+        if should_remove {
+            self.remove_entry(phys_addr);
+        }
+
+        remaining
+    }
+
+    /// 移除指定地址的引用计数条目（引用计数归零时调用）
+    fn remove_entry(&self, phys_addr: usize) {
+        interrupts::without_interrupts(|| {
+            let mut counts = self.ref_counts.write();
+            // 二次检查确保确实归零（防止并发increment竞态）
+            if let Some(entry) = counts.get(&phys_addr) {
+                if entry.load(Ordering::SeqCst) == 0 {
+                    counts.remove(&phys_addr);
                 }
             }
-        }
-        0
+        });
     }
 
     /// 获取页的引用计数

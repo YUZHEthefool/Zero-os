@@ -80,8 +80,8 @@ impl PriorityScheduler {
                                 .push(current_pid);
                         }
                     }
-                    ProcessState::Blocked | ProcessState::Sleeping => {
-                        // 进程被阻塞，不再运行
+                    ProcessState::Blocked | ProcessState::Sleeping | ProcessState::Stopped => {
+                        // 进程被阻塞/睡眠/暂停，不再运行
                         drop(proc);
                     }
                     ProcessState::Zombie | ProcessState::Terminated => {

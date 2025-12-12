@@ -157,6 +157,54 @@ impl Scheduler {
         });
     }
 
+    /// 恢复被暂停的进程（用于 SIGCONT）
+    ///
+    /// 如果进程处于 Stopped 状态，将其设置为 Ready 并添加到就绪队列。
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - 要恢复的进程 ID
+    ///
+    /// # Returns
+    ///
+    /// 如果进程被成功恢复则返回 true
+    pub fn resume_stopped(pid: Pid) -> bool {
+        use process::get_process;
+
+        interrupts::without_interrupts(|| {
+            if let Some(pcb) = get_process(pid) {
+                let (should_add, priority) = {
+                    let mut proc = pcb.lock();
+                    if proc.state == ProcessState::Stopped {
+                        proc.state = ProcessState::Ready;
+                        (true, proc.dynamic_priority)
+                    } else {
+                        (false, 0)
+                    }
+                };
+
+                if should_add {
+                    // 先从队列中移除（防止重复）
+                    {
+                        let mut queue = READY_QUEUE.lock();
+                        for bucket in queue.values_mut() {
+                            bucket.remove(&pid);
+                        }
+                    }
+
+                    // 添加到正确的优先级桶
+                    {
+                        let mut queue = READY_QUEUE.lock();
+                        queue.entry(priority).or_default().insert(pid, pcb);
+                    }
+
+                    return true;
+                }
+            }
+            false
+        })
+    }
+
     /// 选择下一个要运行的进程
     ///
     /// 按优先级从高到低（数值从小到大）遍历，返回第一个就绪进程
@@ -446,6 +494,9 @@ pub fn init() {
 
     // 注册重调度回调，让系统调用返回时能触发调度
     kernel_core::register_resched_callback(Scheduler::reschedule_now);
+
+    // 注册信号恢复回调，让 SIGCONT 能正确恢复暂停的进程
+    kernel_core::register_resume_callback(Scheduler::resume_stopped);
 
     println!("Enhanced scheduler initialized");
     println!("  Ready queue capacity: unlimited");

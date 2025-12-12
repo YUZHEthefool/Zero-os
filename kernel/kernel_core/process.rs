@@ -1,4 +1,5 @@
-use alloc::{collections::BTreeMap, vec, vec::Vec, string::String, sync::Arc};
+use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec, string::String, sync::Arc};
+use core::any::Any;
 use spin::Mutex;
 use x86_64::{
     PhysAddr, VirtAddr,
@@ -6,6 +7,7 @@ use x86_64::{
     structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB},
 };
 use crate::fork::PAGE_REF_COUNT;
+use crate::signal::PendingSignals;
 use crate::time;
 use mm::memory::FrameAllocator;
 use mm::page_table;
@@ -39,6 +41,38 @@ type SchedulerCleanupCallback = fn(ProcessId);
 
 /// IPC清理回调类型
 type IpcCleanupCallback = fn(ProcessId);
+
+/// 最大文件描述符数量（每进程）
+pub const MAX_FD: i32 = 256;
+
+/// 文件操作 trait
+///
+/// 定义文件描述符必须实现的操作，支持：
+/// - 克隆（用于 fork）
+/// - 向下转型（用于类型特定操作）
+/// - 调试输出
+///
+/// 由于循环依赖限制，kernel_core 定义此 trait，具体类型（如 PipeHandle）
+/// 在各自的 crate（如 ipc）中实现。
+pub trait FileOps: Send + Sync {
+    /// 克隆此文件描述符（用于 fork）
+    fn clone_box(&self) -> Box<dyn FileOps>;
+
+    /// 获取 Any 引用用于向下转型
+    fn as_any(&self) -> &dyn Any;
+
+    /// 获取类型名称（用于调试）
+    fn type_name(&self) -> &'static str;
+}
+
+impl core::fmt::Debug for dyn FileOps {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "FileOps({})", self.type_name())
+    }
+}
+
+/// 文件描述符类型
+pub type FileDescriptor = Box<dyn FileOps>;
 
 /// 内核栈分配错误
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +155,8 @@ pub enum ProcessState {
     Running,
     /// 阻塞状态（等待I/O或其他事件）
     Blocked,
+    /// 暂停状态（如 SIGSTOP）
+    Stopped,
     /// 睡眠状态
     Sleeping,
     /// 僵尸状态（已终止但未被父进程回收）
@@ -228,7 +264,10 @@ impl Default for Context {
 }
 
 /// 进程控制块（PCB）
-#[derive(Debug, Clone)]
+///
+/// 注意：Process 不实现 Clone，因为 fd_table 包含不可克隆的 Box<dyn FileOps>。
+/// 进程复制（fork）通过手动字段复制和 clone_box() 实现。
+#[derive(Debug)]
 pub struct Process {
     /// 进程ID
     pub pid: ProcessId,
@@ -241,7 +280,10 @@ pub struct Process {
     
     /// 进程状态
     pub state: ProcessState,
-    
+
+    /// 挂起的信号位图（1-64）
+    pub pending_signals: PendingSignals,
+
     /// 进程优先级（静态优先级）
     pub priority: Priority,
     
@@ -272,6 +314,11 @@ pub struct Process {
     /// 下一个自动分配的 mmap 起始地址
     pub next_mmap_addr: usize,
 
+    /// 文件描述符表（fd -> 描述符）
+    ///
+    /// fd 0/1/2 分别保留给 stdin/stdout/stderr，新分配从 3 开始
+    pub fd_table: BTreeMap<i32, FileDescriptor>,
+
     /// 退出码
     pub exit_code: Option<i32>,
 
@@ -296,6 +343,7 @@ impl Process {
             ppid,
             name,
             state: ProcessState::Ready,
+            pending_signals: PendingSignals::new(),
             priority,
             dynamic_priority: priority,
             time_slice: calculate_time_slice(priority),
@@ -306,6 +354,7 @@ impl Process {
             memory_space: 0,
             mmap_regions: BTreeMap::new(),
             next_mmap_addr: DEFAULT_MMAP_BASE,
+            fd_table: BTreeMap::new(),
             exit_code: None,
             waiting_child: None,
             children: Vec::new(),
@@ -313,7 +362,51 @@ impl Process {
             created_at: time::current_timestamp_ms(),
         }
     }
-    
+
+    /// 分配新的文件描述符
+    ///
+    /// fd 0/1/2 保留给标准输入/输出/错误，新分配从 3 开始
+    ///
+    /// # Returns
+    ///
+    /// 成功返回分配的 fd，失败（达到上限）返回 None
+    pub fn allocate_fd(&mut self, desc: FileDescriptor) -> Option<i32> {
+        let fd = self.next_available_fd()?;
+        self.fd_table.insert(fd, desc);
+        Some(fd)
+    }
+
+    /// 获取指定 fd 对应的描述符引用
+    pub fn get_fd(&self, fd: i32) -> Option<&FileDescriptor> {
+        if fd < 0 {
+            return None;
+        }
+        self.fd_table.get(&fd)
+    }
+
+    /// 移除并返回指定 fd 的描述符
+    ///
+    /// 关闭文件描述符时使用，描述符的 Drop 会自动处理资源清理
+    pub fn remove_fd(&mut self, fd: i32) -> Option<FileDescriptor> {
+        if fd < 0 {
+            return None;
+        }
+        self.fd_table.remove(&fd)
+    }
+
+    /// 查找下一个可用的 fd（从 3 开始）
+    fn next_available_fd(&self) -> Option<i32> {
+        // 从 3 开始，因为 0/1/2 保留给标准流
+        let mut fd: i32 = 3;
+        while fd < MAX_FD {
+            if !self.fd_table.contains_key(&fd) {
+                return Some(fd);
+            }
+            fd = fd.checked_add(1)?;
+        }
+        None // 已达到 fd 上限
+    }
+
     /// 重置时间片
     pub fn reset_time_slice(&mut self) {
         self.time_slice = calculate_time_slice(self.dynamic_priority);
@@ -666,6 +759,14 @@ fn free_process_resources(proc: &mut Process) {
     // 清理 mmap 区域跟踪
     proc.mmap_regions.clear();
 
+    // 关闭并清理所有文件描述符
+    // 通过 clear() 触发每个 FileDescriptor 的 Drop，自动释放管道等资源
+    let fd_count = proc.fd_table.len();
+    proc.fd_table.clear();
+    if fd_count > 0 {
+        println!("  Closed {} file descriptors for process {}", fd_count, proc.pid);
+    }
+
     // 如果进程拥有独立的页表（memory_space != 0），释放页表及其管理的物理帧
     if proc.memory_space != 0 {
         free_address_space(proc.memory_space);
@@ -858,6 +959,7 @@ pub fn get_process_stats() -> ProcessStats {
             match proc.state {
                 ProcessState::Ready => stats.ready += 1,
                 ProcessState::Running => stats.running += 1,
+                ProcessState::Stopped => stats.stopped += 1,
                 ProcessState::Blocked => stats.blocked += 1,
                 ProcessState::Sleeping => stats.sleeping += 1,
                 ProcessState::Zombie => stats.zombie += 1,
@@ -875,6 +977,7 @@ pub struct ProcessStats {
     pub total: usize,
     pub ready: usize,
     pub running: usize,
+    pub stopped: usize,
     pub blocked: usize,
     pub sleeping: usize,
     pub zombie: usize,
@@ -887,6 +990,7 @@ impl ProcessStats {
         println!("Total:      {}", self.total);
         println!("Ready:      {}", self.ready);
         println!("Running:    {}", self.running);
+        println!("Stopped:    {}", self.stopped);
         println!("Blocked:    {}", self.blocked);
         println!("Sleeping:   {}", self.sleeping);
         println!("Zombie:     {}", self.zombie);

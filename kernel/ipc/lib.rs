@@ -2,33 +2,256 @@
 #![feature(abi_x86_interrupt)]
 extern crate alloc;
 
+use alloc::boxed::Box;
+
 // 导入 drivers crate 的宏
 #[macro_use]
 extern crate drivers;
 
 pub use kernel_core::process;
+use kernel_core::{SyscallError, FileOps};
 
 pub mod ipc;
+pub mod sync;
+pub mod pipe;
+pub mod futex;
 
 pub use ipc::{
     cleanup_process_endpoints,
     destroy_endpoint,
     grant_access,
     receive_message,
+    receive_message_blocking,
+    receive_message_with_retries,
     register_endpoint,
     revoke_access,
     send_message,
+    send_message_notify,
+    get_queue_length,
     EndpointId,
     IpcError,
     Message,
     ReceivedMessage,
 };
 
+pub use sync::{
+    WaitQueue,
+    KMutex,
+    Semaphore,
+    CondVar,
+};
+
+pub use pipe::{
+    create_pipe,
+    create_pipe_with_capacity,
+    PipeHandle,
+    PipeEndType,
+    PipeError,
+    PipeFlags,
+    PipeId,
+    PipeStatus,
+    DEFAULT_PIPE_CAPACITY,
+};
+
+pub use futex::{
+    FutexTable,
+    FutexError,
+    FUTEX_WAIT,
+    FUTEX_WAKE,
+    futex_wait,
+    futex_wake,
+    cleanup_process_futexes,
+    active_futex_count,
+};
+
+// ============================================================================
+// 系统调用回调实现
+// ============================================================================
+
+/// 创建管道的系统调用回调
+///
+/// 创建一个管道，分配两个文件描述符给当前进程
+fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
+    use process::{current_pid, get_process};
+
+    // 获取当前进程
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // 创建管道
+    let (read_handle, write_handle) = create_pipe(PipeFlags::default());
+
+    // 分配文件描述符
+    let (read_fd, write_fd) = {
+        let mut proc = process.lock();
+
+        // 分配读端 fd
+        let rfd = proc.allocate_fd(Box::new(read_handle) as Box<dyn FileOps>)
+            .ok_or(SyscallError::EMFILE)?;
+
+        // 分配写端 fd，失败时回滚
+        let wfd = match proc.allocate_fd(Box::new(write_handle) as Box<dyn FileOps>) {
+            Some(fd) => fd,
+            None => {
+                // 回滚：移除已分配的读端 fd
+                proc.remove_fd(rfd);
+                return Err(SyscallError::EMFILE);
+            }
+        };
+
+        (rfd, wfd)
+    };
+
+    println!("sys_pipe: created pipe (read_fd={}, write_fd={})", read_fd, write_fd);
+    Ok((read_fd, write_fd))
+}
+
+/// 文件描述符读取回调
+///
+/// 从指定的文件描述符读取数据（目前仅支持管道）
+///
+/// 注意：为避免死锁，必须在释放进程锁后再调用可能阻塞的管道操作
+fn fd_read_callback(fd: i32, buf: &mut [u8]) -> Result<usize, SyscallError> {
+    use process::{current_pid, get_process};
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // 克隆 PipeHandle 以便在释放进程锁后使用
+    // 这是安全的因为 PipeHandle 使用 Arc<Pipe> 进行引用计数
+    let pipe_handle = {
+        let proc = process.lock();
+        let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+
+        // 尝试 downcast 到 PipeHandle 并克隆
+        let handle = fd_obj.as_any()
+            .downcast_ref::<PipeHandle>()
+            .ok_or(SyscallError::EBADF)?;
+        handle.clone() // 克隆 PipeHandle（增加 Arc 引用计数）
+    }; // 进程锁在此释放
+
+    // 在锁外执行可能阻塞的读取操作
+    pipe_handle.read(buf).map_err(pipe_error_to_syscall)
+}
+
+/// 文件描述符写入回调
+///
+/// 向指定的文件描述符写入数据（目前仅支持管道）
+///
+/// 注意：为避免死锁，必须在释放进程锁后再调用可能阻塞的管道操作
+fn fd_write_callback(fd: i32, buf: &[u8]) -> Result<usize, SyscallError> {
+    use process::{current_pid, get_process};
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // 克隆 PipeHandle 以便在释放进程锁后使用
+    let pipe_handle = {
+        let proc = process.lock();
+        let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+
+        // 尝试 downcast 到 PipeHandle 并克隆
+        let handle = fd_obj.as_any()
+            .downcast_ref::<PipeHandle>()
+            .ok_or(SyscallError::EBADF)?;
+        handle.clone()
+    }; // 进程锁在此释放
+
+    // 在锁外执行可能阻塞的写入操作
+    pipe_handle.write(buf).map_err(pipe_error_to_syscall)
+}
+
+/// 文件描述符关闭回调
+///
+/// 关闭指定的文件描述符（触发 Drop 清理资源）
+fn fd_close_callback(fd: i32) -> Result<(), SyscallError> {
+    use process::{current_pid, get_process};
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // 移除文件描述符（Drop 会自动清理管道资源）
+    let mut proc = process.lock();
+    proc.remove_fd(fd).ok_or(SyscallError::EBADF)?;
+
+    Ok(())
+}
+
+/// PipeError 到 SyscallError 的转换
+fn pipe_error_to_syscall(err: PipeError) -> SyscallError {
+    match err {
+        PipeError::WouldBlock => SyscallError::EAGAIN,
+        PipeError::BrokenPipe => SyscallError::EPIPE,
+        PipeError::Closed => SyscallError::EPIPE,
+        PipeError::InvalidPipe | PipeError::InvalidOperation => SyscallError::EBADF,
+        PipeError::NoCurrentProcess => SyscallError::ESRCH,
+    }
+}
+
+/// Futex 操作回调
+///
+/// 根据操作码执行 FUTEX_WAIT 或 FUTEX_WAKE
+///
+/// # Arguments
+///
+/// * `uaddr` - 用户空间 futex 地址
+/// * `op` - 操作码 (FUTEX_WAIT=0, FUTEX_WAKE=1)
+/// * `val` - FUTEX_WAIT 时为期望值，FUTEX_WAKE 时为唤醒数量
+/// * `current_value` - 调用者从用户空间读取的当前值（仅 FUTEX_WAIT 使用）
+///
+/// # Returns
+///
+/// FUTEX_WAIT: 成功返回 0，值不匹配返回 EAGAIN
+/// FUTEX_WAKE: 返回实际唤醒的进程数量
+fn futex_callback(uaddr: usize, op: i32, val: u32, current_value: u32) -> Result<usize, SyscallError> {
+    use process::current_pid;
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+
+    match op {
+        futex::FUTEX_WAIT => {
+            futex_wait(pid, uaddr, val, current_value)
+                .map_err(|e| match e {
+                    FutexError::WouldBlock => SyscallError::EAGAIN,
+                    FutexError::Fault => SyscallError::EFAULT,
+                    FutexError::NoProcess => SyscallError::ESRCH,
+                    FutexError::InvalidOperation => SyscallError::EINVAL,
+                })
+        }
+        futex::FUTEX_WAKE => {
+            Ok(futex_wake(pid, uaddr, val as usize))
+        }
+        _ => Err(SyscallError::EINVAL),
+    }
+}
+
+/// 进程退出时的 IPC 清理（端点 + futex 表）
+///
+/// 注册到 kernel_core 的进程清理回调，确保进程退出时自动清理所有 IPC 资源
+fn ipc_cleanup(pid: process::ProcessId) {
+    cleanup_process_endpoints(pid);
+    cleanup_process_futexes(pid);
+}
+
 /// 初始化IPC子系统
 ///
 /// 注册进程清理回调，确保进程退出时自动清理其IPC端点。
+/// 同时注册系统调用回调，使 kernel_core 的 sys_pipe/sys_read/sys_write/sys_close
+/// 能够操作管道。
 pub fn init() {
-    // 注册IPC清理回调到进程管理子系统
-    kernel_core::register_ipc_cleanup(cleanup_process_endpoints);
+    // 注册IPC清理回调到进程管理子系统（包括端点和 futex 清理）
+    kernel_core::register_ipc_cleanup(ipc_cleanup);
+
+    // 注册系统调用回调
+    kernel_core::register_pipe_callback(pipe_create_callback);
+    kernel_core::register_fd_read_callback(fd_read_callback);
+    kernel_core::register_fd_write_callback(fd_write_callback);
+    kernel_core::register_fd_close_callback(fd_close_callback);
+    kernel_core::register_futex_callback(futex_callback);
+
     ipc::init();
+    println!("  Synchronization primitives loaded (WaitQueue, KMutex, Semaphore, CondVar)");
+    println!("  Pipe support loaded (anonymous pipes with blocking I/O)");
+    println!("  Futex support loaded (user-space fast mutex)");
+    println!("  Syscall callbacks registered (pipe, read, write, close, futex)");
 }
