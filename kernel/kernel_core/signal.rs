@@ -250,9 +250,43 @@ pub fn default_action(signal: Signal) -> SignalAction {
 /// # Returns
 ///
 /// The action taken on success, or error
+///
+/// # Permission Model (temporary until UID/capability system)
+///
+/// - Process can send signals to itself
+/// - Parent can send signals to child
+/// - Child can send signals to parent
+/// - PID 1 is protected (only self can signal)
 pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, SignalError> {
     // 注意：我们需要调用调度器的 resume_stopped，它在 sched crate 中
     // 由于循环依赖的限制，我们通过回调机制实现
+
+    // 【安全修复 S-4】权限检查（深度防御）
+    // 即使 sys_kill 已检查，内部调用也需要验证
+    if let Some(sender) = process::current_pid() {
+        // PID 1 保护
+        if pid == 1 && sender != 1 {
+            return Err(SignalError::PermissionDenied);
+        }
+
+        // 非自己的进程需要检查父子关系
+        if sender != pid {
+            let sender_ppid = process::get_process(sender)
+                .map(|p| p.lock().ppid);
+
+            let target_arc = process::get_process(pid).ok_or(SignalError::NoSuchProcess)?;
+            let target_ppid = target_arc.lock().ppid;
+
+            // 父进程向子进程
+            let is_parent_to_child = target_ppid == sender;
+            // 子进程向父进程
+            let is_child_to_parent = sender_ppid == Some(pid);
+
+            if !is_parent_to_child && !is_child_to_parent {
+                return Err(SignalError::PermissionDenied);
+            }
+        }
+    }
 
     let process_arc = process::get_process(pid).ok_or(SignalError::NoSuchProcess)?;
     let action = default_action(signal);

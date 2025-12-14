@@ -115,19 +115,32 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("[2.6/3] Applying security hardening...");
     {
         let mut frame_allocator = mm::memory::FrameAllocator::new();
-        // 使用 Skip 策略暂时跳过 identity map 清理
-        // 因为完全移除可写标志可能影响 VGA/MMIO 访问
-        // 生产环境应使用 RemoveWritable 或 Unmap
+        // Phase 0 安全加固配置
+        //
+        // 当前限制：
+        // 1. identity map cleanup 使用 Skip 策略（需要精细MMIO映射支持）
+        // 2. NX 强制暂时禁用（bootloader使用2MB huge pages，无法精细控制）
+        //
+        // TODO [Phase 1]:
+        // - 实现 4KB 页粒度的内核映射
+        // - 为 MMIO 区域创建单独映射
+        // - 启用完整的 W^X/NX 强制
+        //
+        // 已启用的安全功能：
+        // - W^X 验证：检测违规（非阻止模式）
+        // - kptr guard：内核指针混淆
+        // - CSPRNG：ChaCha20 + RDRAND/RDSEED
+        // - Spectre/Meltdown 缓解
         let sec_config = security::SecurityConfig {
             phys_offset: mm::page_table::get_physical_memory_offset(),
             cleanup_strategy: security::IdentityCleanupStrategy::Skip,
-            enforce_nx: false,  // 暂时禁用，因为内核使用 2MB huge pages
-            validate_wxorx: false, // 暂时禁用，因为 bootloader 设置了 RWX 页
+            enforce_nx: false,                // 暂时禁用（需要4KB页粒度支持）
+            validate_wxorx: true,             // 验证 W^X 策略（检测但不阻止）
             initialize_rng: true,
-            strict_wxorx: false,
-            enable_kptr_guard: true,  // 启用内核指针混淆
-            enable_spectre_mitigations: true,  // 启用 Spectre/Meltdown 缓解
-            run_security_tests: false,  // 暂时禁用自测，可在 debug 模式启用
+            strict_wxorx: false,              // 非致命模式
+            enable_kptr_guard: true,          // 启用内核指针混淆
+            enable_spectre_mitigations: true, // 启用 Spectre/Meltdown 缓解
+            run_security_tests: false,        // 暂时禁用安全测试
         };
 
         match security::init(sec_config, &mut frame_allocator) {

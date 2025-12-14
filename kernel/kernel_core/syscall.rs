@@ -893,8 +893,42 @@ fn sys_getppid() -> SyscallResult {
 /// # Returns
 ///
 /// 成功返回 0，失败返回错误码
+///
+/// # Permission Model（临时实现，等待 UID/capability 系统）
+///
+/// - 进程可以向自己发送任意信号
+/// - 父进程可以向子进程发送信号
+/// - 子进程可以向父进程发送信号
+/// - PID 1 (init) 受保护，只有自己能向自己发信号
 fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
     use crate::signal::{Signal, send_signal, signal_name};
+
+    // 【安全修复 S-2】权限检查
+    // 临时实现：只允许 self, parent→child, child→parent
+    if let Some(self_pid) = current_pid() {
+        // PID 1 保护：只有 init 自己能向自己发信号
+        if pid == 1 && self_pid != 1 {
+            return Err(SyscallError::EPERM);
+        }
+
+        // 非自己的进程需要检查父子关系
+        if self_pid != pid {
+            let target = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let target_ppid = target.lock().ppid;
+
+            // 检查是否为父进程向子进程发送
+            let is_parent_to_child = target_ppid == self_pid;
+
+            // 检查是否为子进程向父进程发送
+            let is_child_to_parent = get_process(self_pid)
+                .map(|p| p.lock().ppid == pid)
+                .unwrap_or(false);
+
+            if !is_parent_to_child && !is_child_to_parent {
+                return Err(SyscallError::EPERM);
+            }
+        }
+    }
 
     // 验证信号编号
     let signal = Signal::from_raw(sig)?;

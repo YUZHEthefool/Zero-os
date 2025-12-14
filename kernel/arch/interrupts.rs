@@ -280,11 +280,25 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 }
 
 /// #PF - Page Fault (页错误)
+///
+/// 处理缺页异常：
+/// 1. COW 缺页：复制页面并恢复执行
+/// 2. 用户空间缺页（用户态触发）：终止进程
+/// 3. 内核空间缺页或内核态触发的用户空间缺页：内核 bug，panic
+///
+/// # Safety Note
+///
+/// 区分用户态触发和内核态触发的缺页：
+/// - USER_MODE 标志表示 CPU 在 Ring 3 时触发
+/// - 内核态访问用户内存触发的缺页仍会 panic（正确行为，因为这表示内核bug）
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
     use x86_64::registers::control::Cr2;
+
+    /// 用户空间地址上界
+    const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
 
     INTERRUPT_STATS.page_fault.fetch_add(1, Ordering::Relaxed);
 
@@ -306,10 +320,32 @@ extern "x86-interrupt" fn page_fault_handler(
         }
     }
 
-    // 无法处理的缺页错误
+    // 【安全修复 S-3】检查是否为用户态触发的用户空间缺页
+    // USER_MODE 标志表示 CPU 在 Ring 3（用户态）时触发了缺页
+    // 只有在用户态触发且地址在用户空间时才终止进程
+    // 内核态访问用户内存的缺页仍然 panic（这是内核bug，如TOCTOU）
+    let is_user_mode = error_code.contains(PageFaultErrorCode::USER_MODE);
+
+    if is_user_mode && fault_addr < USER_SPACE_TOP {
+        if let Some(pid) = kernel_core::process::current_pid() {
+            // 标记进程为待终止状态并设置重调度标志
+            // 实际终止在返回用户态前的安全路径中执行
+            // SIGSEGV 的退出码为 128 + 11 = 139
+            kernel_core::process::terminate_process(pid, 139);
+
+            // 设置重调度标志，让调度器在安全点切换进程
+            kernel_core::request_resched_from_irq();
+
+            // 返回让中断框架执行 iret
+            // 由于进程已被标记为 Zombie，调度器不会再选择它
+            return;
+        }
+    }
+
+    // 内核空间缺页或内核态触发的用户空间缺页是严重的内核 bug
     panic!(
-        "Page fault at 0x{:x} ({:?})\n{:#?}",
-        fault_addr, error_code, stack_frame
+        "Page fault at 0x{:x} (error={:?}, user_mode={})\n{:#?}",
+        fault_addr, error_code, is_user_mode, stack_frame
     );
 }
 
