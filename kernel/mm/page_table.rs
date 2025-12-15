@@ -4,6 +4,7 @@
 
 use x86_64::{
     structures::paging::{
+        page_table::PageTableEntry,
         Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
         FrameAllocator, Mapper, OffsetPageTable, Translate,
     },
@@ -14,6 +15,15 @@ use spin::Mutex;
 /// 物理内存高半区偏移（bootloader 映射 0xffffffff80000000 -> 0）
 /// 覆盖物理地址 0-1GB
 pub const PHYSICAL_MEMORY_OFFSET: u64 = 0xffff_ffff_8000_0000;
+
+/// VGA text buffer (phys 0xB8000) high-half alias
+pub const VGA_PHYS_ADDR: u64 = 0x000b_8000;
+pub const VGA_VIRT_ADDR: u64 = PHYSICAL_MEMORY_OFFSET + VGA_PHYS_ADDR;
+
+/// Local APIC MMIO window (4 KiB at phys 0xFEE0_0000) dedicated high-half alias
+pub const APIC_PHYS_ADDR: u64 = 0xfee0_0000;
+pub const APIC_MMIO_SIZE: usize = 0x1000;
+pub const APIC_VIRT_ADDR: u64 = 0xffff_ffff_fee0_0000; // PML4[511] unused slot
 
 #[inline]
 fn get_phys_offset() -> VirtAddr {
@@ -301,4 +311,299 @@ pub fn get_manager() -> Option<spin::MutexGuard<'static, Option<PageTableManager
     } else {
         None
     }
+}
+
+// ============================================================================
+// 递归页表访问 - 用于访问任意物理地址的页表帧
+// ============================================================================
+
+/// 递归页表槽索引 (PML4[510] 指向 PML4 自身)
+pub const RECURSIVE_INDEX: usize = 510;
+
+/// 通过递归映射计算的 PML4 虚拟地址
+/// 地址计算: sign_extend(510 << 39 | 510 << 30 | 510 << 21 | 510 << 12)
+pub const RECURSIVE_PML4_ADDR: u64 = 0xFFFF_FF7F_BFDF_E000;
+
+/// 通过递归映射计算的 PDPT 基地址
+/// 地址计算: sign_extend(510 << 39 | 510 << 30 | 510 << 21)
+pub const RECURSIVE_PDPT_BASE: u64 = 0xFFFF_FF7F_BFC0_0000;
+
+/// 通过递归映射计算的 PD 基地址
+/// 地址计算: sign_extend(510 << 39 | 510 << 30)
+pub const RECURSIVE_PD_BASE: u64 = 0xFFFF_FF7F_8000_0000;
+
+/// 通过递归映射计算的 PT 基地址
+/// 地址计算: sign_extend(510 << 39)
+pub const RECURSIVE_PT_BASE: u64 = 0xFFFF_FF00_0000_0000;
+
+/// 获取当前活动的 PML4 表（通过递归映射）
+///
+/// # Safety
+///
+/// 需要递归页表槽已正确设置
+#[inline]
+pub unsafe fn recursive_pml4() -> &'static mut PageTable {
+    &mut *(RECURSIVE_PML4_ADDR as *mut PageTable)
+}
+
+/// 获取指定 PML4 索引的 PDPT（通过递归映射）
+///
+/// # Safety
+///
+/// 调用者必须确保该 PML4 条目存在且指向有效的 PDPT
+#[inline]
+pub unsafe fn recursive_pdpt(pml4_idx: usize) -> &'static mut PageTable {
+    let addr = RECURSIVE_PDPT_BASE + (pml4_idx as u64) * 0x1000;
+    &mut *(addr as *mut PageTable)
+}
+
+/// 获取指定索引的 PD（通过递归映射）
+///
+/// # Safety
+///
+/// 调用者必须确保对应的页表条目存在且有效
+#[inline]
+pub unsafe fn recursive_pd(pml4_idx: usize, pdpt_idx: usize) -> &'static mut PageTable {
+    let addr = RECURSIVE_PD_BASE
+        + (pml4_idx as u64) * 0x20_0000
+        + (pdpt_idx as u64) * 0x1000;
+    &mut *(addr as *mut PageTable)
+}
+
+/// 获取指定索引的 PT（通过递归映射）
+///
+/// # Safety
+///
+/// 调用者必须确保对应的页表条目存在且有效
+#[inline]
+pub unsafe fn recursive_pt(pml4_idx: usize, pdpt_idx: usize, pd_idx: usize) -> &'static mut PageTable {
+    let addr = RECURSIVE_PT_BASE
+        + (pml4_idx as u64) * 0x4000_0000
+        + (pdpt_idx as u64) * 0x20_0000
+        + (pd_idx as u64) * 0x1000;
+    &mut *(addr as *mut PageTable)
+}
+
+// ============================================================================
+// 4KB 页粒度支持 - 用于 MMIO 隔离和 W^X/NX 强制
+// ============================================================================
+
+/// Default flags for device MMIO mappings: RW, NX, uncached, write-through
+#[inline]
+pub fn mmio_flags() -> PageTableFlags {
+    PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::NO_EXECUTE
+        | PageTableFlags::NO_CACHE
+        | PageTableFlags::WRITE_THROUGH
+}
+
+/// Demote a 2 MB PD huge page into a 4 KB page table, cloning flags.
+///
+/// This function splits a 2MB huge page entry into 512 4KB page entries,
+/// preserving the original flags (minus HUGE_PAGE).
+///
+/// # Safety
+///
+/// - Caller must flush TLB after this operation if mappings are in use
+/// - The pd_entry must point to a valid huge page entry
+///
+/// # Arguments
+///
+/// * `pd_entry` - Mutable reference to the PD entry to split
+/// * `frame_allocator` - Allocator for the new page table frame
+pub unsafe fn split_2m_entry(
+    pd_entry: &mut PageTableEntry,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Result<&'static mut PageTable, MapError> {
+    // Only split huge pages
+    if !pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        // Already a PT pointer, get the table
+        let pt_virt = get_phys_offset() + pd_entry.addr().as_u64();
+        return Ok(&mut *(pt_virt.as_mut_ptr::<PageTable>()));
+    }
+
+    // Allocate a new page table frame
+    let pt_frame = frame_allocator
+        .allocate_frame()
+        .ok_or(MapError::FrameAllocationFailed)?;
+    let pt_virt = get_phys_offset() + pt_frame.start_address().as_u64();
+    let pt_ptr: *mut PageTable = pt_virt.as_mut_ptr();
+
+    // Zero the new page table
+    core::ptr::write_bytes(pt_ptr as *mut u8, 0, 4096);
+
+    // Get base physical address from the huge page entry
+    let base = pd_entry.addr().as_u64();
+
+    // Prepare flags: remove HUGE_PAGE, ensure PRESENT
+    let mut flags = pd_entry.flags();
+    flags.remove(PageTableFlags::HUGE_PAGE);
+    flags.insert(PageTableFlags::PRESENT);
+
+    // Fill 512 PTEs, each mapping a 4KB page
+    let pt = &mut *pt_ptr;
+    for i in 0..512usize {
+        let phys = PhysAddr::new(base + (i as u64) * 0x1000);
+        pt[i].set_addr(phys, flags);
+    }
+
+    // Update PD entry to point to new page table (not a huge page anymore)
+    // Preserve original flags (USER, NO_CACHE, etc.) minus leaf-only bits
+    // HUGE_PAGE and DIRTY are leaf-only - must remove for PDE pointing to PT
+    let mut pd_flags = pd_entry.flags();
+    pd_flags.remove(PageTableFlags::HUGE_PAGE);
+    pd_flags.remove(PageTableFlags::DIRTY);
+    pd_flags.insert(PageTableFlags::PRESENT);
+    pd_entry.set_addr(pt_frame.start_address(), pd_flags);
+
+    Ok(&mut *pt_ptr)
+}
+
+/// Ensure a virtual page is backed by a 4 KB PTE (allocate tables or demote 2 MB leaves).
+///
+/// # Safety
+///
+/// Caller must ensure the virtual address is valid and CR3 won't change during operation.
+pub unsafe fn ensure_pte_level(
+    page: Page<Size4KiB>,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Result<(), MapError> {
+    let phys_offset = get_phys_offset();
+    let pml4 = active_level_4_table(phys_offset);
+
+    // PML4 entry
+    let pml4_idx = page.p4_index();
+    let pml4e = &mut pml4[pml4_idx];
+    if pml4e.is_unused() {
+        return Err(MapError::ParentEntryHugePage);
+    }
+
+    // PDPT
+    let pdpt_ptr: *mut PageTable = (phys_offset + pml4e.addr().as_u64()).as_mut_ptr();
+    let pdpt = &mut *pdpt_ptr;
+    let pdpt_idx = page.p3_index();
+    let pdpte = &mut pdpt[pdpt_idx];
+
+    // Check for 1GB huge page (not supported for demotion)
+    if pdpte.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Err(MapError::ParentEntryHugePage);
+    }
+
+    // Allocate PD if needed
+    if pdpte.is_unused() {
+        let pd_frame = frame_allocator
+            .allocate_frame()
+            .ok_or(MapError::FrameAllocationFailed)?;
+        let pd_virt = phys_offset + pd_frame.start_address().as_u64();
+        core::ptr::write_bytes(pd_virt.as_mut_ptr::<u8>(), 0, 4096);
+        pdpte.set_addr(
+            pd_frame.start_address(),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        );
+    }
+
+    // PD
+    let pd_ptr: *mut PageTable = (phys_offset + pdpte.addr().as_u64()).as_mut_ptr();
+    let pd = &mut *pd_ptr;
+    let pd_idx = page.p2_index();
+    let pde = &mut pd[pd_idx];
+
+    // Demote 2MB huge page to 4KB pages if needed
+    if pde.flags().contains(PageTableFlags::HUGE_PAGE) {
+        split_2m_entry(pde, frame_allocator)?;
+    } else if pde.is_unused() {
+        // Allocate new PT
+        let pt_frame = frame_allocator
+            .allocate_frame()
+            .ok_or(MapError::FrameAllocationFailed)?;
+        let pt_virt = phys_offset + pt_frame.start_address().as_u64();
+        core::ptr::write_bytes(pt_virt.as_mut_ptr::<u8>(), 0, 4096);
+        pde.set_addr(
+            pt_frame.start_address(),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        );
+    }
+
+    Ok(())
+}
+
+/// Ensure a range is mapped at PTE granularity (4KB pages).
+///
+/// # Safety
+///
+/// Caller must ensure addresses are valid and CR3 won't change.
+pub unsafe fn ensure_pte_range(
+    start: VirtAddr,
+    size: usize,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Result<(), MapError> {
+    let pages = (size + 0xfff) / 0x1000;
+    for i in 0..pages {
+        let page = Page::<Size4KiB>::containing_address(start + (i as u64 * 0x1000));
+        ensure_pte_level(page, frame_allocator)?;
+    }
+    Ok(())
+}
+
+/// Map or tighten an MMIO region with RW+NX+uncached flags.
+///
+/// This function ensures the target pages are at 4KB granularity and applies
+/// MMIO-appropriate flags (writable, non-executable, non-cacheable).
+///
+/// # Safety
+///
+/// - Caller must ensure addresses are valid
+/// - TLB will be flushed automatically
+pub unsafe fn map_mmio(
+    virt: VirtAddr,
+    phys: PhysAddr,
+    size: usize,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Result<(), MapError> {
+    // First ensure all pages are at 4KB granularity
+    ensure_pte_range(virt, size, frame_allocator)?;
+
+    let flags = mmio_flags();
+
+    // Now map or update each page
+    with_current_manager(get_phys_offset(), |mgr| {
+        let pages = (size + 0xfff) / 0x1000;
+        for i in 0..pages {
+            let page = Page::<Size4KiB>::containing_address(virt + (i as u64) * 0x1000);
+            let frame = PhysFrame::containing_address(phys + (i as u64) * 0x1000);
+
+            match mgr.map_page(page, frame, flags, frame_allocator) {
+                Ok(()) => {}
+                Err(MapError::PageAlreadyMapped) => {
+                    // Verify existing mapping points to same physical frame
+                    match mgr.translate_addr(page.start_address()) {
+                        Some(mapped) if mapped == frame.start_address() => {
+                            // Same frame, just update flags
+                            mgr.update_flags(page, flags)
+                                .map_err(|_| MapError::ParentEntryHugePage)?;
+                        }
+                        Some(_) => {
+                            // Different frame mapped - conflict
+                            return Err(MapError::PageAlreadyMapped);
+                        }
+                        None => {
+                            // Inconsistent page table state
+                            return Err(MapError::ParentEntryHugePage);
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    })?;
+
+    // Flush TLB for the mapped range
+    for i in 0..(size + 0xfff) / 0x1000 {
+        let addr = virt + (i as u64) * 0x1000;
+        x86_64::instructions::tlb::flush(addr);
+    }
+
+    Ok(())
 }

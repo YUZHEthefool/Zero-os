@@ -9,6 +9,38 @@ use kernel_core::on_scheduler_tick;
 use crate::gdt;
 use crate::context_switch;
 
+// Serial port for debug output (0x3F8)
+const SERIAL_PORT: u16 = 0x3F8;
+
+#[inline(always)]
+unsafe fn serial_outb(port: u16, val: u8) {
+    core::arch::asm!(
+        "out dx, al",
+        in("dx") port,
+        in("al") val,
+        options(nomem, nostack)
+    );
+}
+
+/// Write string to serial port (for early debug)
+#[allow(dead_code)]
+unsafe fn serial_write_str(s: &str) {
+    for byte in s.bytes() {
+        serial_outb(SERIAL_PORT, byte);
+    }
+}
+
+/// Write hex value to serial port
+#[allow(dead_code)]
+unsafe fn serial_write_hex(val: u64) {
+    serial_write_str("0x");
+    for i in (0..16).rev() {
+        let nibble = ((val >> (i * 4)) & 0xF) as u8;
+        let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        serial_outb(SERIAL_PORT, c);
+    }
+}
+
 /// 中断统计信息快照（用于外部查询）
 #[derive(Debug, Default, Clone, Copy)]
 pub struct InterruptStatsSnapshot {
@@ -236,9 +268,17 @@ extern "x86-interrupt" fn device_not_available_handler(_stack_frame: InterruptSt
 
 /// #DF - Double Fault (双重错误)
 extern "x86-interrupt" fn double_fault_handler(
-    _stack_frame: InterruptStackFrame,
+    stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) -> ! {
+    // Output to serial immediately - no heap/VGA
+    unsafe {
+        serial_write_str("\n[DOUBLE FAULT] RIP=");
+        serial_write_hex(stack_frame.instruction_pointer.as_u64());
+        serial_write_str(" RSP=");
+        serial_write_hex(stack_frame.stack_pointer.as_u64());
+        serial_write_str("\n");
+    }
     INTERRUPT_STATS.double_fault.fetch_add(1, Ordering::Relaxed);
     panic!("Double fault - system halted");
 }
@@ -272,9 +312,17 @@ extern "x86-interrupt" fn stack_segment_fault_handler(
 
 /// #GP - General Protection Fault (一般保护错误)
 extern "x86-interrupt" fn general_protection_fault_handler(
-    _stack_frame: InterruptStackFrame,
-    _error_code: u64,
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
 ) {
+    // Output to serial immediately - no heap/VGA
+    unsafe {
+        serial_write_str("\n[GPF] error=");
+        serial_write_hex(error_code);
+        serial_write_str(" RIP=");
+        serial_write_hex(stack_frame.instruction_pointer.as_u64());
+        serial_write_str("\n");
+    }
     INTERRUPT_STATS.general_protection_fault.fetch_add(1, Ordering::Relaxed);
     panic!("General protection fault");
 }
@@ -283,32 +331,48 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 ///
 /// 处理缺页异常：
 /// 1. COW 缺页：复制页面并恢复执行
-/// 2. 用户空间缺页（用户态触发）：终止进程
-/// 3. 内核空间缺页或内核态触发的用户空间缺页：内核 bug，panic
+/// 2. 容错用户拷贝中的缺页：终止进程（无法恢复 RIP）
+/// 3. 用户空间缺页（用户态触发）：终止进程
+/// 4. 内核空间缺页或内核态触发的用户空间缺页：内核 bug，panic
 ///
 /// # Safety Note
 ///
 /// 区分用户态触发和内核态触发的缺页：
 /// - USER_MODE 标志表示 CPU 在 Ring 3 时触发
-/// - 内核态访问用户内存触发的缺页仍会 panic（正确行为，因为这表示内核bug）
+/// - 内核态访问用户内存的缺页如果在 usercopy 中会被优雅处理
+/// - 其他内核态缺页仍会 panic（内核 bug）
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
     use x86_64::registers::control::Cr2;
+    use kernel_core::usercopy;
 
     /// 用户空间地址上界
     const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
 
+    // Immediate serial output - before anything else
+    let fault_addr_raw = unsafe {
+        let mut addr: u64;
+        core::arch::asm!("mov {}, cr2", out(reg) addr, options(nomem, nostack));
+        addr
+    };
+    unsafe {
+        serial_write_str("\n[PF ENTRY] CR2=");
+        serial_write_hex(fault_addr_raw);
+        serial_write_str(" err=");
+        serial_write_hex(error_code.bits());
+        serial_write_str("\n");
+    }
+
     INTERRUPT_STATS.page_fault.fetch_add(1, Ordering::Relaxed);
 
     // 获取导致缺页的地址
-    let fault_addr = Cr2::read()
-        .unwrap_or_else(|_| panic!("Invalid CR2 address"))
-        .as_u64() as usize;
+    let fault_addr = fault_addr_raw as usize;
 
     // 检查是否为写入导致的保护违规缺页（可能是 COW）
     // PROTECTION_VIOLATION 表示页面存在但权限不足，区别于页面不存在的情况
+    // 必须先处理 COW，因为 usercopy 写入 COW 页面是合法操作
     if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
         && error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
     {
@@ -318,6 +382,30 @@ extern "x86-interrupt" fn page_fault_handler(
                 return; // COW 已修复，返回继续执行
             }
         }
+    }
+
+    // 【H-26 修复】检查是否为容错用户拷贝中的缺页
+    // 由于 x86 指令长度可变，无法简单地推进 RIP 跳过故障指令
+    // 当检测到 usercopy 中的页错误时，必须终止执行而非返回（否则会无限循环）
+    //
+    // 已知限制：当前实现会 panic 而非优雅返回 EFAULT
+    // 完整解决方案需要：
+    // 1. 异常表（exception table）将故障地址映射到恢复地址
+    // 2. 或者使用汇编 stub 并已知指令长度
+    if usercopy::try_handle_usercopy_fault(fault_addr) {
+        // 不能简单地 return - CPU 会重试故障指令导致无限循环
+        // 也不能直接调用 force_reschedule - 它不会修改 RIP
+        // 唯一安全的做法是 panic 或实现 RIP 修正
+        if let Some(pid) = kernel_core::process::current_pid() {
+            // 先标记进程终止（清理用途）
+            kernel_core::process::terminate_process(pid, 139);
+        }
+        panic!(
+            "Usercopy page fault at 0x{:x} - TOCTOU detected\n\
+             (User memory unmapped during syscall copy)\n\
+             TODO: Implement exception table for graceful EFAULT recovery\n{:#?}",
+            fault_addr, stack_frame
+        );
     }
 
     // 【安全修复 S-3】检查是否为用户态触发的用户空间缺页
@@ -343,6 +431,17 @@ extern "x86-interrupt" fn page_fault_handler(
     }
 
     // 内核空间缺页或内核态触发的用户空间缺页是严重的内核 bug
+    // 先通过串口输出关键信息（避免VGA/堆访问）
+    unsafe {
+        serial_write_str("\n[PAGE FAULT] addr=");
+        serial_write_hex(fault_addr as u64);
+        serial_write_str(" error=");
+        serial_write_hex(error_code.bits());
+        serial_write_str(" RIP=");
+        serial_write_hex(stack_frame.instruction_pointer.as_u64());
+        serial_write_str("\n");
+    }
+
     panic!(
         "Page fault at 0x{:x} (error={:?}, user_mode={})\n{:#?}",
         fault_addr, error_code, is_user_mode, stack_frame

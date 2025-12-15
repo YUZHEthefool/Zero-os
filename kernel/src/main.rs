@@ -117,24 +117,22 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         let mut frame_allocator = mm::memory::FrameAllocator::new();
         // Phase 0 安全加固配置
         //
-        // 当前限制：
-        // 1. identity map cleanup 使用 Skip 策略（需要精细MMIO映射支持）
-        // 2. NX 强制暂时禁用（bootloader使用2MB huge pages，无法精细控制）
-        //
-        // TODO [Phase 1]:
-        // - 实现 4KB 页粒度的内核映射
-        // - 为 MMIO 区域创建单独映射
-        // - 启用完整的 W^X/NX 强制
-        //
         // 已启用的安全功能：
         // - W^X 验证：检测违规（非阻止模式）
         // - kptr guard：内核指针混淆
         // - CSPRNG：ChaCha20 + RDRAND/RDSEED
         // - Spectre/Meltdown 缓解
+        //
+        // Phase 0 安全加固配置
+        //
+        // 递归页表访问已实现（PML4[510]），允许访问任意物理地址的页表帧
+        // - Identity map cleanup: RemoveWritable（将 identity map 设为只读+NX）
+        // - NX enforcement: 需要 4KB 页粒度，bootloader 使用 2MB huge pages
+        //
         let sec_config = security::SecurityConfig {
             phys_offset: mm::page_table::get_physical_memory_offset(),
-            cleanup_strategy: security::IdentityCleanupStrategy::Skip,
-            enforce_nx: false,                // 暂时禁用（需要4KB页粒度支持）
+            cleanup_strategy: security::IdentityCleanupStrategy::RemoveWritable,
+            enforce_nx: false,                // 暂时禁用（需要 4KB 页粒度）
             validate_wxorx: true,             // 验证 W^X 策略（检测但不阻止）
             initialize_rng: true,
             strict_wxorx: false,              // 非致命模式

@@ -16,6 +16,7 @@ pub mod fork;
 pub mod time;
 pub mod scheduler_hook;
 pub mod elf_loader;
+pub mod usercopy;
 
 pub use signal::{Signal, SignalAction, SignalError, PendingSignals, send_signal, default_action, signal_name, register_resume_callback};
 pub use fork::{sys_fork, ForkError, ForkResult, PAGE_REF_COUNT, create_fresh_address_space};

@@ -300,6 +300,15 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         
         (&mut *pml4_ptr)[0].set_addr(PhysAddr::new(pdpt_low_frame as u64), Flags::PRESENT | Flags::WRITABLE);
 
+        // 设置递归页表槽 (PML4[510] → PML4 自身)
+        // 这允许通过特殊虚拟地址访问任何页表帧，无论其物理地址在哪里
+        // 递归映射虚拟地址计算：
+        //   PML4:  0xFFFFFF7FBFDFE000
+        //   PDPT:  0xFFFFFF7FBFC00000 + pml4_idx * 0x1000
+        //   PD:    0xFFFFFF7F80000000 + pml4_idx * 0x200000 + pdpt_idx * 0x1000
+        //   PT:    0xFFFFFF0000000000 + pml4_idx * 0x40000000 + pdpt_idx * 0x200000 + pd_idx * 0x1000
+        (&mut *pml4_ptr)[510].set_addr(PhysAddr::new(pml4_frame as u64), Flags::PRESENT | Flags::WRITABLE);
+
         // 在切换前写 VGA 测试
         let vga = 0xb8000 as *mut u8;
         let msg1 = b"B4CR3";

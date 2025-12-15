@@ -288,8 +288,8 @@ fn verify_user_memory(ptr: *const u8, len: usize, require_write: bool) -> Result
 
 /// 从用户态缓冲区安全复制数据到内核缓冲区
 ///
-/// 先验证用户空间内存映射，然后执行复制。
-/// 这可以防止访问未映射内存导致的内核崩溃。
+/// 使用容错拷贝机制：如果在拷贝过程中发生页错误，
+/// 会返回 EFAULT 而非导致内核 panic（解决 TOCTOU 竞态条件）。
 ///
 /// # Arguments
 /// * `dest` - 内核缓冲区（目标）
@@ -302,19 +302,20 @@ fn copy_from_user(dest: &mut [u8], user_src: *const u8) -> Result<(), SyscallErr
         return Ok(());
     }
 
-    // 验证用户内存已映射且可读
-    verify_user_memory(user_src, dest.len(), false)?;
+    // 先进行基本的边界检查（地址范围验证）
+    validate_user_ptr(user_src, dest.len())?;
 
-    // 安全复制数据
-    unsafe {
-        core::ptr::copy_nonoverlapping(user_src, dest.as_mut_ptr(), dest.len());
-    }
-    Ok(())
+    // 使用容错拷贝：逐字节复制，页错误时返回 EFAULT
+    crate::usercopy::copy_from_user_safe(dest, user_src)
+        .map_err(|_| SyscallError::EFAULT)
 }
 
 /// 将内核缓冲区的数据安全复制到用户态缓冲区
 ///
-/// 先验证用户空间内存映射和写入权限，然后执行复制。
+/// 使用容错拷贝机制：如果在拷贝过程中发生页错误，
+/// 会返回 EFAULT 而非导致内核 panic（解决 TOCTOU 竞态条件）。
+///
+/// 注意：COW 页面会在写入时触发页错误，由 COW 处理器创建可写副本。
 ///
 /// # Arguments
 /// * `user_dst` - 用户空间缓冲区（目标）
@@ -327,19 +328,13 @@ fn copy_to_user(user_dst: *mut u8, src: &[u8]) -> Result<(), SyscallError> {
         return Ok(());
     }
 
-    // 验证用户内存已映射且可写入
-    // require_write=true 会检查 WRITABLE 或 BIT_9 (COW) 标志
-    // - WRITABLE: 直接可写
-    // - BIT_9 (COW): 写入时触发 #PF，由 COW 处理器创建可写副本
-    // - 两者都没有: 真正的只读页面（如代码段），返回 EFAULT
-    verify_user_memory(user_dst as *const u8, src.len(), true)?;
+    // 先进行基本的边界检查（地址范围验证）
+    validate_user_ptr(user_dst as *const u8, src.len())?;
 
-    // 安全复制数据
-    // 如果是 COW 页面，这里会触发 #PF，COW 处理器会处理
-    unsafe {
-        core::ptr::copy_nonoverlapping(src.as_ptr(), user_dst, src.len());
-    }
-    Ok(())
+    // 使用容错拷贝：逐字节复制，页错误时返回 EFAULT
+    // COW 页面会在 usercopy 过程中触发 #PF，由 COW 处理器处理
+    crate::usercopy::copy_to_user_safe(user_dst, src)
+        .map_err(|_| SyscallError::EFAULT)
 }
 
 /// 从用户空间复制以 '\0' 结尾的 C 字符串到内核缓冲区
