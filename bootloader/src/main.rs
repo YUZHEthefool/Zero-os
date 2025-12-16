@@ -263,9 +263,22 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         // 由于使用2MB大页，必须从2MB边界开始，所以实际映射：
         // 虚拟 0xffffffff80000000 → 物理 0x0 (包含0x100000)
         // 这样内核在物理 0x100000 处的代码对应虚拟地址 0xffffffff80100000
+        //
+        // W^X 安全说明：
+        // - PD[0] (0x0-0x200000) 包含内核所有段（.text/.rodata/.data/.bss）
+        //   由于 2MB 粒度太粗，无法正确分离代码和数据
+        //   暂时保持 RWX，由内核启动后通过 enforce_nx_for_kernel() 拆分为 4KB 页
+        // - 其他 PD 条目设为 RW+NX
         for i in 0..512usize {
             let phys_addr = PhysAddr::new((i as u64) * 0x200000);
-            (&mut *pd_ptr)[i].set_addr(phys_addr, Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE);
+            let flags = if i == 0 {
+                // 内核映像所在区域：暂时 RWX，由内核后续加固
+                Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE
+            } else {
+                // 数据区域：可写不可执行
+                Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE | Flags::NO_EXECUTE
+            };
+            (&mut *pd_ptr)[i].set_addr(phys_addr, flags);
         }
 
         // PDPT的第510项指向PD（对应虚拟地址的第30-38位）
@@ -283,6 +296,11 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
         // 恒等映射前 4GB（需要4个PD，每个PD映射1GB）
         // 这样可以确保 bootloader 代码、UEFI 固件、硬件MMIO（包括APIC在0xfee00000）都能访问
+        //
+        // 安全说明：
+        // - 暂时保持 RWX 以确保 bootloader 可以正常运行
+        // - 内核启动后通过 security::cleanup_identity_map() 将其加固为 RO+NX
+        // - 这是一个已知的启动阶段安全妥协
         for pdpt_idx in 0..4usize {
             let pd_low_frame = boot_services.allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
                 .expect("Failed to allocate low PD");
@@ -294,7 +312,7 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 let phys_addr = PhysAddr::new(((pdpt_idx * 512 + i) as u64) * 0x200000);
                 (&mut *pd_low_ptr)[i].set_addr(phys_addr, Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE);
             }
-            
+
             (&mut *pdpt_low_ptr)[pdpt_idx].set_addr(PhysAddr::new(pd_low_frame as u64), Flags::PRESENT | Flags::WRITABLE);
         }
         
@@ -307,7 +325,14 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         //   PDPT:  0xFFFFFF7FBFC00000 + pml4_idx * 0x1000
         //   PD:    0xFFFFFF7F80000000 + pml4_idx * 0x200000 + pdpt_idx * 0x1000
         //   PT:    0xFFFFFF0000000000 + pml4_idx * 0x40000000 + pdpt_idx * 0x200000 + pd_idx * 0x1000
-        (&mut *pml4_ptr)[510].set_addr(PhysAddr::new(pml4_frame as u64), Flags::PRESENT | Flags::WRITABLE);
+        //
+        // L-6 fix: Add NO_EXECUTE flag to prevent code execution from page table pages.
+        // This is defense-in-depth: even if an attacker can write to page tables via
+        // the recursive mapping, they cannot execute code from them.
+        (&mut *pml4_ptr)[510].set_addr(
+            PhysAddr::new(pml4_frame as u64),
+            Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE
+        );
 
         // 在切换前写 VGA 测试
         let vga = 0xb8000 as *mut u8;

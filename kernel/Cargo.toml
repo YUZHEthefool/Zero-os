@@ -18,6 +18,7 @@ ipc = { path = "ipc" }
 drivers = { path = "drivers" }
 kernel_core = { path = "kernel_core" }
 security = { path = "security" }
+vfs = { path = "vfs" }
 
 # 暂时移除 crossbeam-queue，或确保正确配置
 # crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }

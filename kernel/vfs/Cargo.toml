@@ -1,5 +1,5 @@
 [package]
-name = "arch"
+name = "vfs"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,9 +7,7 @@ edition = "2021"
 path = "lib.rs"
 
 [dependencies]
-kernel_core = { path = "../kernel_core" }
-drivers = { path = "../drivers" }
-cpu_local = { path = "../cpu_local" }
-x86_64 = "0.15"
 spin = "0.9"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
+kernel_core = { path = "../kernel_core" }
+drivers = { path = "../drivers" }

@@ -15,6 +15,7 @@ extern crate sched;
 extern crate ipc;
 extern crate kernel_core;
 extern crate security;
+extern crate vfs;
 
 // 演示模块
 mod demo;
@@ -129,16 +130,18 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         // - Identity map cleanup: RemoveWritable（将 identity map 设为只读+NX）
         // - NX enforcement: 需要 4KB 页粒度，bootloader 使用 2MB huge pages
         //
+        // Phase 0 安全加固：强制 NX + 严格 W^X，违规即 fail-fast
+        // 这是生产环境推荐配置，确保内存保护真正生效
         let sec_config = security::SecurityConfig {
             phys_offset: mm::page_table::get_physical_memory_offset(),
             cleanup_strategy: security::IdentityCleanupStrategy::RemoveWritable,
-            enforce_nx: false,                // 暂时禁用（需要 4KB 页粒度）
-            validate_wxorx: true,             // 验证 W^X 策略（检测但不阻止）
+            enforce_nx: true,                 // 启用 NX 强制执行
+            validate_wxorx: true,             // 验证 W^X 策略
             initialize_rng: true,
-            strict_wxorx: false,              // 非致命模式
+            strict_wxorx: true,               // 严格模式：发现 RWX 即报错
             enable_kptr_guard: true,          // 启用内核指针混淆
             enable_spectre_mitigations: true, // 启用 Spectre/Meltdown 缓解
-            run_security_tests: false,        // 暂时禁用安全测试
+            run_security_tests: false,        // 安全自测（可选开启）
         };
 
         match security::init(sec_config, &mut frame_allocator) {
@@ -170,6 +173,41 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 println!("      ! Continuing with reduced security");
             }
         }
+    }
+
+    // CPU 硬件保护特性启用 (SMEP/SMAP/UMIP)
+    println!("[2.7/3] Enabling CPU protection features...");
+    {
+        let cpu_status = arch::cpu_protection::enable_protections();
+        if cpu_status.smep_enabled {
+            println!("        - SMEP: enabled (blocks kernel executing user pages)");
+        } else if cpu_status.smep_supported {
+            println!("        ! SMEP: supported but failed to enable");
+        } else {
+            println!("        - SMEP: not supported by CPU");
+        }
+        if cpu_status.smap_enabled {
+            println!("        - SMAP: enabled (blocks kernel accessing user pages)");
+        } else if cpu_status.smap_supported {
+            println!("        ! SMAP: supported but failed to enable");
+        } else {
+            println!("        - SMAP: not supported by CPU");
+        }
+        if cpu_status.umip_enabled {
+            println!("        - UMIP: enabled (blocks user SGDT/SIDT/SLDT)");
+        } else if cpu_status.umip_supported {
+            println!("        ! UMIP: supported but failed to enable");
+        } else {
+            println!("        - UMIP: not supported by CPU");
+        }
+        if cpu_status.is_fully_protected() {
+            println!("      ✓ All CPU protections active");
+        } else {
+            println!("      ! Partial CPU protection (some features unavailable)");
+        }
+
+        // V-4 fix: No longer need to update SMAP status cache.
+        // clac_if_smap() now reads CR4 directly for SMP safety.
     }
 
     // 阶段3：测试基础功能
@@ -214,7 +252,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     ipc::init();  // 初始化IPC子系统并注册清理回调
     println!("      ✓ Capability-based endpoints enabled");
     println!("      ✓ Process cleanup callback registered");
-    
+
+    println!("[7.5/8] Initializing VFS...");
+    vfs::init();  // 初始化虚拟文件系统
+    println!("      ✓ devfs mounted at /dev");
+    println!("      ✓ Device files: null, zero, console");
+
     println!("[8/8] Verifying memory management...");
     println!("      ✓ Page table manager compiled");
     println!("      ✓ mmap/munmap available");
@@ -234,6 +277,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("   • Page Table Manager");
     println!("   • Kernel Stack Guard Pages");
     println!("   • Security Hardening (W^X, NX, CSPRNG)");
+    println!("   • CPU Protection (SMEP/SMAP/UMIP)");
     println!("   • Process Control Block");
     println!("   • Enhanced Scheduler (Multi-level feedback queue)");
     println!("   • Context Switch (176-byte context)");
@@ -241,6 +285,8 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("   • Fork with COW");
     println!("   • Memory Mapping (mmap/munmap)");
     println!("   • Capability-based IPC");
+    println!("   • Virtual File System (VFS)");
+    println!("   • Device Files (/dev/null, /dev/zero, /dev/console)");
     println!();
     println!("进入空闲循环...");
     println!();

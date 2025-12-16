@@ -1,0 +1,11 @@
+[package]
+name = "cpu_local"
+version = "0.1.0"
+edition = "2021"
+description = "Per-CPU storage abstraction for SMP support"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+spin = "0.9"

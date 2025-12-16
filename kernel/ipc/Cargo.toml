@@ -13,3 +13,4 @@ kernel_core = { path = "../kernel_core" }
 drivers = { path = "../drivers" }
 mm = { path = "../mm" }
 x86_64 = "0.15"
+vfs = { path = "../vfs" }

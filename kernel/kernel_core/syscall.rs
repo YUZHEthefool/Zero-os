@@ -4,9 +4,11 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use alloc::string::{String, ToString};
 use core::mem;
 use crate::fork::PAGE_REF_COUNT;
 use crate::process::{ProcessId, ProcessState, terminate_process, cleanup_zombie, create_process, current_pid, get_process};
+use crate::usercopy::UserAccessGuard;
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
@@ -129,6 +131,48 @@ pub type FdCloseCallback = fn(i32) -> Result<(), SyscallError>;
 /// 参数: (uaddr, op, val, current_value) -> result 或错误
 pub type FutexCallback = fn(usize, i32, u32, u32) -> Result<usize, SyscallError>;
 
+/// VFS 打开文件回调类型
+///
+/// 由 vfs 模块注册，处理文件打开
+/// 参数: (path, flags, mode) -> FileOps box 或错误
+/// 返回的 FileOps 由 syscall 模块存入 fd_table
+pub type VfsOpenCallback = fn(&str, u32, u32) -> Result<crate::process::FileDescriptor, SyscallError>;
+
+/// VFS 获取文件状态回调类型
+///
+/// 由 vfs 模块注册，处理 stat 系统调用
+/// 参数: (path) -> (size, mode, ino, dev, nlink, uid, gid, rdev, atime, mtime, ctime) 或错误
+pub type VfsStatCallback = fn(&str) -> Result<VfsStat, SyscallError>;
+
+/// VFS lseek 回调类型
+///
+/// 由 vfs 模块注册，处理文件 seek 操作
+/// 参数: (file_ops_ref, offset, whence) -> 新偏移位置 或错误
+/// file_ops_ref 是通过 as_any 获取的引用
+pub type VfsLseekCallback = fn(&dyn core::any::Any, i64, i32) -> Result<u64, SyscallError>;
+
+/// VFS 文件状态信息
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct VfsStat {
+    pub dev: u64,
+    pub ino: u64,
+    pub mode: u32,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u32,
+    pub size: u64,
+    pub blksize: u32,
+    pub blocks: u64,
+    pub atime_sec: i64,
+    pub atime_nsec: i64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
+    pub ctime_sec: i64,
+    pub ctime_nsec: i64,
+}
+
 lazy_static::lazy_static! {
     /// 管道创建回调
     static ref PIPE_CREATE_CALLBACK: spin::Mutex<Option<PipeCreateCallback>> = spin::Mutex::new(None);
@@ -140,6 +184,12 @@ lazy_static::lazy_static! {
     static ref FD_CLOSE_CALLBACK: spin::Mutex<Option<FdCloseCallback>> = spin::Mutex::new(None);
     /// Futex 操作回调
     static ref FUTEX_CALLBACK: spin::Mutex<Option<FutexCallback>> = spin::Mutex::new(None);
+    /// VFS 打开文件回调
+    static ref VFS_OPEN_CALLBACK: spin::Mutex<Option<VfsOpenCallback>> = spin::Mutex::new(None);
+    /// VFS stat 回调
+    static ref VFS_STAT_CALLBACK: spin::Mutex<Option<VfsStatCallback>> = spin::Mutex::new(None);
+    /// VFS lseek 回调
+    static ref VFS_LSEEK_CALLBACK: spin::Mutex<Option<VfsLseekCallback>> = spin::Mutex::new(None);
 }
 
 /// 注册管道创建回调
@@ -165,6 +215,21 @@ pub fn register_fd_close_callback(cb: FdCloseCallback) {
 /// 注册 Futex 操作回调
 pub fn register_futex_callback(cb: FutexCallback) {
     *FUTEX_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 VFS 打开文件回调
+pub fn register_vfs_open_callback(cb: VfsOpenCallback) {
+    *VFS_OPEN_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 VFS stat 回调
+pub fn register_vfs_stat_callback(cb: VfsStatCallback) {
+    *VFS_STAT_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 VFS lseek 回调
+pub fn register_vfs_lseek_callback(cb: VfsLseekCallback) {
+    *VFS_LSEEK_CALLBACK.lock() = Some(cb);
 }
 
 /// 用户空间地址上界
@@ -339,7 +404,11 @@ fn copy_to_user(user_dst: *mut u8, src: &[u8]) -> Result<(), SyscallError> {
 
 /// 从用户空间复制以 '\0' 结尾的 C 字符串到内核缓冲区
 ///
-/// 逐字节读取直到遇到 NUL 终止符，限制最大长度防止恶意无限字符串
+/// V-2 fix: 使用 usercopy 容错拷贝机制，防止 TOCTOU 攻击。
+/// 如果用户在验证后取消映射内存，copy_from_user_safe 会安全返回错误
+/// 而不是导致内核 panic。
+///
+/// 逐字节读取直到遇到 NUL 终止符，限制最大长度防止恶意无限字符串。
 fn copy_user_cstring(ptr: *const u8) -> Result<Vec<u8>, SyscallError> {
     if ptr.is_null() {
         return Err(SyscallError::EFAULT);
@@ -348,13 +417,19 @@ fn copy_user_cstring(ptr: *const u8) -> Result<Vec<u8>, SyscallError> {
     let mut buf = Vec::new();
 
     for i in 0..=MAX_ARG_STRLEN {
-        // 每次只验证 1 字节，避免跨页访问未映射内存
-        verify_user_memory(unsafe { ptr.add(i) }, 1, false)?;
-        let byte = unsafe { *ptr.add(i) };
-        if byte == 0 {
+        // V-2 fix: 使用容错单字节拷贝
+        // copy_from_user_safe 内部会：
+        // 1. 创建 UserAccessGuard 处理 SMAP
+        // 2. 创建 UserCopyGuard 登记 usercopy 状态
+        // 3. 页错误时安全返回 Err 而非 panic
+        let mut byte = [0u8; 1];
+        crate::usercopy::copy_from_user_safe(&mut byte, unsafe { ptr.add(i) })
+            .map_err(|_| SyscallError::EFAULT)?;
+
+        if byte[0] == 0 {
             return Ok(buf);
         }
-        buf.push(byte);
+        buf.push(byte[0]);
     }
 
     // 字符串超过最大长度限制
@@ -362,6 +437,8 @@ fn copy_user_cstring(ptr: *const u8) -> Result<Vec<u8>, SyscallError> {
 }
 
 /// 将用户空间的字符串指针数组（以 NULL 结尾）复制到内核
+///
+/// V-2 fix: 使用 usercopy 容错拷贝机制读取指针数组，防止 TOCTOU 攻击。
 ///
 /// 用于 exec 的 argv 和 envp 参数
 fn copy_user_str_array(list_ptr: *const *const u8) -> Result<Vec<Vec<u8>>, SyscallError> {
@@ -381,16 +458,18 @@ fn copy_user_str_array(list_ptr: *const *const u8) -> Result<Vec<Vec<u8>>, Sysca
             .checked_add(idx * word)
             .ok_or(SyscallError::EFAULT)?;
 
-        // 验证指针地址可读
-        verify_user_memory(entry_addr as *const u8, word, false)?;
+        // V-2 fix: 使用容错拷贝读取指针值
+        // 这确保了即使用户在我们读取时取消映射，也不会导致内核 panic
+        let mut raw_ptr = [0u8; core::mem::size_of::<usize>()];
+        crate::usercopy::copy_from_user_safe(&mut raw_ptr, entry_addr as *const u8)
+            .map_err(|_| SyscallError::EFAULT)?;
+        let entry = usize::from_ne_bytes(raw_ptr) as *const u8;
 
-        // 读取指针值
-        let entry = unsafe { *(entry_addr as *const *const u8) };
         if entry.is_null() {
             break;  // NULL 终止
         }
 
-        // 复制字符串内容
+        // 复制字符串内容（copy_user_cstring 现在也使用容错拷贝）
         let s = copy_user_cstring(entry)?;
         total = total
             .checked_add(s.len() + 1)  // +1 for trailing '\0'
@@ -446,6 +525,8 @@ pub fn syscall_dispatcher(
         1 => sys_write(arg0 as i32, arg1 as *const u8, arg2 as usize),
         2 => sys_open(arg0 as *const u8, arg1 as i32, arg2 as u32),
         3 => sys_close(arg0 as i32),
+        4 => sys_stat(arg0 as *const u8, arg1 as *mut VfsStat),
+        8 => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32),
         22 => sys_pipe(arg0 as *mut i32),
 
         // 内存管理
@@ -562,20 +643,49 @@ fn sys_exec(
         proc.memory_space
     };
 
+    // S-7 fix: RAII guard to rollback address space on error
+    //
+    // After switching CR3, any error must restore the old address space
+    // and free the new one. This guard ensures automatic rollback.
+    struct ExecSpaceGuard {
+        old_space: usize,
+        new_space: usize,
+        committed: bool,
+    }
+
+    impl ExecSpaceGuard {
+        fn new(old_space: usize, new_space: usize) -> Self {
+            Self { old_space, new_space, committed: false }
+        }
+
+        /// Mark the exec as successful, preventing rollback on drop
+        fn commit(&mut self) {
+            self.committed = true;
+        }
+    }
+
+    impl Drop for ExecSpaceGuard {
+        fn drop(&mut self) {
+            if !self.committed {
+                // Rollback: restore old address space and free new one
+                crate::process::activate_memory_space(self.old_space);
+                crate::process::free_address_space(self.new_space);
+            }
+        }
+    }
+
+    // Create the guard before switching CR3
+    let mut space_guard = ExecSpaceGuard::new(old_memory_space, new_memory_space);
+
     // 切换到新地址空间
     activate_memory_space(new_memory_space);
 
     // 加载 ELF 映像
-    let load_result = match load_elf(&elf_data) {
-        Ok(result) => result,
-        Err(e) => {
-            // 加载失败，恢复旧地址空间
-            activate_memory_space(old_memory_space);
-            free_address_space(new_memory_space);
-            println!("sys_exec: ELF load failed: {:?}", e);
-            return Err(SyscallError::ENOEXEC);
-        }
-    };
+    // S-7 fix: Let the guard handle rollback on error
+    let load_result = load_elf(&elf_data).map_err(|e| {
+        println!("sys_exec: ELF load failed: {:?}", e);
+        SyscallError::ENOEXEC
+    })?;
 
     // =========================================================================
     // 构建符合 System V AMD64 ABI 的用户栈布局：
@@ -616,6 +726,9 @@ fn sys_exec(
     // 检查栈空间是否足够
     let stack_top = load_result.user_stack_top as usize;
     let stack_base = stack_top.checked_sub(USER_STACK_SIZE).ok_or(SyscallError::EFAULT)?;
+
+    // Allow supervisor access to user pages for stack construction when SMAP is enabled
+    let _user_access = UserAccessGuard::new();
 
     let total_needed = string_bytes + pointer_bytes + 16;  // +16 for alignment
     if total_needed > USER_STACK_SIZE {
@@ -746,6 +859,10 @@ fn sys_exec(
 
         old_space
     };
+
+    // S-7 fix: Commit the exec - prevent guard from rolling back
+    // This must be called after all error-prone operations are complete.
+    space_guard.commit();
 
     // 释放旧地址空间
     if old_space != 0 {
@@ -1072,10 +1189,181 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
 }
 
 /// sys_open - 打开文件
-fn sys_open(_path: *const u8, _flags: i32, _mode: u32) -> SyscallResult {
-    // TODO: 实现文件打开
-    println!("sys_open: not implemented yet");
-    Err(SyscallError::ENOSYS)
+///
+/// # Arguments
+/// * `path` - 文件路径（用户空间指针）
+/// * `flags` - 打开标志 (O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, etc.)
+/// * `mode` - 创建文件时的权限模式
+///
+/// # Returns
+/// 成功返回文件描述符，失败返回错误码
+fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
+    use crate::usercopy::UserAccessGuard;
+
+    // 验证路径指针
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // 获取当前进程
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // 复制路径字符串（最大 4096 字节）
+    let path_str = {
+        let _guard = UserAccessGuard::new();
+        let mut buf = [0u8; 4096];
+        let mut len = 0;
+
+        // 逐字节复制直到遇到 NUL 或达到最大长度
+        for i in 0..4095 {
+            let byte = unsafe { *path.add(i) };
+            if byte == 0 {
+                break;
+            }
+            buf[i] = byte;
+            len = i + 1;
+        }
+
+        if len == 0 {
+            return Err(SyscallError::EINVAL);
+        }
+
+        // 转换为字符串
+        core::str::from_utf8(&buf[..len])
+            .map_err(|_| SyscallError::EINVAL)?
+            .to_string()
+    };
+
+    // 获取 VFS 回调
+    let open_fn = {
+        let callback = VFS_OPEN_CALLBACK.lock();
+        *callback.as_ref().ok_or(SyscallError::ENOSYS)?
+    };
+
+    // 调用 VFS 打开文件
+    let file_ops = open_fn(&path_str, flags as u32, mode)?;
+
+    // 分配文件描述符并存入 fd_table
+    let fd = {
+        let mut proc = process.lock();
+        proc.allocate_fd(file_ops).ok_or(SyscallError::EMFILE)?
+    };
+
+    Ok(fd as usize)
+}
+
+/// sys_stat - 获取文件状态
+///
+/// # Arguments
+/// * `path` - 文件路径（用户空间指针）
+/// * `statbuf` - 指向用户空间 VfsStat 结构体的指针
+///
+/// # Returns
+/// 成功返回 0，失败返回错误码
+fn sys_stat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
+    use crate::usercopy::UserAccessGuard;
+
+    // 验证路径指针
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // 验证 statbuf 指针
+    if statbuf.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // 复制路径字符串（最大 4096 字节）
+    let path_str = {
+        let _guard = UserAccessGuard::new();
+        let mut buf = [0u8; 4096];
+        let mut len = 0;
+
+        // 逐字节复制直到遇到 NUL 或达到最大长度
+        for i in 0..4095 {
+            let byte = unsafe { *path.add(i) };
+            if byte == 0 {
+                break;
+            }
+            buf[i] = byte;
+            len = i + 1;
+        }
+
+        if len == 0 {
+            return Err(SyscallError::EINVAL);
+        }
+
+        // 转换为字符串
+        core::str::from_utf8(&buf[..len])
+            .map_err(|_| SyscallError::EINVAL)?
+            .to_string()
+    };
+
+    // 获取 VFS stat 回调
+    let stat_fn = {
+        let callback = VFS_STAT_CALLBACK.lock();
+        *callback.as_ref().ok_or(SyscallError::ENOSYS)?
+    };
+
+    // 调用 VFS stat
+    let stat = stat_fn(&path_str)?;
+
+    // 将结果写入用户空间
+    let stat_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &stat as *const VfsStat as *const u8,
+            core::mem::size_of::<VfsStat>(),
+        )
+    };
+    copy_to_user(statbuf as *mut u8, stat_bytes)?;
+
+    Ok(0)
+}
+
+/// sys_lseek - 移动文件读写偏移
+///
+/// # Arguments
+/// * `fd` - 文件描述符
+/// * `offset` - 偏移量
+/// * `whence` - 偏移起点：
+///   - 0 (SEEK_SET): 从文件开头
+///   - 1 (SEEK_CUR): 从当前位置
+///   - 2 (SEEK_END): 从文件结尾
+///
+/// # Returns
+/// 成功返回新的偏移位置，失败返回错误码
+fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
+    // 标准流不支持 seek
+    if fd < 3 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // 验证 whence 参数
+    if whence < 0 || whence > 2 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // 获取当前进程
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // 从 fd_table 获取文件描述符
+    let proc = process.lock();
+    let file_ops = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+
+    // 获取 lseek 回调函数
+    let lseek_fn = {
+        let callback = VFS_LSEEK_CALLBACK.lock();
+        *callback.as_ref().ok_or(SyscallError::EINVAL)?
+    };
+
+    // 通过回调执行 seek 操作
+    // 回调函数会尝试将 file_ops 向下转型到 FileHandle 并执行 seek
+    match lseek_fn(file_ops.as_any(), offset, whence) {
+        Ok(new_offset) => Ok(new_offset as usize),
+        Err(e) => Err(e),
+    }
 }
 
 /// sys_close - 关闭文件描述符

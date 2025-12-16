@@ -108,57 +108,74 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
 
 /// 文件描述符读取回调
 ///
-/// 从指定的文件描述符读取数据（目前仅支持管道）
+/// 从指定的文件描述符读取数据（管道 + VFS 文件）
 ///
 /// 注意：为避免死锁，必须在释放进程锁后再调用可能阻塞的管道操作
 fn fd_read_callback(fd: i32, buf: &mut [u8]) -> Result<usize, SyscallError> {
     use process::{current_pid, get_process};
+    use vfs::traits::FileHandle;
 
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
-    // 克隆 PipeHandle 以便在释放进程锁后使用
-    // 这是安全的因为 PipeHandle 使用 Arc<Pipe> 进行引用计数
-    let pipe_handle = {
+    // 首先尝试管道（在锁外执行可能阻塞的读取）
+    if let Some(pipe_handle) = {
         let proc = process.lock();
         let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+        fd_obj.as_any().downcast_ref::<PipeHandle>().cloned()
+    } {
+        return pipe_handle.read(buf).map_err(pipe_error_to_syscall);
+    }
 
-        // 尝试 downcast 到 PipeHandle 并克隆
-        let handle = fd_obj.as_any()
-            .downcast_ref::<PipeHandle>()
-            .ok_or(SyscallError::EBADF)?;
-        handle.clone() // 克隆 PipeHandle（增加 Arc 引用计数）
-    }; // 进程锁在此释放
+    // 再尝试 VFS FileHandle（VFS 读通常不阻塞，持锁访问即可）
+    {
+        let proc = process.lock();
+        let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+        if let Some(file) = fd_obj.as_any().downcast_ref::<FileHandle>() {
+            if file.inode.is_dir() {
+                return Err(SyscallError::EISDIR);
+            }
+            return file.read(buf).map_err(fs_error_to_syscall);
+        }
+    }
 
-    // 在锁外执行可能阻塞的读取操作
-    pipe_handle.read(buf).map_err(pipe_error_to_syscall)
+    Err(SyscallError::EBADF)
 }
 
 /// 文件描述符写入回调
 ///
-/// 向指定的文件描述符写入数据（目前仅支持管道）
+/// 向指定的文件描述符写入数据（管道 + VFS 文件）
 ///
 /// 注意：为避免死锁，必须在释放进程锁后再调用可能阻塞的管道操作
 fn fd_write_callback(fd: i32, buf: &[u8]) -> Result<usize, SyscallError> {
     use process::{current_pid, get_process};
+    use vfs::traits::FileHandle;
 
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
-    // 克隆 PipeHandle 以便在释放进程锁后使用
-    let pipe_handle = {
+    // 先尝试管道（在锁外执行可能阻塞的写入）
+    if let Some(pipe_handle) = {
         let proc = process.lock();
         let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+        fd_obj.as_any().downcast_ref::<PipeHandle>().cloned()
+    } {
+        return pipe_handle.write(buf).map_err(pipe_error_to_syscall);
+    }
 
-        // 尝试 downcast 到 PipeHandle 并克隆
-        let handle = fd_obj.as_any()
-            .downcast_ref::<PipeHandle>()
-            .ok_or(SyscallError::EBADF)?;
-        handle.clone()
-    }; // 进程锁在此释放
+    // 再尝试 VFS FileHandle
+    {
+        let proc = process.lock();
+        let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+        if let Some(file) = fd_obj.as_any().downcast_ref::<FileHandle>() {
+            if file.inode.is_dir() {
+                return Err(SyscallError::EISDIR);
+            }
+            return file.write(buf).map_err(fs_error_to_syscall);
+        }
+    }
 
-    // 在锁外执行可能阻塞的写入操作
-    pipe_handle.write(buf).map_err(pipe_error_to_syscall)
+    Err(SyscallError::EBADF)
 }
 
 /// 文件描述符关闭回调
@@ -185,6 +202,26 @@ fn pipe_error_to_syscall(err: PipeError) -> SyscallError {
         PipeError::Closed => SyscallError::EPIPE,
         PipeError::InvalidPipe | PipeError::InvalidOperation => SyscallError::EBADF,
         PipeError::NoCurrentProcess => SyscallError::ESRCH,
+    }
+}
+
+/// FsError 到 SyscallError 的转换（用于 VFS FileHandle）
+fn fs_error_to_syscall(err: vfs::types::FsError) -> SyscallError {
+    use vfs::types::FsError;
+    match err {
+        FsError::NotFound => SyscallError::ENOENT,
+        FsError::NotDir => SyscallError::ENOTDIR,
+        FsError::IsDir => SyscallError::EISDIR,
+        FsError::Exists => SyscallError::EEXIST,
+        FsError::PermDenied => SyscallError::EACCES,
+        FsError::BadFd => SyscallError::EBADF,
+        FsError::ReadOnly => SyscallError::EACCES,
+        FsError::NoSpace | FsError::NoMem => SyscallError::ENOMEM,
+        FsError::Io => SyscallError::EIO,
+        FsError::Invalid | FsError::NameTooLong | FsError::CrossDev | FsError::Seek => SyscallError::EINVAL,
+        FsError::NotSupported => SyscallError::ENOSYS,
+        FsError::Pipe => SyscallError::EPIPE,
+        FsError::NotEmpty => SyscallError::EBUSY,
     }
 }
 

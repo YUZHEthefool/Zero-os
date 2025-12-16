@@ -24,6 +24,11 @@ pub use process::{
     register_ipc_cleanup, allocate_kernel_stack, kernel_stack_slot,
     KernelStackError, KSTACK_BASE, KSTACK_STRIDE, free_kernel_stack, free_address_space,
     FileOps, FileDescriptor, MAX_FD,
+    // DAC support
+    Credentials, current_credentials, current_euid, current_egid,
+    current_supplementary_groups, set_current_supplementary_groups,
+    add_supplementary_group, remove_supplementary_group, NGROUPS_MAX,
+    current_umask, set_current_umask,
 };
 pub use time::{current_timestamp_ms, get_ticks, on_timer_tick};
 pub use scheduler_hook::{
@@ -35,7 +40,8 @@ pub use elf_loader::{load_elf, ElfLoadError, ElfLoadResult, USER_STACK_TOP, USER
 pub use syscall::{
     register_pipe_callback, register_fd_read_callback, register_fd_write_callback, register_fd_close_callback,
     register_futex_callback,
-    SyscallError,
+    register_vfs_open_callback, register_vfs_stat_callback, register_vfs_lseek_callback,
+    SyscallError, VfsStat,
 };
 
 pub fn init() {

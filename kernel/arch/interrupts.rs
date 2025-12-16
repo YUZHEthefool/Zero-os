@@ -1,6 +1,13 @@
 //! 中断和异常处理
 //!
 //! 实现完整的x86_64中断描述符表（IDT）和异常处理器
+//!
+//! # SMAP 安全 (S-6 fix + V-4 SMP fix)
+//!
+//! 当中断发生在 STAC 区域（SMAP 临时禁用）时，中断处理器必须立即执行 CLAC
+//! 以恢复 SMAP 保护。这防止了攻击者利用中断窗口绕过 SMAP。
+//!
+//! V-4 fix: 直接读取CR4而非使用全局缓存，确保SMP环境下每个CPU正确检测SMAP状态。
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -11,6 +18,33 @@ use crate::context_switch;
 
 // Serial port for debug output (0x3F8)
 const SERIAL_PORT: u16 = 0x3F8;
+
+/// Clear AC flag if SMAP is enabled (S-6 fix + V-4 SMP fix)
+///
+/// Called at the entry of interrupt handlers to restore SMAP protection
+/// in case the interrupt occurred during a STAC region.
+///
+/// V-4 fix: Reads CR4 directly instead of using a cached value. This ensures
+/// correct SMAP detection on each CPU in SMP environments where different
+/// cores might enable SMAP at different times.
+///
+/// # Performance Note
+///
+/// Reading CR4 is a privileged instruction but is fast on modern CPUs.
+/// The overhead is minimal compared to the security benefit of correct
+/// SMAP enforcement across all CPUs.
+///
+/// # Safety
+///
+/// Safe to call from any context. CLAC is a no-op if SMAP is not enabled
+/// or if AC is already clear.
+#[inline(always)]
+fn clac_if_smap() {
+    use x86_64::registers::control::{Cr4, Cr4Flags};
+    if Cr4::read().contains(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION) {
+        unsafe { core::arch::asm!("clac", options(nostack, nomem)); }
+    }
+}
 
 #[inline(always)]
 unsafe fn serial_outb(port: u16, val: u8) {
@@ -222,6 +256,7 @@ pub fn get_stats() -> InterruptStatsSnapshot {
 
 /// #DE - Divide Error (除法错误)
 extern "x86-interrupt" fn divide_error_handler(_stack_frame: InterruptStackFrame) {
+    clac_if_smap();
     INTERRUPT_STATS.divide_error.fetch_add(1, Ordering::Relaxed);
     // 注意：中断处理程序中不使用 println! 以避免死锁
     panic!("Divide by zero or division overflow");
@@ -229,40 +264,47 @@ extern "x86-interrupt" fn divide_error_handler(_stack_frame: InterruptStackFrame
 
 /// #DB - Debug Exception (调试异常)
 extern "x86-interrupt" fn debug_handler(_stack_frame: InterruptStackFrame) {
+    clac_if_smap();
     // 调试异常：静默处理
 }
 
 /// #NMI - Non-Maskable Interrupt (不可屏蔽中断)
 extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
+    clac_if_smap();
     // NMI：可能是硬件错误，静默处理
 }
 
 /// #BP - Breakpoint (断点)
 extern "x86-interrupt" fn breakpoint_handler(_stack_frame: InterruptStackFrame) {
+    clac_if_smap();
     INTERRUPT_STATS.breakpoint.fetch_add(1, Ordering::Relaxed);
     // 断点异常：通常用于调试，静默处理
 }
 
 /// #OF - Overflow (溢出)
 extern "x86-interrupt" fn overflow_handler(_stack_frame: InterruptStackFrame) {
+    clac_if_smap();
     INTERRUPT_STATS.overflow.fetch_add(1, Ordering::Relaxed);
     panic!("Arithmetic overflow");
 }
 
 /// #BR - Bound Range Exceeded (边界范围超出)
 extern "x86-interrupt" fn bound_range_exceeded_handler(_stack_frame: InterruptStackFrame) {
+    clac_if_smap();
     INTERRUPT_STATS.bound_range_exceeded.fetch_add(1, Ordering::Relaxed);
     panic!("Bound range exceeded");
 }
 
 /// #UD - Invalid Opcode (无效操作码)
 extern "x86-interrupt" fn invalid_opcode_handler(_stack_frame: InterruptStackFrame) {
+    clac_if_smap();
     INTERRUPT_STATS.invalid_opcode.fetch_add(1, Ordering::Relaxed);
     panic!("Invalid or undefined opcode");
 }
 
 /// #NM - Device Not Available (设备不可用)
 extern "x86-interrupt" fn device_not_available_handler(_stack_frame: InterruptStackFrame) {
+    clac_if_smap();
     panic!("FPU or SIMD device not available");
 }
 
@@ -271,7 +313,12 @@ extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) -> ! {
-    // Output to serial immediately - no heap/VGA
+    // S-6 fix: Immediately restore SMAP protection
+    clac_if_smap();
+
+    // L-7 fix: Only output detailed state in debug builds to avoid
+    // leaking kernel addresses (KASLR bypass prevention)
+    #[cfg(debug_assertions)]
     unsafe {
         serial_write_str("\n[DOUBLE FAULT] RIP=");
         serial_write_hex(stack_frame.instruction_pointer.as_u64());
@@ -279,6 +326,13 @@ extern "x86-interrupt" fn double_fault_handler(
         serial_write_hex(stack_frame.stack_pointer.as_u64());
         serial_write_str("\n");
     }
+    #[cfg(not(debug_assertions))]
+    unsafe {
+        // Suppress unused warning in release builds
+        let _ = &stack_frame;
+        serial_write_str("\n[DOUBLE FAULT]\n");
+    }
+
     INTERRUPT_STATS.double_fault.fetch_add(1, Ordering::Relaxed);
     panic!("Double fault - system halted");
 }
@@ -288,6 +342,7 @@ extern "x86-interrupt" fn invalid_tss_handler(
     _stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) {
+    clac_if_smap();
     INTERRUPT_STATS.invalid_tss.fetch_add(1, Ordering::Relaxed);
     panic!("Invalid Task State Segment");
 }
@@ -297,6 +352,7 @@ extern "x86-interrupt" fn segment_not_present_handler(
     _stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) {
+    clac_if_smap();
     INTERRUPT_STATS.segment_not_present.fetch_add(1, Ordering::Relaxed);
     panic!("Segment not present");
 }
@@ -306,6 +362,7 @@ extern "x86-interrupt" fn stack_segment_fault_handler(
     _stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) {
+    clac_if_smap();
     INTERRUPT_STATS.stack_segment_fault.fetch_add(1, Ordering::Relaxed);
     panic!("Stack segment fault");
 }
@@ -315,6 +372,9 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) {
+    // S-6 fix: Immediately restore SMAP protection
+    clac_if_smap();
+
     // Output to serial immediately - no heap/VGA
     unsafe {
         serial_write_str("\n[GPF] error=");
@@ -345,6 +405,11 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    // S-6 fix: Immediately restore SMAP protection
+    // If this interrupt occurred during a STAC region, AC is set and SMAP is bypassed.
+    // We must clear AC before doing anything else to prevent SMAP bypass attacks.
+    clac_if_smap();
+
     use x86_64::registers::control::Cr2;
     use kernel_core::usercopy;
 
@@ -386,24 +451,24 @@ extern "x86-interrupt" fn page_fault_handler(
 
     // 【H-26 修复】检查是否为容错用户拷贝中的缺页
     // 由于 x86 指令长度可变，无法简单地推进 RIP 跳过故障指令
-    // 当检测到 usercopy 中的页错误时，必须终止执行而非返回（否则会无限循环）
+    // 采用"标记进程终止 + 请求重调度"的方式优雅处理，避免整个内核 panic
     //
-    // 已知限制：当前实现会 panic 而非优雅返回 EFAULT
-    // 完整解决方案需要：
-    // 1. 异常表（exception table）将故障地址映射到恢复地址
-    // 2. 或者使用汇编 stub 并已知指令长度
+    // 已知限制：完整解决方案需要异常表（exception table）将故障地址映射到恢复地址
     if usercopy::try_handle_usercopy_fault(fault_addr) {
-        // 不能简单地 return - CPU 会重试故障指令导致无限循环
-        // 也不能直接调用 force_reschedule - 它不会修改 RIP
-        // 唯一安全的做法是 panic 或实现 RIP 修正
+        // 标记进程终止并请求重调度
         if let Some(pid) = kernel_core::process::current_pid() {
-            // 先标记进程终止（清理用途）
+            // SIGSEGV 的退出码为 128 + 11 = 139
             kernel_core::process::terminate_process(pid, 139);
+            // 设置重调度标志，让调度器在安全点切换进程
+            kernel_core::request_resched_from_irq();
+            // 返回让中断框架执行 iret，调度器会选择其他进程
+            return;
         }
+
+        // 无法识别当前进程时仍保持 panic 以避免静默失败
         panic!(
-            "Usercopy page fault at 0x{:x} - TOCTOU detected\n\
-             (User memory unmapped during syscall copy)\n\
-             TODO: Implement exception table for graceful EFAULT recovery\n{:#?}",
+            "Usercopy page fault at 0x{:x} - TOCTOU detected (no current PID)\n\
+             (User memory unmapped during syscall copy)\n{:#?}",
             fault_addr, stack_frame
         );
     }
@@ -450,6 +515,7 @@ extern "x86-interrupt" fn page_fault_handler(
 
 /// #MF - x87 Floating-Point Exception (x87浮点异常)
 extern "x86-interrupt" fn x87_floating_point_handler(_stack_frame: InterruptStackFrame) {
+    clac_if_smap();
     panic!("x87 floating-point exception");
 }
 
@@ -458,24 +524,28 @@ extern "x86-interrupt" fn alignment_check_handler(
     _stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) {
+    clac_if_smap();
     INTERRUPT_STATS.alignment_check.fetch_add(1, Ordering::Relaxed);
     panic!("Alignment check failed");
 }
 
 /// #MC - Machine Check (机器检查)
 extern "x86-interrupt" fn machine_check_handler(_stack_frame: InterruptStackFrame) -> ! {
+    clac_if_smap();
     INTERRUPT_STATS.machine_check.fetch_add(1, Ordering::Relaxed);
     panic!("Machine check - hardware error");
 }
 
 /// #XM - SIMD Floating-Point Exception (SIMD浮点异常)
 extern "x86-interrupt" fn simd_floating_point_handler(_stack_frame: InterruptStackFrame) {
+    clac_if_smap();
     INTERRUPT_STATS.simd_floating_point.fetch_add(1, Ordering::Relaxed);
     panic!("SIMD floating-point exception");
 }
 
 /// #VE - Virtualization Exception (虚拟化异常)
 extern "x86-interrupt" fn virtualization_handler(_stack_frame: InterruptStackFrame) {
+    clac_if_smap();
     INTERRUPT_STATS.virtualization.fetch_add(1, Ordering::Relaxed);
     panic!("Virtualization exception");
 }
@@ -496,6 +566,9 @@ extern "x86-interrupt" fn virtualization_handler(_stack_frame: InterruptStackFra
 /// 注意：必须先发送 EOI 再执行抢占，避免上下文切换后 IRQ0 被屏蔽。
 /// 内核态中断不抢占，以避免持锁时发生调度。
 extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
+    // S-6 fix: Immediately restore SMAP protection
+    clac_if_smap();
+
     INTERRUPT_STATS.timer.fetch_add(1, Ordering::Relaxed);
 
     // 更新系统时钟计数器
@@ -527,6 +600,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
 
 /// IRQ 1 - Keyboard Interrupt (键盘中断)
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // S-6 fix: Immediately restore SMAP protection
+    clac_if_smap();
+
     INTERRUPT_STATS.keyboard.fetch_add(1, Ordering::Relaxed);
 
     // 读取并丢弃键盘扫描码（清除中断）

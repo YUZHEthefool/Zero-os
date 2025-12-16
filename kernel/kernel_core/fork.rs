@@ -166,6 +166,15 @@ fn fork_inner(
 
         child.time_slice = parent.time_slice;
         child.cpu_time = 0;
+
+        // 继承父进程的凭证 (DAC支持)
+        child.uid = parent.uid;
+        child.gid = parent.gid;
+        child.euid = parent.euid;
+        child.egid = parent.egid;
+        child.supplementary_groups = parent.supplementary_groups.clone();
+        child.umask = parent.umask;
+
         child.context.rax = 0; // 子进程返回值 0
         child.state = ProcessState::Ready;
 
@@ -308,18 +317,30 @@ pub unsafe fn handle_cow_page_fault(
             4096,
         );
 
-        // 取消原映射
-        let _ = manager.unmap_page(page);
+        // H-35 fix: Check unmap result - if it fails, deallocate the new frame and return error
+        if manager.unmap_page(page).is_err() {
+            frame_alloc.deallocate_frame(new_frame);
+            return Err(ForkError::PageTableCopyFailed);
+        }
 
         // 设置新标志：移除 COW，添加 WRITABLE
         let mut new_flags = flags;
         new_flags.remove(cow_flag());
         new_flags.insert(PageTableFlags::WRITABLE);
 
-        // 建立新映射
-        manager
-            .map_page(page, new_frame, new_flags, &mut frame_alloc)
-            .map_err(|_| ForkError::PageTableCopyFailed)?;
+        // H-35 fix: If map fails, try to restore the old mapping to avoid page loss
+        if let Err(_) = manager.map_page(page, new_frame, new_flags, &mut frame_alloc) {
+            // Attempt to restore the old mapping
+            let _ = manager.map_page(page, old_frame, flags, &mut frame_alloc);
+            // Flush TLB for this page to ensure old mapping is visible
+            x86_64::instructions::tlb::flush(virt);
+            // Deallocate the new frame we allocated
+            frame_alloc.deallocate_frame(new_frame);
+            return Err(ForkError::PageTableCopyFailed);
+        }
+
+        // H-35 fix: Flush TLB to ensure the new mapping with WRITABLE flag is effective
+        x86_64::instructions::tlb::flush(virt);
 
         // 减少原页引用计数
         let remaining = PAGE_REF_COUNT.decrement(old_phys.as_u64() as usize);
@@ -524,8 +545,13 @@ fn clone_leaf(
     } else if flags.contains(PageTableFlags::USER_ACCESSIBLE) {
         // 【关键修复】只读用户页面（如代码段）也在进程间共享
         // 缺少引用计数会导致父进程退出时页面被释放，而子进程仍在使用
-        let prev = PAGE_REF_COUNT.get(addr_usize);
-        PAGE_REF_COUNT.increment(addr_usize);  // 子进程持有引用
+        //
+        // 【TOCTOU 修复】使用一次原子加返回旧值的方式避免 get()+increment 竞态：
+        // - increment() 返回更新后的值，减 1 得到旧值
+        // - 如果旧值为 0，说明是首次跟踪此页面，需要补记父进程的引用
+        // - 如果旧值 > 0，说明已有其他进程在跟踪，只需为子进程增加引用
+        let new_count = PAGE_REF_COUNT.increment(addr_usize); // 子进程持有引用
+        let prev = new_count.saturating_sub(1); // 计算旧值
         if prev == 0 {
             // 首次跟踪此页面时，补记父进程的持有
             PAGE_REF_COUNT.increment(addr_usize);

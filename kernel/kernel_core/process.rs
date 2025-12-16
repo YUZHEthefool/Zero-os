@@ -327,16 +327,40 @@ pub struct Process {
 
     /// 子进程列表
     pub children: Vec<ProcessId>,
-    
+
     /// CPU时间统计（毫秒）
     pub cpu_time: u64,
-    
+
     /// 创建时间戳
     pub created_at: u64,
+
+    // ========== 进程凭证 (DAC支持) ==========
+
+    /// 真实用户ID (uid)
+    pub uid: u32,
+
+    /// 真实组ID (gid)
+    pub gid: u32,
+
+    /// 有效用户ID (euid) - 用于权限检查
+    pub euid: u32,
+
+    /// 有效组ID (egid) - 用于权限检查
+    pub egid: u32,
+
+    /// 附属组ID列表 (supplementary groups)
+    /// 用于扩展组权限检查，进程可以属于多个组
+    pub supplementary_groups: Vec<u32>,
+
+    /// 文件创建掩码 (umask)
+    /// 新建文件的权限 = mode & !umask
+    pub umask: u16,
 }
 
 impl Process {
     /// 创建新进程
+    ///
+    /// 默认以root权限运行（uid=0, gid=0），umask为标准0o022
     pub fn new(pid: ProcessId, ppid: ProcessId, name: String, priority: Priority) -> Self {
         Process {
             pid,
@@ -360,6 +384,13 @@ impl Process {
             children: Vec::new(),
             cpu_time: 0,
             created_at: time::current_timestamp_ms(),
+            // 默认以root运行，标准umask
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
+            supplementary_groups: Vec::new(),
+            umask: 0o022,
         }
     }
 
@@ -534,6 +565,181 @@ pub fn current_pid() -> Option<ProcessId> {
 /// 设置当前进程ID
 pub fn set_current_pid(pid: Option<ProcessId>) {
     *CURRENT_PID.lock() = pid;
+}
+
+// ========== 进程凭证访问 (DAC支持) ==========
+
+/// 进程凭证结构
+#[derive(Debug, Clone)]
+pub struct Credentials {
+    pub uid: u32,
+    pub gid: u32,
+    pub euid: u32,
+    pub egid: u32,
+    pub supplementary_groups: Vec<u32>,
+}
+
+/// 获取当前进程的凭证
+///
+/// 返回 None 如果没有当前进程
+pub fn current_credentials() -> Option<Credentials> {
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let proc = slot.as_ref()?.lock();
+    Some(Credentials {
+        uid: proc.uid,
+        gid: proc.gid,
+        euid: proc.euid,
+        egid: proc.egid,
+        supplementary_groups: proc.supplementary_groups.clone(),
+    })
+}
+
+/// 获取当前进程的有效用户ID
+pub fn current_euid() -> Option<u32> {
+    current_credentials().map(|c| c.euid)
+}
+
+/// 获取当前进程的有效组ID
+pub fn current_egid() -> Option<u32> {
+    current_credentials().map(|c| c.egid)
+}
+
+/// 获取当前进程的附属组列表
+///
+/// 返回附属组ID的克隆列表，如果没有当前进程则返回 None
+pub fn current_supplementary_groups() -> Option<Vec<u32>> {
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let proc = slot.as_ref()?.lock();
+    Some(proc.supplementary_groups.clone())
+}
+
+/// Maximum number of supplementary groups per process
+///
+/// This limit prevents memory exhaustion and keeps permission check performance reasonable.
+/// Linux uses NGROUPS_MAX (typically 65536), but we use a smaller value for kernel simplicity.
+pub const NGROUPS_MAX: usize = 256;
+
+/// 设置当前进程的附属组列表
+///
+/// 会自动去重并排序，方便后续查找。
+/// 最多保留 NGROUPS_MAX 个组以防止资源耗尽。
+///
+/// # Security
+///
+/// 只有 root 进程 (euid == 0) 可以修改附属组列表。
+/// 非特权进程调用此函数将静默失败（返回 None）。
+///
+/// # Arguments
+/// * `groups` - 新的附属组列表
+///
+/// # Returns
+/// 成功返回 Some(())，没有当前进程或权限不足返回 None
+pub fn set_current_supplementary_groups(groups: &[u32]) -> Option<()> {
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let mut proc = slot.as_ref()?.lock();
+
+    // Security: Only root can modify supplementary groups
+    if proc.euid != 0 {
+        return None;
+    }
+
+    proc.supplementary_groups.clear();
+    // Take only up to NGROUPS_MAX groups to prevent DoS
+    let limit = groups.len().min(NGROUPS_MAX);
+    proc.supplementary_groups.extend(groups[..limit].iter().copied());
+    proc.supplementary_groups.sort_unstable();
+    proc.supplementary_groups.dedup();
+    Some(())
+}
+
+/// 向当前进程添加一个附属组
+///
+/// 如果该组已存在则不会重复添加。
+/// 如果已达到 NGROUPS_MAX 上限，添加操作被忽略。
+///
+/// # Security
+///
+/// 只有 root 进程 (euid == 0) 可以添加附属组。
+/// 非特权进程调用此函数将静默失败（返回 None）。
+///
+/// # Arguments
+/// * `gid` - 要添加的组ID
+///
+/// # Returns
+/// 成功返回 Some(())，没有当前进程或权限不足返回 None
+pub fn add_supplementary_group(gid: u32) -> Option<()> {
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let mut proc = slot.as_ref()?.lock();
+
+    // Security: Only root can modify supplementary groups
+    if proc.euid != 0 {
+        return None;
+    }
+
+    if !proc.supplementary_groups.contains(&gid) {
+        // Enforce NGROUPS_MAX limit
+        if proc.supplementary_groups.len() < NGROUPS_MAX {
+            proc.supplementary_groups.push(gid);
+        }
+    }
+    Some(())
+}
+
+/// 从当前进程移除一个附属组
+///
+/// 如果该组不存在则无操作
+///
+/// # Security
+///
+/// 只有 root 进程 (euid == 0) 可以移除附属组。
+/// 非特权进程调用此函数将静默失败（返回 None）。
+///
+/// # Arguments
+/// * `gid` - 要移除的组ID
+///
+/// # Returns
+/// 成功返回 Some(())，没有当前进程或权限不足返回 None
+pub fn remove_supplementary_group(gid: u32) -> Option<()> {
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let mut proc = slot.as_ref()?.lock();
+
+    // Security: Only root can modify supplementary groups
+    if proc.euid != 0 {
+        return None;
+    }
+
+    proc.supplementary_groups.retain(|&g| g != gid);
+    Some(())
+}
+
+/// 获取当前进程的umask
+pub fn current_umask() -> Option<u16> {
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let proc = slot.as_ref()?.lock();
+    Some(proc.umask)
+}
+
+/// 设置当前进程的umask，返回旧的umask
+pub fn set_current_umask(new_mask: u16) -> Option<u16> {
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let mut proc = slot.as_ref()?.lock();
+    let old = proc.umask;
+    proc.umask = new_mask & 0o777; // 只保留权限位
+    Some(old)
 }
 
 /// 激活指定的地址空间
