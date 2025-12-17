@@ -635,17 +635,158 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
     // 获取当前页表根（复制内核映射）
     let (current_frame, _) = Cr3::read();
 
+    // 递归页表槽索引 (PML4[510] 指向 PML4 自身)
+    const RECURSIVE_INDEX: usize = 510;
+
     unsafe {
         let current_pml4 = phys_to_virt_table(current_frame.start_address());
         let new_pml4 = phys_to_virt_table(new_pml4_frame.start_address());
+
+        // 【关键修复】深拷贝 PML4[0] 并为用户空间准备 4KB 页映射
+        //
+        // PML4[0] 包含恒等映射（0-4GB），使用 2MB 大页。
+        // 用户空间需要 4KB 页映射，所以我们需要：
+        // 1. 深拷贝 PML4[0] 路径上的页表（避免影响内核的恒等映射）
+        // 2. 将用户空间区域（0x400000 附近）的 2MB 大页拆分为 4KB 页
+        if !current_pml4[0].is_unused() {
+            deep_copy_identity_for_user(
+                current_pml4,
+                new_pml4,
+                &mut frame_alloc,
+            )?;
+        }
 
         // 复制内核高半区映射（索引 256-511）
         // 这些映射在所有进程间共享
         for i in 256..512 {
             new_pml4[i] = current_pml4[i].clone();
         }
+
+        // 【关键修复】设置新页表的递归映射
+        // PML4[510] 必须指向新的 PML4 帧自身，而不是从 boot 页表复制的旧值
+        // 这样 recursive_pml4() 等函数才能正确访问新页表的条目
+        let recursive_flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+        new_pml4[RECURSIVE_INDEX].set_frame(new_pml4_frame, recursive_flags);
     }
 
     let phys_addr = new_pml4_frame.start_address().as_u64() as usize;
     Ok((new_pml4_frame, phys_addr))
+}
+
+/// 深拷贝恒等映射 PML4[0]，并为用户空间准备 4KB 页映射
+///
+/// 用户空间起始地址 0x400000 (4MB) 落在：
+/// - PML4[0] (0-512GB)
+/// - PDPT[0] (0-1GB)
+/// - PD[2] (4MB-6MB，因为每个 PD entry 覆盖 2MB)
+///
+/// 我们需要：
+/// 1. 为新页表分配独立的 PDPT（深拷贝）
+/// 2. 为 PDPT[0] 分配独立的 PD（深拷贝）
+/// 3. 将 PD[2] 的 2MB 大页拆分为 4KB PT（如果需要）
+///
+/// 这样用户空间可以使用 4KB 页，而内核的恒等映射不受影响。
+unsafe fn deep_copy_identity_for_user(
+    current_pml4: &mut PageTable,
+    new_pml4: &mut PageTable,
+    frame_alloc: &mut FrameAllocator,
+) -> Result<(), ForkError> {
+    // 用户空间起始地址对应的页表索引
+    const USER_BASE: usize = 0x400000; // 4MB
+    const PDPT_IDX: usize = 0;         // 0-1GB 在 PDPT[0]
+    const PD_IDX: usize = 2;           // 4MB-6MB 在 PD[2] (4MB / 2MB = 2)
+
+    let current_pml4_0 = &current_pml4[0];
+    if current_pml4_0.is_unused() {
+        return Ok(()); // 没有恒等映射，无需处理
+    }
+
+    // Step 1: 分配新的 PDPT
+    let new_pdpt_frame = frame_alloc
+        .allocate_frame()
+        .ok_or(ForkError::MemoryAllocationFailed)?;
+    zero_table(new_pdpt_frame);
+
+    // 复制 PDPT 条目
+    let current_pdpt = phys_to_virt_table(current_pml4_0.addr());
+    let new_pdpt = phys_to_virt_table(new_pdpt_frame.start_address());
+    for i in 0..512 {
+        new_pdpt[i] = current_pdpt[i].clone();
+    }
+
+    // 更新新 PML4[0] 指向新 PDPT
+    // 【关键修复】添加 USER_ACCESSIBLE 以允许用户态访问
+    let mut pml4_flags = current_pml4_0.flags();
+    pml4_flags.insert(PageTableFlags::USER_ACCESSIBLE);
+    new_pml4[0].set_addr(new_pdpt_frame.start_address(), pml4_flags);
+
+    // Step 2: 检查 PDPT[0]（0-1GB 区域）
+    let current_pdpt_0 = &current_pdpt[PDPT_IDX];
+    if current_pdpt_0.is_unused() {
+        return Ok(()); // 0-1GB 未映射
+    }
+
+    // 如果 PDPT[0] 是 1GB 大页，我们不支持拆分（太复杂）
+    if current_pdpt_0.flags().contains(PageTableFlags::HUGE_PAGE) {
+        println!("WARNING: 1GB huge page at PDPT[0], cannot split for user space");
+        return Err(ForkError::PageTableCopyFailed);
+    }
+
+    // Step 3: 分配新的 PD
+    let new_pd_frame = frame_alloc
+        .allocate_frame()
+        .ok_or(ForkError::MemoryAllocationFailed)?;
+    zero_table(new_pd_frame);
+
+    // 复制 PD 条目
+    let current_pd = phys_to_virt_table(current_pdpt_0.addr());
+    let new_pd = phys_to_virt_table(new_pd_frame.start_address());
+    for i in 0..512 {
+        new_pd[i] = current_pd[i].clone();
+    }
+
+    // 更新新 PDPT[0] 指向新 PD
+    // 【关键修复】添加 USER_ACCESSIBLE 以允许用户态访问
+    let mut pdpt_flags = current_pdpt_0.flags();
+    pdpt_flags.insert(PageTableFlags::USER_ACCESSIBLE);
+    new_pdpt[PDPT_IDX].set_addr(new_pd_frame.start_address(), pdpt_flags);
+
+    // Step 4: 检查并拆分 PD[2]（4MB-6MB 区域）的 2MB 大页
+    let current_pd_entry = &new_pd[PD_IDX];
+    if current_pd_entry.is_unused() {
+        return Ok(()); // 4MB-6MB 未映射
+    }
+
+    if current_pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        // 这是 2MB 大页，需要拆分为 4KB PT
+        // 但我们不填充 PT 条目，而是留空让 ELF loader 创建新映射
+        // 用户进程不需要 identity mapping，它会有自己的物理帧
+
+        // 分配新的 PT
+        let new_pt_frame = frame_alloc
+            .allocate_frame()
+            .ok_or(ForkError::MemoryAllocationFailed)?;
+        zero_table(new_pt_frame); // PT 保持为空，不填充 identity mapping
+
+        // 更新 PD[2] 指向新的空 PT（不再是大页）
+        // 【关键修复】添加 USER_ACCESSIBLE，移除 NO_EXECUTE 以允许用户代码执行
+        // NX 位会被 ELF loader 在 PT 级别按需设置
+        let mut pd_flags = current_pd_entry.flags();
+        pd_flags.remove(PageTableFlags::HUGE_PAGE);
+        pd_flags.remove(PageTableFlags::DIRTY); // DIRTY 是叶子页专有
+        pd_flags.remove(PageTableFlags::NO_EXECUTE); // 允许子页按需设置执行权限
+        pd_flags.insert(PageTableFlags::USER_ACCESSIBLE);
+        new_pd[PD_IDX].set_addr(new_pt_frame.start_address(), pd_flags);
+    } else {
+        // PD[2] 已经是 4KB PT，确保有 USER_ACCESSIBLE 且无 NO_EXECUTE
+        let pd_addr = current_pd_entry.addr();
+        let mut pd_flags = current_pd_entry.flags();
+        pd_flags.remove(PageTableFlags::NO_EXECUTE); // 允许子页按需设置执行权限
+        pd_flags.insert(PageTableFlags::USER_ACCESSIBLE);
+        new_pd[PD_IDX].set_addr(pd_addr, pd_flags);
+    }
+
+    Ok(())
 }

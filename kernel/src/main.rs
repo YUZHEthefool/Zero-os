@@ -26,6 +26,7 @@ mod syscall_demo;
 mod interrupt_demo;
 mod integration_test;
 mod stack_guard;
+mod usermode_test;
 
 // 串口端口
 const SERIAL_PORT: u16 = 0x3F8;
@@ -212,6 +213,19 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         // clac_if_smap() now reads CR4 directly for SMP safety.
     }
 
+    // Phase 6: 初始化 SYSCALL/SYSRET 快速系统调用机制
+    println!("[2.8/3] Initializing SYSCALL/SYSRET...");
+    {
+        // GDT 必须在此之前初始化（由 arch::interrupts::init() 完成）
+        // 获取系统调用入口点地址并配置 MSR
+        let syscall_entry = arch::syscall::syscall_entry_stub as *const () as u64;
+        unsafe {
+            arch::init_syscall_msr(syscall_entry);
+        }
+        println!("      ✓ SYSCALL MSR configured");
+        println!("      ✓ Ring 3 transition support ready");
+    }
+
     // 阶段3：测试基础功能
     println!("[3/3] Running basic tests...");
     
@@ -287,7 +301,15 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     
     // 运行集成测试
     integration_test::run_all_tests();
-    
+
+    // 运行 Ring 3 用户态测试
+    println!("[9/9] Running Ring 3 user mode test...");
+    if usermode_test::run_usermode_test() {
+        println!("      ✓ Ring 3 test process created successfully");
+    } else {
+        println!("      ! Ring 3 test setup failed");
+    }
+
     println!("=== System Ready ===");
     println!();
     println!("🎉 Zero-OS Phase 1 Complete!");
@@ -301,9 +323,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("   • Kernel Stack Guard Pages");
     println!("   • Security Hardening (W^X, NX, CSPRNG)");
     println!("   • CPU Protection (SMEP/SMAP/UMIP)");
+    println!("   • SYSCALL/SYSRET (Ring 3 transition)");
     println!("   • Process Control Block");
     println!("   • Enhanced Scheduler (Multi-level feedback queue)");
-    println!("   • Context Switch (176-byte context)");
+    println!("   • Context Switch (176-byte context + IRETQ)");
     println!("   • System Calls (50+ defined)");
     println!("   • Fork with COW");
     println!("   • Memory Mapping (mmap/munmap)");
@@ -311,6 +334,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("   • Virtual File System (VFS)");
     println!("   • Device Files (/dev/null, /dev/zero, /dev/console)");
     println!("   • Security Audit (hash-chained events)");
+    println!("   • Ring 3 User Mode (Phase 6 complete)");
     println!();
     println!("进入空闲循环...");
     println!();
@@ -321,8 +345,17 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         core::arch::asm!("sti", options(nomem, nostack));
     }
 
+    // 先尝试强制调度一次，让 Ring 3 测试进程运行
+    // 这是 Phase 6 Ring 3 测试的关键：调度器会检测到用户进程并使用 IRETQ 进入用户态
+    sched::enhanced_scheduler::Scheduler::reschedule_now(true);
+
     // 主内核循环
     loop {
+        // 检查是否有进程需要调度
+        if sched::enhanced_scheduler::Scheduler::need_resched() {
+            sched::enhanced_scheduler::Scheduler::reschedule_now(false);
+        }
+
         unsafe {
             core::arch::asm!(
                 "hlt",

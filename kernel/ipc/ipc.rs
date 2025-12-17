@@ -9,6 +9,7 @@
 
 use alloc::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
     vec::Vec,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -355,6 +356,15 @@ pub fn revoke_access(endpoint_id: EndpointId, pid: ProcessId) -> Result<(), IpcE
 /// 删除端点
 ///
 /// 只有端点所有者可以删除。
+///
+/// # X-6 安全修复
+///
+/// 销毁端点时必须清理关联的等待队列，唤醒所有阻塞等待的进程。
+/// 否则这些进程会永久阻塞，造成资源泄漏和 DoS。
+///
+/// **重要**：必须先移除端点注册，再清理等待队列。这确保被唤醒的线程
+/// 在下一次 receive_message 时立即看到 EndpointNotFound，避免重新创建
+/// 新的等待队列导致再次阻塞。
 pub fn destroy_endpoint(endpoint_id: EndpointId) -> Result<(), IpcError> {
     let owner = process::current_pid().ok_or(IpcError::NoCurrentProcess)?;
 
@@ -368,15 +378,49 @@ pub fn destroy_endpoint(endpoint_id: EndpointId) -> Result<(), IpcError> {
     }
 
     drop(registry);
+
+    // 先移除端点注册，确保被唤醒的等待者在下一次 receive 时立即得到 EndpointNotFound
     ENDPOINTS.lock().remove_endpoint(endpoint_id);
+
+    // X-6 修复：清理等待队列，唤醒所有阻塞的接收者
+    // 被唤醒的进程会在下次 receive_message 时得到 EndpointNotFound 错误
+    cleanup_wait_queue(endpoint_id);
+
     Ok(())
 }
 
 /// 清理进程的所有端点（进程退出时调用）
 ///
 /// 此函数应在进程终止时由进程管理子系统调用。
+///
+/// # X-6 安全修复
+///
+/// 进程退出时必须清理其所有端点的等待队列，唤醒所有阻塞等待的进程。
+/// 否则其他进程会永久阻塞在已销毁的端点上。
+///
+/// **重要**：必须先移除端点注册，再清理等待队列。这确保被唤醒的线程
+/// 在下一次 receive_message 时立即看到 EndpointNotFound，避免重新创建
+/// 新的等待队列导致再次阻塞。
 pub fn cleanup_process_endpoints(pid: ProcessId) {
+    // X-6 修复：先收集该进程的所有端点 ID
+    let endpoint_ids: Vec<EndpointId> = {
+        let registry = ENDPOINTS.lock();
+        registry
+            .per_process
+            .get(&pid)
+            .map(|table| table.keys().copied().collect())
+            .unwrap_or_default()
+    };
+
+    // X-6 修复：先移除端点注册
+    // 确保被唤醒的线程在下一次 receive 时立即看到 EndpointNotFound
+    // 避免在等待队列清理后重新创建新的等待队列导致再次阻塞
     ENDPOINTS.lock().cleanup_process(pid);
+
+    // 然后清理每个端点的等待队列，唤醒阻塞的进程
+    for endpoint_id in &endpoint_ids {
+        cleanup_wait_queue(*endpoint_id);
+    }
 }
 
 /// 获取端点队列中的消息数量
@@ -405,21 +449,26 @@ use alloc::collections::BTreeMap as WaitQueueMap;
 
 lazy_static::lazy_static! {
     /// 每端点等待队列：用于阻塞接收
-    static ref ENDPOINT_WAIT_QUEUES: spin::Mutex<WaitQueueMap<EndpointId, WaitQueue>> =
+    ///
+    /// # X-6 安全增强
+    ///
+    /// 使用 Arc<WaitQueue> 引用计数，避免在锁外访问时发生 use-after-free。
+    /// 当端点销毁时，通过 close() 关闭队列，唤醒所有等待者。
+    static ref ENDPOINT_WAIT_QUEUES: spin::Mutex<WaitQueueMap<EndpointId, Arc<WaitQueue>>> =
         spin::Mutex::new(WaitQueueMap::new());
 }
 
 /// 获取或创建端点的等待队列
-fn get_or_create_wait_queue(endpoint_id: EndpointId) -> &'static WaitQueue {
+///
+/// # X-6 安全增强
+///
+/// 返回 Arc<WaitQueue> 而非裸指针，确保引用计数正确管理内存。
+fn get_or_create_wait_queue(endpoint_id: EndpointId) -> Arc<WaitQueue> {
     let mut queues = ENDPOINT_WAIT_QUEUES.lock();
-    if !queues.contains_key(&endpoint_id) {
-        // 由于WaitQueue不是Copy，我们需要使用lazy初始化
-        queues.insert(endpoint_id, WaitQueue::new());
-    }
-    // 这里的生命周期是安全的，因为ENDPOINT_WAIT_QUEUES是静态的
-    // 但Rust的借用检查器不允许直接返回引用，所以我们需要用裸指针
-    let ptr = queues.get(&endpoint_id).unwrap() as *const WaitQueue;
-    unsafe { &*ptr }
+    queues
+        .entry(endpoint_id)
+        .or_insert_with(|| Arc::new(WaitQueue::new()))
+        .clone()
 }
 
 /// 发送消息并唤醒等待的接收者
@@ -429,9 +478,13 @@ pub fn send_message_notify(endpoint_id: EndpointId, data: Vec<u8>) -> Result<(),
     // 发送消息
     send_message(endpoint_id, data)?;
 
-    // 唤醒等待者
-    let queues = ENDPOINT_WAIT_QUEUES.lock();
-    if let Some(wq) = queues.get(&endpoint_id) {
+    // X-6: 克隆 Arc 后再释放锁，避免在持有锁时调用 wake
+    let wq = {
+        let queues = ENDPOINT_WAIT_QUEUES.lock();
+        queues.get(&endpoint_id).cloned()
+    };
+
+    if let Some(wq) = wq {
         wq.wake_one();
     }
 
@@ -450,30 +503,35 @@ pub fn send_message_notify(endpoint_id: EndpointId, data: Vec<u8>) -> Result<(),
 ///
 /// * `Ok(msg)` - 成功接收消息
 /// * `Err(...)` - 发生错误
+///
+/// # X-6 安全增强
+///
+/// 使用 Arc<WaitQueue> 避免 use-after-free，检查 is_closed() 避免永久阻塞。
+/// 如果端点在等待期间被销毁，返回 EndpointNotFound 错误。
 pub fn receive_message_blocking(endpoint_id: EndpointId) -> Result<ReceivedMessage, IpcError> {
-    // 确保等待队列存在
-    {
-        let mut queues = ENDPOINT_WAIT_QUEUES.lock();
-        if !queues.contains_key(&endpoint_id) {
-            queues.insert(endpoint_id, WaitQueue::new());
-        }
-    }
-
     loop {
         // 尝试接收
         match receive_message(endpoint_id)? {
             Some(msg) => return Ok(msg),
             None => {
-                // 队列为空，阻塞等待
-                // 获取等待队列的指针（安全：ENDPOINT_WAIT_QUEUES是静态的）
-                let wq_ptr = {
-                    let queues = ENDPOINT_WAIT_QUEUES.lock();
-                    queues.get(&endpoint_id).map(|wq| wq as *const WaitQueue)
-                };
+                // 队列为空，准备阻塞等待
+                // X-6: 使用 Arc 获取 wait queue，避免 use-after-free
+                let wq = get_or_create_wait_queue(endpoint_id);
 
-                if let Some(ptr) = wq_ptr {
-                    // 安全：指针指向静态存储
-                    unsafe { (*ptr).wait() };
+                // X-6: 如果端点已被销毁（队列已关闭），直接返回错误避免阻塞
+                if wq.is_closed() {
+                    return Err(IpcError::EndpointNotFound);
+                }
+
+                // 等待唤醒
+                let waited = wq.wait();
+
+                // X-6: wait() 返回 false 表示队列已关闭或无当前进程
+                if !waited {
+                    if wq.is_closed() {
+                        return Err(IpcError::EndpointNotFound);
+                    }
+                    return Err(IpcError::NoCurrentProcess);
                 }
             }
         }
@@ -509,10 +567,24 @@ pub fn receive_message_with_retries(
 }
 
 /// 清理端点的等待队列（端点销毁时调用）
+///
+/// # X-6 安全增强
+///
+/// 使用 close() 方法而非仅 wake_all()，确保：
+/// 1. 设置 closed 标志，阻止新的等待者加入
+/// 2. 唤醒所有现有等待者
+/// 3. 等待者被唤醒后会检查 is_closed() 并返回错误
 fn cleanup_wait_queue(endpoint_id: EndpointId) {
-    let mut queues = ENDPOINT_WAIT_QUEUES.lock();
-    if let Some(wq) = queues.remove(&endpoint_id) {
-        // 唤醒所有等待者，让它们收到EndpointNotFound错误
-        wq.wake_all();
+    // X-6: 先取出 Arc，再释放锁后调用 close()
+    // 这避免了在持有锁时调用可能导致调度的操作
+    let wq = {
+        let mut queues = ENDPOINT_WAIT_QUEUES.lock();
+        queues.remove(&endpoint_id)
+    };
+
+    if let Some(wq) = wq {
+        // 关闭队列并唤醒所有等待者
+        // 被唤醒的进程会检查 is_closed() 并返回 EndpointNotFound
+        wq.close();
     }
 }

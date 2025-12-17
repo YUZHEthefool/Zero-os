@@ -16,7 +16,7 @@ use lazy_static::lazy_static;
 use x86_64::instructions::interrupts;
 
 // 导入arch模块的上下文切换功能
-use arch::switch_context;
+use arch::{switch_context, save_context, enter_usermode};
 use arch::{set_kernel_stack, default_kernel_stack_top};
 use arch::Context as ArchContext;
 
@@ -336,8 +336,9 @@ impl Scheduler {
                     // TODO: 实现完整的上下文切换路径后，在此处或调用方处理 CR3
                     // process::activate_memory_space(next_memory_space);
 
-                    // 更新当前进程
+                    // 更新当前进程 (both scheduler and kernel_core trackers)
                     Self::set_current(Some(next_pid));
+                    process::set_current_pid(Some(next_pid));
 
                     let mut stats = SCHEDULER_STATS.lock();
                     stats.total_switches += 1;
@@ -398,7 +399,9 @@ impl Scheduler {
     /// 2. 选择下一个进程
     /// 3. 保存旧进程上下文（在旧地址空间中）
     /// 4. 切换地址空间（CR3）
-    /// 5. 恢复新进程上下文并跳转
+    /// 5. 根据目标进程特权级选择切换方式：
+    ///    - Ring 0：使用 switch_context 直接切换
+    ///    - Ring 3：使用 save_context + enter_usermode (IRETQ)
     ///
     /// **警告**: 此函数可能不会返回（如果发生上下文切换）
     pub fn reschedule_now(force: bool) {
@@ -443,13 +446,19 @@ impl Scheduler {
                 }
             };
 
-            // 获取新进程的上下文指针和内核栈顶
-            let (new_ctx_ptr, next_kstack_top): (*const ArchContext, u64) = {
+            // 获取新进程的上下文指针、内核栈顶和 CS（用于判断 Ring 3）
+            let (new_ctx_ptr, next_kstack_top, next_cs): (*const ArchContext, u64, u64) = {
                 let guard = next_pcb.lock();
                 let ctx = &guard.context as *const _ as *const ArchContext;
                 let kstack_top = guard.kernel_stack_top.as_u64();
-                (ctx, kstack_top)
+                let cs = guard.context.cs;
+                (ctx, kstack_top, cs)
             };
+
+            // 判断下一个进程是否为用户态进程（Ring 3）
+            // CS 的低 2 位是 RPL（Request Privilege Level）
+            // RPL == 3 表示用户态（Ring 3）
+            let next_is_user = (next_cs & 0x3) == 0x3;
 
             // 执行上下文切换
             // switch_context 内部流程：
@@ -473,12 +482,32 @@ impl Scheduler {
             };
             unsafe { set_kernel_stack(effective_kstack_top); }
 
+            // Debug output for Ring 3 transition (minimal)
+            // Uncomment for debugging: println!("[SCHED] -> PID {} (Ring {})", next_pid, if next_is_user { 3 } else { 0 });
+
             process::activate_memory_space(next_space);
 
             // 执行上下文切换
-            // 对于旧进程，函数会在下次被调度时从这里"返回"
+            // 根据目标进程的特权级选择不同的切换方式：
+            //
+            // - Ring 0（内核进程）：使用 switch_context 直接切换寄存器和栈
+            // - Ring 3（用户进程）：需要使用 IRETQ 进行特权级切换
+            //
+            // 对于 Ring 3 进程，enter_usermode 永不返回（执行 IRETQ 跳转到用户态），
+            // 因此必须先用 save_context 保存当前内核上下文，以便下次被调度时恢复。
             unsafe {
-                switch_context(old_ctx_ptr, new_ctx_ptr);
+                if next_is_user {
+                    // 用户态进程：先保存当前上下文，再通过 IRETQ 进入用户态
+                    // enter_usermode 会验证 RIP/RSP 的规范性和用户空间边界，
+                    // 清理 RFLAGS 中的特权位（IOPL/NT/RF），强制使用用户段选择子
+                    save_context(old_ctx_ptr);
+                    enter_usermode(new_ctx_ptr);
+                    // 不会到达这里
+                } else {
+                    // 内核态进程：使用标准的 switch_context
+                    // 对于旧进程，函数会在下次被调度时从这里"返回"
+                    switch_context(old_ctx_ptr, new_ctx_ptr);
+                }
             }
         });
     }
@@ -501,5 +530,5 @@ pub fn init() {
     println!("Enhanced scheduler initialized");
     println!("  Ready queue capacity: unlimited");
     println!("  Scheduling algorithm: Priority-based with time slice");
-    println!("  Context switch: Enabled with CR3 switching");
+    println!("  Context switch: Enabled with CR3 switching + Ring 3 IRETQ support");
 }

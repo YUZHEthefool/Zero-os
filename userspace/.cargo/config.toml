@@ -1,0 +1,20 @@
+# User-space build configuration for Zero-OS
+# Target: x86_64 freestanding (no OS, no libc)
+
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# Use custom linker script for proper user-space addressing
+linker = "rust-lld"
+rustflags = [
+  # Static relocation model (non-PIE executable)
+  "-C", "relocation-model=static",
+  # Use custom linker script
+  "-C", "link-arg=-T",
+  "-C", "link-arg=userspace.ld",
+]
+
+[unstable]
+build-std = ["core"]
+build-std-features = ["compiler-builtins-mem"]

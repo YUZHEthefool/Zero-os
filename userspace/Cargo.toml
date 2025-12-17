@@ -1,0 +1,27 @@
+[package]
+name = "userspace"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Zero-OS user-space library with syscall wrappers"
+
+[lib]
+name = "userspace"
+path = "src/lib.rs"
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1

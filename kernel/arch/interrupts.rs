@@ -296,9 +296,17 @@ extern "x86-interrupt" fn bound_range_exceeded_handler(_stack_frame: InterruptSt
 }
 
 /// #UD - Invalid Opcode (无效操作码)
-extern "x86-interrupt" fn invalid_opcode_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
     clac_if_smap();
     INTERRUPT_STATS.invalid_opcode.fetch_add(1, Ordering::Relaxed);
+    // Debug output for Ring 3 issues
+    unsafe {
+        serial_write_str("\n[#UD] Invalid opcode at RIP=");
+        serial_write_hex(stack_frame.instruction_pointer.as_u64());
+        serial_write_str(" RSP=");
+        serial_write_hex(stack_frame.stack_pointer.as_u64());
+        serial_write_str("\n");
+    }
     panic!("Invalid or undefined opcode");
 }
 

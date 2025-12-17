@@ -635,7 +635,12 @@ fn sys_exit(exit_code: i32) -> SyscallResult {
 
         // 如果调度器选择了其他进程，这里不会返回
         // 如果没有其他进程，系统会回到这里（但进程已是 Zombie 状态）
-        Ok(0)
+        // 在这种情况下，我们必须阻止返回到用户空间
+        // 进入无限循环等待中断（其他进程可能会在定时器中断中被创建）
+        println!("[sys_exit] No other process to run, entering idle loop");
+        loop {
+            x86_64::instructions::hlt();
+        }
     } else {
         Err(SyscallError::ESRCH)
     }

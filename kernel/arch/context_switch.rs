@@ -129,14 +129,18 @@ impl Context {
     }
 
     /// 为用户态进程初始化上下文
+    ///
+    /// 设置正确的用户态段选择子：
+    /// - CS = 0x23 (user_code selector with RPL=3)
+    /// - SS = 0x1B (user_data selector with RPL=3)
     pub fn init_for_user_process(entry_point: u64, stack_top: u64) -> Self {
         let mut ctx = Self::new();
         ctx.rip = entry_point;
         ctx.rsp = stack_top;
         ctx.rbp = stack_top;
         ctx.rflags = 0x202;  // IF位使能
-        ctx.cs = 0x1B;       // 用户代码段 (GDT索引3, RPL=3)
-        ctx.ss = 0x23;       // 用户数据段 (GDT索引4, RPL=3)
+        ctx.cs = 0x23;       // 用户代码段 (GDT索引4, RPL=3): 0x20 | 3
+        ctx.ss = 0x1B;       // 用户数据段 (GDT索引3, RPL=3): 0x18 | 3
         ctx.fx = FxSaveArea::default(); // 使用默认的 FPU 状态
         ctx
     }
@@ -241,6 +245,14 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
 
 /// 保存当前上下文
 ///
+/// 保存当前 CPU 状态到指定的 Context 结构，包括：
+/// - 所有通用寄存器 (rax-r15)
+/// - 栈指针 (rsp) 和帧指针 (rbp)
+/// - 段寄存器 (cs, ss) - 用于判断当前执行模式
+/// - FPU/SIMD 状态
+///
+/// 注意：RIP 和 RFLAGS 不在此保存，它们由调用者或上下文切换机制处理。
+///
 /// # Safety
 ///
 /// 调用者必须确保ctx指向有效的Context结构，且 FPU 已初始化
@@ -264,6 +276,13 @@ pub unsafe fn save_context(ctx: *mut Context) {
         "mov [{ctx} + 0x68], r13",
         "mov [{ctx} + 0x70], r14",
         "mov [{ctx} + 0x78], r15",
+        // 保存 CS/SS 以便调度器判断当前执行模式
+        // 当用户进程在系统调用中被抢占时，CS=0x08（内核）
+        // 这使得调度器能正确使用 switch_context 而非 enter_usermode
+        "mov rax, cs",
+        "mov [{ctx} + 0x90], rax",
+        "mov rax, ss",
+        "mov [{ctx} + 0x98], rax",
         ctx = in(reg) ctx,
         fxoff = const FXSAVE_OFFSET,
         options(nostack)
@@ -321,3 +340,172 @@ pub fn init_fpu() {
         unsafe { Cr4::write(cr4) };
     }
 }
+
+// ============================================================================
+// 用户态入口
+// ============================================================================
+
+/// 用户态段选择子
+pub const USER_CODE_SELECTOR: u64 = 0x23;  // GDT index 4 with RPL=3
+pub const USER_DATA_SELECTOR: u64 = 0x1B;  // GDT index 3 with RPL=3
+
+/// RFLAGS 安全掩码常量
+const RFLAGS_IF: u64 = 1 << 9;             // 中断使能位
+const RFLAGS_IOPL: u64 = 0b11 << 12;       // I/O 特权级
+const RFLAGS_NT: u64 = 1 << 14;            // 嵌套任务标志
+const RFLAGS_RF: u64 = 1 << 16;            // 恢复标志
+
+/// 用户态 RFLAGS 安全掩码
+/// 清除 IOPL/NT/RF 等特权位，只保留用户可控位
+const RFLAGS_USER_MASK: u64 = !(RFLAGS_IOPL | RFLAGS_NT | RFLAGS_RF);
+
+/// 进入用户态（首次）
+///
+/// 使用 IRETQ 从内核态（Ring 0）切换到用户态（Ring 3）。
+/// 这是进程首次进入用户态的唯一方式，因为 SYSRET 只能用于从 SYSCALL 返回。
+///
+/// ## IRETQ 栈帧布局
+///
+/// IRETQ 期望栈上有以下数据（从低地址到高地址）：
+/// - RIP    (8 bytes) - 用户态入口点
+/// - CS     (8 bytes) - 用户代码段选择子
+/// - RFLAGS (8 bytes) - 用户态标志寄存器
+/// - RSP    (8 bytes) - 用户态栈指针
+/// - SS     (8 bytes) - 用户数据段选择子
+///
+/// ## 安全注意事项
+///
+/// 1. 此函数不会返回 - 它跳转到用户态代码
+/// 2. 在调用前必须设置好 TSS 的 RSP0 以便系统调用返回
+/// 3. 中断必须在 IRETQ 后由 RFLAGS.IF 控制
+/// 4. RIP/RSP 必须是规范地址且在用户空间（bit 47 == 0）
+/// 5. RFLAGS 中的特权位（IOPL/NT/RF）会被清除
+/// 6. 段选择子强制使用用户态值，忽略上下文中的值
+///
+/// # Arguments
+///
+/// * `ctx` - 包含用户态入口点和栈信息的上下文
+///
+/// # Safety
+///
+/// - ctx 必须指向有效的 Context 结构
+/// - ctx.rip 必须是有效的用户态代码地址（规范且 bit 47 == 0）
+/// - ctx.rsp 必须是有效的用户态栈地址（规范且 bit 47 == 0）
+/// - 调用前必须设置 TSS RSP0
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_usermode(ctx: *const Context) -> ! {
+    core::arch::naked_asm!(
+        // ========================================
+        // Y-6 安全修复：规范地址验证
+        // ========================================
+        // 验证 RIP 是规范地址且在用户空间 (bit 47 == 0)
+        "mov rax, [rdi + 0x80]",      // 加载用户 RIP
+        "mov rcx, rax",
+        "shl rcx, 16",
+        "sar rcx, 16",
+        "cmp rcx, rax",
+        "jne 3f",                      // 非规范地址，跳转到 UD2
+        "bt rax, 47",
+        "jc 3f",                       // 内核空间地址，跳转到 UD2
+
+        // 验证 RSP 是规范地址且在用户空间 (bit 47 == 0)
+        "mov rcx, [rdi + 0x38]",      // 加载用户 RSP
+        "mov rbx, rcx",
+        "shl rbx, 16",
+        "sar rbx, 16",
+        "cmp rbx, rcx",
+        "jne 3f",                      // 非规范地址，跳转到 UD2
+        "bt rcx, 47",
+        "jc 3f",                       // 内核空间地址，跳转到 UD2
+
+        // ========================================
+        // Y-6 安全修复：RFLAGS 清理
+        // ========================================
+        // 清除 IOPL/NT/RF 等特权位，确保 IF 置位
+        "mov rax, [rdi + 0x88]",      // 加载用户 RFLAGS
+        "and rax, {rflags_user_mask}", // 清除特权位
+        "or  rax, {rflags_if}",        // 确保中断使能
+        "mov r15, rax",                // 暂存到 r15
+
+        // 恢复 FPU/SIMD 状态
+        "fxrstor64 [rdi + {fxoff}]",
+
+        // 恢复通用寄存器（除了 RSP，它由 IRETQ 恢复）
+        "mov rax, [rdi + 0x00]",
+        "mov rbx, [rdi + 0x08]",
+        "mov rcx, [rdi + 0x10]",
+        "mov rdx, [rdi + 0x18]",
+        "mov rsi, [rdi + 0x20]",
+        // rdi 最后恢复
+        "mov rbp, [rdi + 0x30]",
+        "mov r8,  [rdi + 0x40]",
+        "mov r9,  [rdi + 0x48]",
+        "mov r10, [rdi + 0x50]",
+        "mov r11, [rdi + 0x58]",
+        "mov r12, [rdi + 0x60]",
+        "mov r13, [rdi + 0x68]",
+        "mov r14, [rdi + 0x70]",
+        // r15 稍后恢复（当前保存着清理后的 RFLAGS）
+
+        // ========================================
+        // 构建 IRETQ 栈帧
+        // ========================================
+        // 注意：IRETQ 期望从低地址到高地址依次为 RIP, CS, RFLAGS, RSP, SS
+        // 我们需要先 push SS，最后 push RIP
+        // Y-6 安全修复：强制使用用户态段选择子，不信任上下文值
+
+        // SS (强制用户数据段)
+        "push {user_ss}",
+        // RSP (用户栈)
+        "push qword ptr [rdi + 0x38]",
+        // RFLAGS (已清理，从 r15 获取)
+        "push r15",
+        // CS (强制用户代码段)
+        "push {user_cs}",
+        // RIP (入口点)
+        "push qword ptr [rdi + 0x80]",
+
+        // 恢复 r15（原上下文值）
+        "mov r15, [rdi + 0x78]",
+
+        // 最后恢复 rdi
+        "mov rdi, [rdi + 0x28]",
+
+        // 执行 IRETQ 进入用户态
+        "iretq",
+
+        // ========================================
+        // 非法地址回退：触发 #UD
+        // ========================================
+        // 如果 RIP 或 RSP 是非规范地址或内核地址，
+        // 则触发未定义指令异常，防止非法的用户态转换
+        "3:",
+        "ud2",
+
+        fxoff = const FXSAVE_OFFSET,
+        rflags_if = const RFLAGS_IF,
+        rflags_user_mask = const RFLAGS_USER_MASK,
+        user_cs = const USER_CODE_SELECTOR,
+        user_ss = const USER_DATA_SELECTOR,
+    );
+}
+
+/// 使用指定的入口点和栈进入用户态
+///
+/// 这是一个更简便的接口，直接指定入口点和栈地址。
+///
+/// # Arguments
+///
+/// * `entry_point` - 用户态代码入口地址
+/// * `user_stack` - 用户态栈顶地址
+///
+/// # Safety
+///
+/// - entry_point 必须是有效的用户态代码地址
+/// - user_stack 必须是有效的用户态栈地址（向下增长）
+/// - 调用前必须设置 TSS RSP0
+pub unsafe fn jump_to_usermode(entry_point: u64, user_stack: u64) -> ! {
+    let ctx = Context::init_for_user_process(entry_point, user_stack);
+    enter_usermode(&ctx)
+}
+

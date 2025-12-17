@@ -17,10 +17,17 @@ use x86_64::instructions::interrupts;
 ///
 /// 用于进程阻塞和唤醒。当资源不可用时，进程加入等待队列；
 /// 当资源可用时，唤醒等待队列中的进程。
+///
+/// # X-6 安全增强
+///
+/// 添加 `closed` 标志防止在端点销毁后新的等待者加入，
+/// 避免永久阻塞和资源泄漏。
 #[derive(Debug)]
 pub struct WaitQueue {
     /// 等待的进程ID列表
     waiters: Mutex<VecDeque<ProcessId>>,
+    /// 当为 true 时不再接受新的等待者（用于端点销毁时取消阻塞）
+    closed: AtomicBool,
 }
 
 impl WaitQueue {
@@ -28,20 +35,38 @@ impl WaitQueue {
     pub const fn new() -> Self {
         WaitQueue {
             waiters: Mutex::new(VecDeque::new()),
+            closed: AtomicBool::new(false),
         }
     }
 
     /// 将当前进程加入等待队列并阻塞
     ///
-    /// 返回true表示成功阻塞后被唤醒，false表示无当前进程
+    /// 返回true表示成功阻塞后被唤醒，false表示无当前进程或队列已关闭
+    ///
+    /// # X-6 安全增强
+    ///
+    /// 如果队列已关闭（如端点被销毁），立即返回 false 而不阻塞，
+    /// 防止进程在已销毁的端点上永久阻塞。
     pub fn wait(&self) -> bool {
         let pid = match process::current_pid() {
             Some(p) => p,
             None => return false,
         };
 
+        // X-6: 快速检查 - 如果已关闭则不阻塞
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let mut enqueued = false;
+
         // 在关中断状态下操作，防止竞态条件
         interrupts::without_interrupts(|| {
+            // X-6: 二次检查 - 在临界区内再次确认未关闭
+            if self.closed.load(Ordering::Relaxed) {
+                return;
+            }
+
             // 将当前进程加入等待队列
             self.waiters.lock().push_back(pid);
 
@@ -50,7 +75,14 @@ impl WaitQueue {
                 let mut proc = proc_arc.lock();
                 proc.state = ProcessState::Blocked;
             }
+
+            enqueued = true;
         });
+
+        // X-6: 如果未能入队（队列已关闭），直接返回
+        if !enqueued {
+            return false;
+        }
 
         // 触发调度，让出CPU
         kernel_core::force_reschedule();
@@ -144,6 +176,24 @@ impl WaitQueue {
     /// 获取等待队列中的进程数量
     pub fn len(&self) -> usize {
         self.waiters.lock().len()
+    }
+
+    /// 检查队列是否已关闭（例如端点被销毁）
+    ///
+    /// # X-6 安全增强
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// 关闭队列并唤醒所有等待者
+    ///
+    /// 用于端点销毁时，确保所有等待者被唤醒并得到错误返回。
+    /// 关闭后的队列不再接受新的等待者。
+    ///
+    /// # X-6 安全增强
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.wake_all();
     }
 }
 

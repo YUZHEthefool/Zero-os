@@ -3,6 +3,10 @@ members = [
     "bootloader",
     "kernel",
 ]
+# Userspace is excluded because it uses a different target (x86_64-unknown-none)
+exclude = [
+    "userspace",
+]
 resolver = "2"
 
 [profile.release]

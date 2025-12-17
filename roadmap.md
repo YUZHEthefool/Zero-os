@@ -6,7 +6,7 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ---
 
-## Current Status: Phase 3 Complete, Ready for Phase 4
+## Current Status: Phase 6.1 Complete, Ready for Phase 6.2
 
 ### Completed Features
 
@@ -35,6 +35,8 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 - **GDT/TSS for user-kernel transitions**
 - **IST for double fault safety**
 - **Security Audit subsystem (hash-chained events)**
+- **SYSCALL/SYSRET MSR configuration (Ring 3 transition)**
+- **IRETQ-based user mode entry**
 
 ### Fixed Issues (2025-12-10 Seventh Audit)
 
@@ -393,14 +395,17 @@ Zero-OS is evolving toward a **hybrid kernel architecture** inspired by Linux, c
 
 ## Phase 6: User Space
 
-**Priority: Lower**
+**Priority: Medium**
 **Target: First User Program**
+**Status: In Progress (6.1 Core Infrastructure Complete)**
 
-### 6.1 User Mode Support
+### 6.1 User Mode Support (COMPLETED ✓)
 
-- [ ] TSS setup
-- [ ] Ring 3 transition
-- [ ] System call entry/exit
+- [x] TSS setup ✓ (GDT with TSS RSP0 for syscall return)
+- [x] Ring 3 transition ✓ (IRETQ-based enter_usermode)
+- [x] System call entry/exit ✓ (SYSCALL/SYSRET with proper stack switching)
+- [x] SYSCALL MSR configuration ✓ (STAR, LSTAR, SFMASK, EFER.SCE)
+- [x] User/kernel segment selectors ✓ (CS=0x23, SS=0x1B)
 
 ### 6.2 User Libraries
 
@@ -518,20 +523,21 @@ All critical issues have been resolved:
 | 2025-12-16 | Claude + Codex (17th) | 4 new | 2 (W-1: W^X, W-2: readdir), 2 deferred (W-3, W-4: SMP) |
 | 2025-12-16 | Claude + Codex (18th) | 2 new | 2 (W^X-1, W^X-2: boot-time W^X enforcement) |
 | 2025-12-16 | Claude + Codex (19th) | 0 new | Audit subsystem implemented (hash-chained events) |
-| 2025-12-17 | Claude + Codex (20th) | 8 new | 3 fixed (X-2: DoS, X-4: mount perms, X-7: TLB), 5 deferred |
+| 2025-12-17 | Claude + Codex (20th) | 8 new | 4 fixed (X-2: DoS, X-4: mount perms, X-6: IPC, X-7: TLB), 4 deferred |
+| 2025-12-17 | Claude + Codex (21st) | 10 new | 4 fixed (Y-1: SFMASK, Y-2: SYSRET, Y-3: DR6/DR7, Y-6: enter_usermode), 6 open |
 
 ### Current Status
 
-- Total issues tracked: 89
-- Fixed: 73 (82%)
-- Open: 16 (18%)
+- Total issues tracked: 99
+- Fixed: 78 (79%)
+- Open: 21 (21%)
   - 1 Low (L-1: ENOSYS stubs)
-  - 12 Deferred (A-3, H-25, H-26, H-33, H-34, M-18, W-3, W-4, X-1, X-5 - mostly SMP/crypto)
-  - 3 NEW (X-3, X-6, X-8 - short-term fixes pending)
+  - 13 Deferred (A-3, H-25, H-26, H-33, H-34, M-18, W-3, W-4, X-1, X-5, Y-7 - mostly SMP)
+  - 6 NEW (X-3, X-8, Y-4, Y-5, Y-8, Y-9, Y-10 - short-term fixes pending)
   - A-1 partially resolved (cooperative scheduling)
   - A-2 fully resolved (address space isolation)
 
-See [qa-2025-12-10.md](qa-2025-12-10.md), [qa-2025-12-10-v2.md](qa-2025-12-10-v2.md), [qa-2025-12-11.md](qa-2025-12-11.md), [qa-2025-12-15-v2.md](qa-2025-12-15-v2.md), [qa-2025-12-16.md](qa-2025-12-16.md), and [qa-2025-12-17.md](qa-2025-12-17.md) for detailed audit reports.
+See [qa-2025-12-10.md](qa-2025-12-10.md), [qa-2025-12-10-v2.md](qa-2025-12-10-v2.md), [qa-2025-12-11.md](qa-2025-12-11.md), [qa-2025-12-15-v2.md](qa-2025-12-15-v2.md), [qa-2025-12-16.md](qa-2025-12-16.md), [qa-2025-12-17.md](qa-2025-12-17.md), and [qa-2025-12-17-v2.md](qa-2025-12-17-v2.md) for detailed audit reports.
 
 ---
 
@@ -554,7 +560,9 @@ See [qa-2025-12-10.md](qa-2025-12-10.md), [qa-2025-12-10-v2.md](qa-2025-12-10-v2
 | 0.4.1 | 2025-12-16 | Security hardening - W^X enforcement, readdir perms |
 | 0.4.2 | 2025-12-16 | Boot-time W^X validation - 0 violations achieved |
 | 0.4.3 | 2025-12-16 | Security Audit subsystem - hash-chained syscall logging |
-| 0.4.4 | 2025-12-17 | Security fixes - DoS (X-2), mount perms (X-4), TLB flush (X-7) |
+| 0.4.4 | 2025-12-17 | Security fixes - DoS (X-2), mount perms (X-4), IPC cleanup (X-6), TLB flush (X-7) |
+| 0.5.0 | 2025-12-17 | Phase 6 foundation - SYSCALL/SYSRET, Ring 3 transition, enter_usermode |
+| 0.5.1 | 2025-12-17 | Ring 3 security hardening - SYSRET canonical checks, SFMASK, DR clearing, RFLAGS sanitization |
 | 1.0.0 | TBD | First stable release |
 
 ---

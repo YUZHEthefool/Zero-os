@@ -22,8 +22,12 @@ use xmas_elf::{
     ElfFile,
 };
 
-/// 用户地址空间起始（4MB，为内核预留低地址）
-pub const USER_BASE: usize = 0x0000_0000_0040_0000;
+/// 用户地址空间起始（4MB）
+///
+/// 用户程序加载在 4MB 处，这是经典的 Linux 用户空间起始地址。
+/// 注意：bootloader 建立的恒等映射使用 2MB 大页，在映射用户空间前
+/// 需要将冲突的大页拆分为 4KB 页（通过 ensure_pte_level）。
+pub const USER_BASE: usize = 0x0040_0000;
 
 /// 用户栈顶地址（用户空间顶部 - 8KB 守护页）
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_E000;
@@ -195,6 +199,14 @@ fn load_segment(elf: &ElfFile, ph: &xmas_elf::program::ProgramHeader) -> Result<
     let mut frame_alloc = FrameAllocator::new();
     let mut mapped: Vec<(Page<Size4KiB>, PhysFrame<Size4KiB>)> = Vec::new();
 
+    println!("  load_segment: vaddr=0x{:x}, memsz={}, filesz={}, pages={}",
+             vaddr, memsz, filesz, page_count);
+    println!("    flags: R={} W={} X={} => PTFlags: 0x{:x}",
+             true, ph.flags().is_write(), ph.flags().is_execute(), flags.bits());
+
+    // 注意：用户地址空间的 4MB-6MB 区域已准备好 4KB 页表
+    // ELF 加载器直接创建新的 4KB 页映射
+
     unsafe {
         page_table::with_current_manager(VirtAddr::new(0), |mgr| -> Result<(), ElfLoadError> {
             for i in 0..page_count {
@@ -205,7 +217,8 @@ fn load_segment(elf: &ElfFile, ph: &xmas_elf::program::ProgramHeader) -> Result<
                     .allocate_frame()
                     .ok_or(ElfLoadError::OutOfMemory)?;
 
-                if let Err(_) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
+                if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
+                    println!("ELF loader: map_page FAILED for va=0x{:x}: {:?}", va.as_u64(), e);
                     // 【关键修复】回滚已映射的页，避免泄漏物理帧或留下半成品映射
                     frame_alloc.deallocate_frame(frame);
                     for (cleanup_page, cleanup_frame) in mapped.drain(..) {
