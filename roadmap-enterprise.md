@@ -19,27 +19,28 @@ Zero-OS aims to be an enterprise-grade server kernel with:
 - **Secure IPC**: Capability-based access control for all kernel objects
 - **Compliance Ready**: Comprehensive audit logging with tamper evidence
 
-### Current Status (as of 2025-12-11)
+### Current Status (as of 2025-12-16)
 
 | Component | Status | Security Level |
 |-----------|--------|----------------|
-| Boot & Memory | Complete | Hardened (COW, guard pages) |
+| Boot & Memory | Complete | Hardened (COW, guard pages, W^X) |
 | Process Management | Complete | Isolated (per-process address space) |
 | Scheduler | Complete | Safe (IRQ-safe, MLFQ) |
 | IPC (Pipe/MQ/Futex) | Complete | Basic capabilities |
 | Signals | Complete | Basic |
-| VFS | Not started | - |
+| VFS | Complete | DAC permissions (owner/group/other/umask) |
+| Audit | Complete | Hash-chained syscall logging |
 | User Mode (Ring 3) | Not started | - |
 | Network | Not started | - |
 | SMP | Not started | - |
-| Security Framework | Not started | - |
+| Security Framework | In progress | Audit only (no MAC/LSM/Capabilities) |
 
 ### Issue Resolution Summary
 
-- **Total Audits**: 13 rounds
-- **Issues Identified**: 70
-- **Issues Fixed**: 62 (89%)
-- **Open Issues**: 8 (deferred to future phases)
+- **Total Audits**: 19 rounds
+- **Issues Identified**: 79
+- **Issues Fixed**: 68 (86%)
+- **Open Issues**: 11 (deferred to future phases)
 
 ---
 
@@ -209,8 +210,8 @@ The following enterprise-critical components are missing from current implementa
 
 #### 0.1 Memory Hardening
 
-- [ ] Enable W^X (no writable+executable pages)
-- [ ] Remove writable identity map after boot
+- [x] Enable W^X (no writable+executable pages) ✓ (W-1, W^X-1, W^X-2, 2025-12-16)
+- [x] Remove writable identity map after boot ✓ (L-5, 2025-12-16 - RemoveWritable strategy)
 - [ ] Stack canaries for kernel functions
 - [ ] KASLR (Kernel Address Space Layout Randomization)
 - [ ] Slab allocator with red zones and quarantine
@@ -812,10 +813,10 @@ fn tlb_shootdown(range: VirtRange, asid: Option<Asid>) {
 
 ### Immediate (Next Sprint)
 
-1. W^X enforcement
-2. Remove writable identity map
-3. Syscall fuzzer setup
-4. Audit event infrastructure
+1. ~~W^X enforcement~~ ✓ (W-1, W^X-1, W^X-2, 2025-12-16)
+2. ~~Remove writable identity map~~ ✓ (L-5, 2025-12-16)
+3. ~~Audit event infrastructure~~ ✓ (2025-12-16, hash-chained syscall audit)
+4. Syscall fuzzer setup
 
 ### Short Term (1-2 Months)
 
@@ -860,12 +861,12 @@ fn tlb_shootdown(range: VirtRange, asid: Option<Asid>) {
 
 | Metric | Value |
 |--------|-------|
-| Total Rust LOC | ~10,000 |
-| Kernel modules | 7 (arch, mm, sched, ipc, drivers, kernel_core, bootloader) |
+| Total Rust LOC | ~12,000 |
+| Kernel modules | 9 (arch, mm, sched, ipc, vfs, cpu_local, security, drivers, kernel_core, bootloader) |
 | Syscalls defined | 50+ |
-| Syscalls implemented | ~20 |
-| Security audits | 13 |
-| Issues fixed | 62/70 (89%) |
+| Syscalls implemented | ~30 |
+| Security audits | 17 |
+| Issues fixed | 68/79 (86%) |
 
 ## Appendix B: Existing Security Features Detail
 
@@ -875,12 +876,22 @@ fn tlb_shootdown(range: VirtRange, asid: Option<Asid>) {
 - Page zeroing on allocation
 - Guard pages for kernel stacks
 - mmap rollback on failure
+- **W^X enforcement in ELF loader (W-1, 2025-12-16)**
 
 ### Process Isolation
 - Per-process page tables
 - CR3 switching on context switch
 - Per-process kernel stacks
 - Resource cleanup on exit
+
+### VFS Security (2025-12-15/16)
+
+- POSIX DAC permissions (owner/group/other)
+- Supplementary groups support
+- umask enforcement
+- Sticky bit semantics
+- Path traversal permission checks
+- readdir permission enforcement (W-2)
 
 ### IPC Security
 - Capability-based endpoint access

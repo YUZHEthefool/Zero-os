@@ -512,6 +512,12 @@ pub unsafe fn ensure_pte_level(
     // Demote 2MB huge page to 4KB pages if needed
     if pde.flags().contains(PageTableFlags::HUGE_PAGE) {
         split_2m_entry(pde, frame_allocator)?;
+        // X-7 安全修复：拆分 2MB huge page 后必须刷新 TLB
+        //
+        // CPU 可能缓存了原始 2MB 映射（通常带有 RWX 权限），如果不刷新，
+        // 后续对 4KB 页的权限修改（如 W^X 强制执行）将被绕过，直到 TLB
+        // 条目自然过期。这可能导致可写+可执行的窗口期。
+        x86_64::instructions::tlb::flush(page.start_address());
     } else if pde.is_unused() {
         // Allocate new PT
         let pt_frame = frame_allocator

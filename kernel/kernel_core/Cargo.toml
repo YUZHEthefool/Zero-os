@@ -14,3 +14,4 @@ x86_64 = "0.15"
 mm = { path = "../mm" }
 xmas-elf = "0.9"
 cpu_local = { path = "../cpu_local" }
+audit = { path = "../audit" }

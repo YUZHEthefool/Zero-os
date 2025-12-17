@@ -22,7 +22,7 @@
 //! - PD (Page Directory) - 2 MB regions (can be huge pages)
 //! - PT (Page Table) - 4 KB pages
 
-use mm::page_table;
+use mm::page_table::{self, RECURSIVE_INDEX};
 use x86_64::{
     registers::control::Cr3,
     structures::paging::{PageTable, PageTableFlags},
@@ -113,6 +113,16 @@ pub fn validate_active(phys_offset: VirtAddr) -> Result<ValidationSummary, Wxorx
 
     // Walk all PML4 entries
     for (pml4_idx, pml4_entry) in pml4.iter().enumerate() {
+        // 【W^X 修复】跳过递归页表槽 (PML4[510])
+        //
+        // 递归映射允许通过特殊虚拟地址访问任意页表帧。当验证器遍历递归槽时，
+        // 会将中间页表条目（PML4/PDPT/PD）误认为是叶子 PTE，从而报告假阳性。
+        // 这些条目本身是 writable + !NO_EXECUTE，但它们不是实际的内存映射。
+        // NX 位只在叶子页表条目上强制执行。
+        if pml4_idx == RECURSIVE_INDEX {
+            continue;
+        }
+
         if pml4_entry.is_unused() {
             continue;
         }

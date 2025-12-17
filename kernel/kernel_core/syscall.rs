@@ -1,6 +1,11 @@
 //! 系统调用接口
 //!
 //! 实现类POSIX系统调用，提供用户程序与内核交互的接口
+//!
+//! # Audit Integration
+//!
+//! All syscalls are audited with entry and exit events for security monitoring.
+//! Events include: syscall number, arguments, result, and process context.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -12,6 +17,9 @@ use crate::usercopy::UserAccessGuard;
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
+// Audit integration for syscall security monitoring
+use audit::{AuditKind, AuditOutcome, AuditSubject, AuditObject};
+
 /// 最大参数数量（防止恶意用户传递过多参数）
 const MAX_ARG_COUNT: usize = 256;
 
@@ -20,6 +28,17 @@ const MAX_ARG_TOTAL: usize = 128 * 1024;
 
 /// 单个参数最大长度
 const MAX_ARG_STRLEN: usize = 4096;
+
+/// 最大单次读写长度（X-2 安全修复：防止内核堆耗尽 DoS）
+///
+/// 用户可请求任意大小的 count，如果不限制会导致：
+/// - 内核尝试分配 GB 级别的 Vec
+/// - OOM panic 或堆耗尽
+/// - 任意用户进程可 DoS 整个系统
+///
+/// Linux 通常允许单次最大 2GB，但考虑到 Zero-OS 是微内核，
+/// 1MB 上限足够大多数场景，同时保护内核免受资源耗尽攻击。
+const MAX_RW_SIZE: usize = 1 * 1024 * 1024;
 
 /// 系统调用号定义（参考Linux系统调用表）
 #[repr(u64)]
@@ -495,9 +514,34 @@ pub fn init() {
     println!("  Supported syscalls: exit, fork, getpid, read, write, yield");
 }
 
+/// Get audit subject from current process context
+///
+/// Returns AuditSubject with pid, uid, gid from current process credentials.
+/// Falls back to kernel subject (pid 0) if no current process.
+#[inline]
+fn get_audit_subject() -> AuditSubject {
+    if let Some(pid) = current_pid() {
+        if let Some(creds) = crate::process::current_credentials() {
+            AuditSubject::new(pid as u32, creds.euid, creds.egid, None)
+        } else {
+            // Process exists but credentials unavailable
+            AuditSubject::new(pid as u32, 0, 0, None)
+        }
+    } else {
+        AuditSubject::kernel()
+    }
+}
+
 /// 系统调用分发器
 ///
 /// 根据系统调用号和参数执行相应的系统调用
+///
+/// # Audit Trail
+///
+/// All syscalls emit an audit event after completion with:
+/// - Syscall number and up to 6 arguments
+/// - Success/Error outcome
+/// - Process context (pid, uid, gid)
 ///
 /// 在返回前检查 NEED_RESCHED 标志，如果需要则执行调度。
 /// 这是 NEED_RESCHED 的主要消费点，确保时间片到期后能在返回用户态前触发调度。
@@ -510,6 +554,9 @@ pub fn syscall_dispatcher(
     arg4: u64,
     arg5: u64,
 ) -> i64 {
+    // Capture timestamp at syscall entry
+    let timestamp = crate::time::get_ticks();
+
     let result = match syscall_num {
         // 进程管理
         60 => sys_exit(arg0 as i32),
@@ -542,6 +589,25 @@ pub fn syscall_dispatcher(
 
         _ => Err(SyscallError::ENOSYS),
     };
+
+    // Emit audit event for syscall completion
+    // Note: This is after the syscall so we capture the outcome
+    let (outcome, errno) = match &result {
+        Ok(_) => (AuditOutcome::Success, 0),
+        Err(e) => (AuditOutcome::Error, e.as_i64() as i32),
+    };
+
+    // Emit audit event (ignore errors - audit should never block syscalls)
+    // Include all 6 arguments for syscalls like mmap that use all of them
+    let _ = audit::emit(
+        AuditKind::Syscall,
+        outcome,
+        get_audit_subject(),
+        AuditObject::None,
+        &[syscall_num, arg0, arg1, arg2, arg3, arg4, arg5],
+        errno,
+        timestamp,
+    );
 
     // 在返回用户态前检查是否需要调度
     // 这是定时器中断设置的 NEED_RESCHED 标志的主要消费点
@@ -1123,10 +1189,21 @@ fn sys_pipe(fds: *mut i32) -> SyscallResult {
 }
 
 /// sys_read - 从文件描述符读取数据
+///
+/// # Security (X-2 fix)
+///
+/// 限制单次读取大小为 MAX_RW_SIZE (1MB)，防止用户请求超大 count
+/// 导致内核堆耗尽。在分配缓冲区前先验证用户指针有效性。
 fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
-    if count == 0 {
-        return Ok(0);
-    }
+    // X-2 安全修复：限制大小并提前验证
+    let count = match count {
+        0 => return Ok(0),
+        c if c > MAX_RW_SIZE => return Err(SyscallError::E2BIG),
+        c => c,
+    };
+
+    // 预先验证用户缓冲区，避免在分配后发现指针无效
+    validate_user_ptr_mut(buf, count)?;
 
     // stdin (fd 0): 简化实现，返回零填充数据
     if fd == 0 {
@@ -1156,10 +1233,21 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
 }
 
 /// sys_write - 向文件描述符写入数据
+///
+/// # Security (X-2 fix)
+///
+/// 限制单次写入大小为 MAX_RW_SIZE (1MB)，防止用户请求超大 count
+/// 导致内核堆耗尽。在分配缓冲区前先验证用户指针有效性。
 fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
-    if count == 0 {
-        return Ok(0);
-    }
+    // X-2 安全修复：限制大小并提前验证
+    let count = match count {
+        0 => return Ok(0),
+        c if c > MAX_RW_SIZE => return Err(SyscallError::E2BIG),
+        c => c,
+    };
+
+    // 预先验证用户缓冲区，避免在分配后发现指针无效
+    validate_user_ptr(buf, count)?;
 
     // 先复制到内核缓冲区，避免直接解引用用户指针
     let mut tmp = vec![0u8; count];

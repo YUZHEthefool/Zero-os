@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2025-12-11
+**Last Updated:** 2025-12-17
 
 This document outlines the development roadmap for Zero-OS, a microkernel operating system written in Rust for x86_64 architecture.
 
@@ -34,6 +34,7 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 - **UEFI memory map integration (BootInfo)**
 - **GDT/TSS for user-kernel transitions**
 - **IST for double fault safety**
+- **Security Audit subsystem (hash-chained events)**
 
 ### Fixed Issues (2025-12-10 Seventh Audit)
 
@@ -120,7 +121,7 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 - [x] H-16: Missing TSS setup for user-kernel transition ✓ FIXED
 - [x] M-8: No kernel stack guard pages ✓ FIXED
 - [x] M-9: FPU/SIMD context not saved ✓ FIXED
-- [ ] L-5: Identity map left writable after boot
+- [x] L-5: Identity map left writable after boot ✓ FIXED (Round 18 - security hardening)
 
 ### Architectural Limitations (Partially Resolved - Dec 11)
 
@@ -356,27 +357,37 @@ Zero-OS is evolving toward a **hybrid kernel architecture** inspired by Linux, c
 
 ---
 
-## Phase 5: File System Foundation
+## Phase 5: File System Foundation (COMPLETED ✓)
 
 **Priority: Medium**
 **Target: Basic I/O Operations**
+**Status: COMPLETE ✓**
 
 ### 5.1 Virtual File System (VFS)
 
-- [ ] VFS layer design
-- [ ] Inode abstraction
-- [ ] File descriptor table
+- [x] VFS layer design ✓
+- [x] Inode abstraction ✓
+- [x] File descriptor table ✓
 
 ### 5.2 Initial File Systems
 
-- [ ] RAM Disk (initrd)
-- [ ] Device files (/dev/null, /dev/zero, /dev/console)
+- [x] RAM Disk (ramfs) ✓
+- [x] Device files (/dev/null, /dev/zero, /dev/console) ✓
 
 ### 5.3 System Calls
 
-- [ ] open/close implementation
-- [ ] read/write for files
-- [ ] lseek support
+- [x] open/close implementation ✓
+- [x] read/write for files ✓
+- [x] lseek support ✓
+
+### 5.4 Security Features (2025-12-15/16)
+
+- [x] POSIX DAC permissions (owner/group/other) ✓
+- [x] Supplementary groups support ✓
+- [x] umask enforcement ✓
+- [x] Sticky bit semantics ✓
+- [x] Path traversal permission checks ✓
+- [x] readdir permission enforcement (W-2) ✓
 
 ---
 
@@ -503,18 +514,24 @@ All critical issues have been resolved:
 | 2025-12-11 | Claude + Codex (11th) | 3 new | 3 (C-21, H-27, H-28 - sys_pipe/FD) |
 | 2025-12-11 | Claude + Codex (12th) | 3 new | 3 (H-29, H-30, M-17 - futex) |
 | 2025-12-11 | Claude + Codex (13th) | 5 new | 2 (H-31, H-32 - signal), 3 deferred (H-33, H-34, M-18) |
+| 2025-12-15 | Claude + Codex (16th) | 5 new | 4 (V-1, V-2, V-3, V-4 - VFS perms, SMP SMAP) |
+| 2025-12-16 | Claude + Codex (17th) | 4 new | 2 (W-1: W^X, W-2: readdir), 2 deferred (W-3, W-4: SMP) |
+| 2025-12-16 | Claude + Codex (18th) | 2 new | 2 (W^X-1, W^X-2: boot-time W^X enforcement) |
+| 2025-12-16 | Claude + Codex (19th) | 0 new | Audit subsystem implemented (hash-chained events) |
+| 2025-12-17 | Claude + Codex (20th) | 8 new | 3 fixed (X-2: DoS, X-4: mount perms, X-7: TLB), 5 deferred |
 
 ### Current Status
 
-- Total issues tracked: 70
-- Fixed: 62 (89%)
-- Open: 8 (11%)
-  - 2 Low (L-1: ENOSYS stubs, L-5: identity map)
-  - 6 Deferred (A-3: user mode, H-25: SMP, H-26: TOCTOU, H-33: kill perms, H-34: stop semantics, M-18: SIGCONT resched)
+- Total issues tracked: 89
+- Fixed: 73 (82%)
+- Open: 16 (18%)
+  - 1 Low (L-1: ENOSYS stubs)
+  - 12 Deferred (A-3, H-25, H-26, H-33, H-34, M-18, W-3, W-4, X-1, X-5 - mostly SMP/crypto)
+  - 3 NEW (X-3, X-6, X-8 - short-term fixes pending)
   - A-1 partially resolved (cooperative scheduling)
   - A-2 fully resolved (address space isolation)
 
-See [qa-2025-12-10.md](qa-2025-12-10.md), [qa-2025-12-10-v2.md](qa-2025-12-10-v2.md), and [qa-2025-12-11.md](qa-2025-12-11.md) for detailed audit reports.
+See [qa-2025-12-10.md](qa-2025-12-10.md), [qa-2025-12-10-v2.md](qa-2025-12-10-v2.md), [qa-2025-12-11.md](qa-2025-12-11.md), [qa-2025-12-15-v2.md](qa-2025-12-15-v2.md), [qa-2025-12-16.md](qa-2025-12-16.md), and [qa-2025-12-17.md](qa-2025-12-17.md) for detailed audit reports.
 
 ---
 
@@ -533,6 +550,11 @@ See [qa-2025-12-10.md](qa-2025-12-10.md), [qa-2025-12-10-v2.md](qa-2025-12-10-v2
 | 0.2.0 | 2025-12-10 | Phase 2 - Process isolation (COMPLETE) |
 | 0.3.0 | 2025-12-11 | Phase 3 - Multi-process support (COMPLETE) |
 | 0.3.1 | 2025-12-11 | Phase 4 IPC - Pipes, Futex, Signal handling |
+| 0.4.0 | 2025-12-15 | Phase 5 VFS - ramfs, devfs, DAC permissions |
+| 0.4.1 | 2025-12-16 | Security hardening - W^X enforcement, readdir perms |
+| 0.4.2 | 2025-12-16 | Boot-time W^X validation - 0 violations achieved |
+| 0.4.3 | 2025-12-16 | Security Audit subsystem - hash-chained syscall logging |
+| 0.4.4 | 2025-12-17 | Security fixes - DoS (X-2), mount perms (X-4), TLB flush (X-7) |
 | 1.0.0 | TBD | First stable release |
 
 ---

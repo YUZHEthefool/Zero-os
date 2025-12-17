@@ -1,0 +1,21 @@
+[package]
+name = "audit"
+version = "0.1.0"
+edition = "2021"
+description = "Security audit subsystem for Zero-OS kernel"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+spin = "0.9"
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
+x86_64 = "0.15"
+drivers = { path = "../drivers" }
+
+[features]
+default = []
+# Enable detailed audit logging (more verbose)
+verbose = []
+# Disable audit entirely (compile out all code)
+disabled = []

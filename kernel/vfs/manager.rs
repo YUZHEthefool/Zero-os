@@ -176,7 +176,24 @@ impl Vfs {
     }
 
     /// Mount a filesystem at the given path
+    ///
+    /// # Security (X-4 fix)
+    ///
+    /// Mount 操作仅限 root 用户（euid == 0）或内核初始化路径。
+    /// 未授权的 mount 可能导致：
+    /// - 攻击者注入恶意文件系统
+    /// - setuid 二进制文件劫持
+    /// - 数据泄露或完整性破坏
     pub fn mount(&self, path: &str, fs: Arc<dyn FileSystem>) -> Result<(), FsError> {
+        // X-4 安全修复：只有 root 可以执行 mount
+        // current_euid() 返回 None 表示内核初始化阶段（允许）
+        // 返回 Some(uid) 时需要检查是否为 root
+        if let Some(euid) = current_euid() {
+            if euid != 0 {
+                return Err(FsError::PermDenied);
+            }
+        }
+
         let path = normalize_path(path);
 
         let mut mounts = self.mounts.write();
@@ -189,7 +206,19 @@ impl Vfs {
     }
 
     /// Unmount filesystem at path
+    ///
+    /// # Security (X-4 fix)
+    ///
+    /// Umount 操作仅限 root 用户（euid == 0）。
+    /// 未授权的 umount 可能导致 DoS（卸载关键文件系统）。
     pub fn umount(&self, path: &str) -> Result<(), FsError> {
+        // X-4 安全修复：只有 root 可以执行 umount
+        if let Some(euid) = current_euid() {
+            if euid != 0 {
+                return Err(FsError::PermDenied);
+            }
+        }
+
         let path = normalize_path(path);
         let mut mounts = self.mounts.write();
 
@@ -323,6 +352,14 @@ impl Vfs {
 
         if !inode.is_dir() {
             return Err(FsError::NotDir);
+        }
+
+        // 【W-2 安全修复】读取目录需要 read + execute 权限
+        // 仅有 --x 权限的目录允许通过已知文件名访问，但不允许枚举内容
+        // 防止信息泄漏（如枚举 /home 下其他用户的目录名）
+        let dir_stat = inode.stat()?;
+        if !check_access_permission(&dir_stat, true, false, true) {
+            return Err(FsError::PermDenied);
         }
 
         let mut entries = Vec::new();

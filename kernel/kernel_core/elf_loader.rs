@@ -49,6 +49,8 @@ pub enum ElfLoadError {
     NotLittleEndian,
     /// 段地址超出允许范围
     SegmentOutOfRange,
+    /// 同时可写可执行的段被拒绝（W^X 安全策略）
+    WritableExecutableSegment,
     /// 段与栈区域重叠
     OverlapWithStack,
     /// 页映射失败
@@ -163,6 +165,15 @@ fn load_segment(elf: &ElfFile, ph: &xmas_elf::program::ProgramHeader) -> Result<
     // 验证文件数据边界
     if offset.saturating_add(filesz) > elf.input.len() {
         return Err(ElfLoadError::OutOfBounds);
+    }
+
+    // 【W-1 安全修复】W^X (Write XOR Execute) 检查
+    // 拒绝同时可写可执行的段，防止代码注入攻击
+    // 恶意程序可能利用 RWX 段在运行时注入并执行任意代码
+    let writable = ph.flags().is_write();
+    let executable = ph.flags().is_execute();
+    if writable && executable {
+        return Err(ElfLoadError::WritableExecutableSegment);
     }
 
     // 计算需要映射的页

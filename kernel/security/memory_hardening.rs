@@ -296,6 +296,17 @@ pub fn enforce_nx_for_kernel(
 
             let pd = get_table_from_entry(pdpt_entry, phys_offset)?;
 
+            // 【W^X 修复】基线处理：先将内核 PD 下所有页面标记为 NX
+            //
+            // 当 ensure_pte_range 将 2MB 内核 huge page 拆分为 4KB 页面时，
+            // 新创建的 PTE 会继承原始的 RWX 标志。apply_section 只修改落在
+            // text/rodata/data/bss 范围内的 ~74 个页面，剩余 512-74 ≈ 438 个
+            // 页面仍保持 RWX，导致 W^X 违规。
+            //
+            // 解决方案：先对所有内核映射页面添加 NX，然后由 text 段处理器
+            // 仅对需要执行的代码页清除 NX。这确保所有非代码页都是 NX 的。
+            mark_all_nx(pd, phys_offset)?;
+
             // Apply text section: R-X (executable, read-only)
             apply_section(
                 pd,
@@ -366,6 +377,52 @@ unsafe fn get_table_from_entry(
     let phys = entry.addr();
     let virt = phys_offset + phys.as_u64();
     Ok(&mut *(virt.as_u64() as *mut PageTable))
+}
+
+/// 为 PD 下的所有叶子页面添加 NX 位
+///
+/// 处理 2MB huge page（PD 级叶子）和 4KB 页面（PT 级叶子）。
+/// 这是 W^X 策略的基线保护：默认所有页面不可执行，
+/// 然后由各段处理器仅对代码页（.text）清除 NX。
+///
+/// # Safety
+///
+/// 调用者必须确保 `pd` 指向有效的 Page Directory，
+/// 且 `phys_offset` 是正确的物理内存偏移量。
+fn mark_all_nx(pd: &mut PageTable, phys_offset: VirtAddr) -> Result<(), HardeningError> {
+    for pd_entry in pd.iter_mut() {
+        if pd_entry.is_unused() {
+            continue;
+        }
+
+        let flags = pd_entry.flags();
+
+        // 处理 2MB huge page（PD 级别的叶子节点）
+        if flags.contains(PageTableFlags::HUGE_PAGE) {
+            if !flags.contains(PageTableFlags::NO_EXECUTE) {
+                let mut new_flags = flags;
+                new_flags.insert(PageTableFlags::NO_EXECUTE);
+                pd_entry.set_addr(pd_entry.addr(), new_flags);
+            }
+            continue;
+        }
+
+        // 4KB 页面：遍历 PT 条目
+        let pt = unsafe { get_table_from_entry(pd_entry, phys_offset)? };
+        for pt_entry in pt.iter_mut() {
+            if pt_entry.is_unused() {
+                continue;
+            }
+
+            let mut new_flags = pt_entry.flags();
+            if !new_flags.contains(PageTableFlags::NO_EXECUTE) {
+                new_flags.insert(PageTableFlags::NO_EXECUTE);
+                pt_entry.set_addr(pt_entry.addr(), new_flags);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Calculate PD index for a virtual address

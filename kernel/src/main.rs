@@ -16,6 +16,8 @@ extern crate ipc;
 extern crate kernel_core;
 extern crate security;
 extern crate vfs;
+#[macro_use]
+extern crate audit;
 
 // 演示模块
 mod demo;
@@ -258,6 +260,27 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("      ✓ devfs mounted at /dev");
     println!("      ✓ Device files: null, zero, console");
 
+    println!("[7.6/8] Initializing audit subsystem...");
+    match audit::init(audit::DEFAULT_CAPACITY) {
+        Ok(()) => {
+            // Emit boot event
+            let _ = audit::emit(
+                audit::AuditKind::Internal,
+                audit::AuditOutcome::Info,
+                audit::AuditSubject::kernel(),
+                audit::AuditObject::None,
+                &[0], // boot event
+                0,
+                0, // timestamp 0 = boot
+            );
+            println!("      ✓ Audit subsystem ready (capacity: {} events)", audit::DEFAULT_CAPACITY);
+            println!("      ✓ Hash-chained tamper evidence enabled");
+        }
+        Err(e) => {
+            println!("      ! Audit initialization failed: {:?}", e);
+        }
+    }
+
     println!("[8/8] Verifying memory management...");
     println!("      ✓ Page table manager compiled");
     println!("      ✓ mmap/munmap available");
@@ -287,6 +310,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("   • Capability-based IPC");
     println!("   • Virtual File System (VFS)");
     println!("   • Device Files (/dev/null, /dev/zero, /dev/console)");
+    println!("   • Security Audit (hash-chained events)");
     println!();
     println!("进入空闲循环...");
     println!();
