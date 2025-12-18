@@ -225,11 +225,13 @@ lazy_static::lazy_static! {
 /// 初始化调度器
 pub fn init() {
     println!("Priority scheduler initialized");
-    
+
     // 创建init进程（PID 0，最高优先级）
-    let init_pid = crate::process::create_process("init".into(), 0, 0);
+    // Init 进程必须成功创建，失败则 panic
+    let init_pid = crate::process::create_process("init".into(), 0, 0)
+        .expect("FATAL: Failed to create init process - kernel stack allocation failed");
     SCHEDULER.lock().add_process(init_pid);
-    
+
     println!("Init process created with PID {}", init_pid);
 }
 

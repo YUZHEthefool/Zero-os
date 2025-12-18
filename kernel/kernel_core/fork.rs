@@ -35,6 +35,8 @@ pub enum ForkError {
     MemoryAllocationFailed,
     /// 页表复制失败
     PageTableCopyFailed,
+    /// 子进程创建失败（内核栈分配等）
+    ProcessCreationFailed,
 }
 
 /// 执行fork系统调用
@@ -67,7 +69,9 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
     };
 
     // 创建子进程（此时未持有父进程锁，避免死锁）
-    let child_pid = create_process(child_name, parent_pid, parent_prio);
+    // Z-7: create_process 现在返回 Result，失败时正确传播错误
+    let child_pid = create_process(child_name, parent_pid, parent_prio)
+        .map_err(|_| ForkError::ProcessCreationFailed)?;
 
     // 重新获取父进程锁执行真正的 fork
     let mut parent = parent_process.lock();

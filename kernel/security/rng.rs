@@ -172,8 +172,10 @@ fn fill_entropy(buf: &mut [u8]) -> Result<(), RngError> {
         let chunk_size = remaining.min(8);
 
         // Try RDSEED first (true random), fall back to RDRAND
+        // SECURITY FIX Z-6: Never fall back to zero on entropy failure
+        // Both RDSEED and RDRAND must succeed, or propagate error
         let value = if rdseed_supported() {
-            rdseed64().unwrap_or_else(|_| rdrand64().unwrap_or(0))
+            rdseed64().or_else(|_| rdrand64())?
         } else {
             rdrand64()?
         };

@@ -85,6 +85,15 @@ pub enum KernelStackError {
     MapFailed,
 }
 
+/// 进程创建错误
+///
+/// SECURITY FIX Z-7: 进程创建失败时必须正确报告错误，而非静默回退
+#[derive(Debug, Clone, Copy)]
+pub enum ProcessCreateError {
+    /// 内核栈分配失败
+    KernelStackAllocFailed(KernelStackError),
+}
+
 /// 计算指定 PID 的内核栈虚拟地址范围
 ///
 /// 返回 (栈底, 栈顶)，栈向下生长，栈顶用于 TSS.rsp0
@@ -511,27 +520,35 @@ pub fn init() {
 /// * `priority` - 进程优先级
 ///
 /// # Returns
-/// 新创建进程的 PID
-pub fn create_process(name: String, ppid: ProcessId, priority: Priority) -> ProcessId {
-    let mut next_pid = NEXT_PID.lock();
-    let pid = *next_pid;
-    *next_pid += 1;
-    drop(next_pid);
+/// 成功返回新创建进程的 PID，失败返回错误
+///
+/// # Security Fix Z-7
+/// 内核栈分配失败时必须返回错误终止进程创建，绝不能共享内核栈
+pub fn create_process(name: String, ppid: ProcessId, priority: Priority) -> Result<ProcessId, ProcessCreateError> {
+    // 先尝试分配内核栈，失败则直接返回错误（不分配 PID）
+    let mut next_pid_guard = NEXT_PID.lock();
+    let pid = *next_pid_guard;
+
+    // 为进程分配内核栈 - SECURITY FIX Z-7: 失败时必须返回错误
+    let (stack_base, stack_top) = match allocate_kernel_stack(pid) {
+        Ok((base, top)) => (base, top),
+        Err(e) => {
+            println!("Error: Failed to allocate kernel stack for PID {}: {:?}", pid, e);
+            return Err(ProcessCreateError::KernelStackAllocFailed(e));
+        }
+    };
+
+    // 栈分配成功后才递增 PID 计数器，避免 PID 泄漏
+    *next_pid_guard += 1;
+    drop(next_pid_guard);
 
     let process = Arc::new(Mutex::new(Process::new(pid, ppid, name.clone(), priority)));
 
-    // 为进程分配内核栈
-    match allocate_kernel_stack(pid) {
-        Ok((stack_base, stack_top)) => {
-            let mut proc = process.lock();
-            proc.kernel_stack = stack_base;
-            proc.kernel_stack_top = stack_top;
-            drop(proc);
-        }
-        Err(e) => {
-            println!("Warning: Failed to allocate kernel stack for PID {}: {:?}", pid, e);
-            // 内核栈分配失败时使用默认栈（回退到共享内核栈）
-        }
+    // 设置已分配的内核栈
+    {
+        let mut proc = process.lock();
+        proc.kernel_stack = stack_base;
+        proc.kernel_stack_top = stack_top;
     }
 
     let mut table = PROCESS_TABLE.lock();
@@ -554,7 +571,7 @@ pub fn create_process(name: String, ppid: ProcessId, priority: Priority) -> Proc
 
     println!("Created process: PID={}, Name={}, Priority={}", pid, name, priority);
 
-    pid
+    Ok(pid)
 }
 
 /// 获取当前进程ID

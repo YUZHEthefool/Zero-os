@@ -166,9 +166,15 @@ pub fn run_usermode_test() -> bool {
 
     // Step 1: Create a new process
     println!("[1/4] Creating user process...");
-    // create_process(name: String, ppid: ProcessId, priority: Priority) -> ProcessId
+    // create_process(name: String, ppid: ProcessId, priority: Priority) -> Result<ProcessId, ProcessCreateError>
     // ppid = 0 means init process is parent, priority = 50 (default)
-    let pid = create_process("hello".to_string(), 0, 50);
+    let pid = match create_process("hello".to_string(), 0, 50) {
+        Ok(pid) => pid,
+        Err(e) => {
+            println!("      ✗ Failed to create process: {:?}", e);
+            return false;
+        }
+    };
     println!("      ✓ Process created with PID {}", pid);
 
     // Step 2: Create fresh address space

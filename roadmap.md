@@ -525,19 +525,21 @@ All critical issues have been resolved:
 | 2025-12-16 | Claude + Codex (19th) | 0 new | Audit subsystem implemented (hash-chained events) |
 | 2025-12-17 | Claude + Codex (20th) | 8 new | 4 fixed (X-2: DoS, X-4: mount perms, X-6: IPC, X-7: TLB), 4 deferred |
 | 2025-12-17 | Claude + Codex (21st) | 10 new | 4 fixed (Y-1: SFMASK, Y-2: SYSRET, Y-3: DR6/DR7, Y-6: enter_usermode), 6 open |
+| 2025-12-18 | Claude + Codex (22nd) | 11 new | 2 fixed (Z-6: RNG entropy, Z-7: kernel stack), 9 open |
 
 ### Current Status
 
-- Total issues tracked: 99
-- Fixed: 78 (79%)
-- Open: 21 (21%)
-  - 1 Low (L-1: ENOSYS stubs)
+- Total issues tracked: 110
+- Fixed: 80 (73%)
+- Open: 30 (27%)
+  - 2 CRITICAL fixed this round (Z-6: RNG entropy fallback, Z-7: kernel stack allocation)
+  - 5 HIGH open (Z-1: FPU/SIMD, Z-2: stack align, Z-3: user ptr, Z-4: callback len, Z-8: fork rollback, Z-9: signal perms)
+  - 3 MEDIUM open (Z-5: context switch, Z-10: ELF rollback, Z-11: pipe wakeup)
   - 13 Deferred (A-3, H-25, H-26, H-33, H-34, M-18, W-3, W-4, X-1, X-5, Y-7 - mostly SMP)
-  - 6 NEW (X-3, X-8, Y-4, Y-5, Y-8, Y-9, Y-10 - short-term fixes pending)
   - A-1 partially resolved (cooperative scheduling)
   - A-2 fully resolved (address space isolation)
 
-See [qa-2025-12-10.md](qa-2025-12-10.md), [qa-2025-12-10-v2.md](qa-2025-12-10-v2.md), [qa-2025-12-11.md](qa-2025-12-11.md), [qa-2025-12-15-v2.md](qa-2025-12-15-v2.md), [qa-2025-12-16.md](qa-2025-12-16.md), [qa-2025-12-17.md](qa-2025-12-17.md), and [qa-2025-12-17-v2.md](qa-2025-12-17-v2.md) for detailed audit reports.
+See [qa-2025-12-10.md](qa-2025-12-10.md), [qa-2025-12-10-v2.md](qa-2025-12-10-v2.md), [qa-2025-12-11.md](qa-2025-12-11.md), [qa-2025-12-15-v2.md](qa-2025-12-15-v2.md), [qa-2025-12-16.md](qa-2025-12-16.md), [qa-2025-12-17.md](qa-2025-12-17.md), [qa-2025-12-17-v2.md](qa-2025-12-17-v2.md), and [qa-2025-12-18.md](qa-2025-12-18.md) for detailed audit reports.
 
 ---
 
@@ -563,6 +565,7 @@ See [qa-2025-12-10.md](qa-2025-12-10.md), [qa-2025-12-10-v2.md](qa-2025-12-10-v2
 | 0.4.4 | 2025-12-17 | Security fixes - DoS (X-2), mount perms (X-4), IPC cleanup (X-6), TLB flush (X-7) |
 | 0.5.0 | 2025-12-17 | Phase 6 foundation - SYSCALL/SYSRET, Ring 3 transition, enter_usermode |
 | 0.5.1 | 2025-12-17 | Ring 3 security hardening - SYSRET canonical checks, SFMASK, DR clearing, RFLAGS sanitization |
+| 0.5.2 | 2025-12-18 | Critical security fixes - RNG entropy (Z-6), kernel stack allocation (Z-7) |
 | 1.0.0 | TBD | First stable release |
 
 ---
