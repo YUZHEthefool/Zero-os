@@ -299,7 +299,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("      ✓ Device files: null, zero, console");
 
     println!("[7.6/8] Initializing audit subsystem...");
-    match audit::init(audit::DEFAULT_CAPACITY) {
+    match audit::init(64) { // Reduced from 256 to save heap memory
         Ok(()) => {
             // Emit boot event
             let _ = audit::emit(
@@ -393,6 +393,25 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
 #[alloc_error_handler]
 fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
+    // Print heap statistics before panicking
+    unsafe {
+        serial_write_str("ALLOC FAILED: size=");
+        let size = layout.size();
+        let mut buf = [0u8; 20];
+        let mut n = size;
+        let mut i = 0;
+        loop {
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            i += 1;
+            if n == 0 { break; }
+        }
+        while i > 0 {
+            i -= 1;
+            serial_write_byte(buf[i]);
+        }
+        serial_write_str("\n");
+    }
     panic!("Allocation error: {:?}", layout);
 }
 
@@ -405,8 +424,39 @@ fn panic(info: &PanicInfo) -> ! {
         serial_write_str("KERNEL PANIC: ");
         if let Some(location) = info.location() {
             serial_write_str(location.file());
+            serial_write_str(":");
+            // 输出行号
+            let line = location.line();
+            let mut buf = [0u8; 10];
+            let mut n = line;
+            let mut i = 0;
+            loop {
+                buf[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+                i += 1;
+                if n == 0 {
+                    break;
+                }
+            }
+            while i > 0 {
+                i -= 1;
+                serial_write_byte(buf[i]);
+            }
         }
         serial_write_str("\n");
+
+        // 尝试打印panic消息
+        // 使用 core::fmt::write 来格式化
+        struct SerialFmt;
+        impl core::fmt::Write for SerialFmt {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                for b in s.bytes() {
+                    unsafe { serial_write_byte(b); }
+                }
+                Ok(())
+            }
+        }
+        let _ = core::fmt::write(&mut SerialFmt, format_args!("{}\n", info));
     }
     loop {
         unsafe {

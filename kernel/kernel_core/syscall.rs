@@ -54,8 +54,14 @@ fn stdin_prepare_to_wait() -> bool {
 
     // 在关中断状态下操作
     x86_64::instructions::interrupts::without_interrupts(|| {
-        // 将当前进程加入等待队列
-        STDIN_WAITERS.lock().push_back(pid);
+        let mut waiters = STDIN_WAITERS.lock();
+
+        // 避免重复添加：检查是否已经在等待队列中
+        // 这防止了当 force_reschedule 返回（因没有其他进程）时
+        // 进程在循环中反复将自己添加到队列导致内存耗尽
+        if !waiters.iter().any(|&p| p == pid) {
+            waiters.push_back(pid);
+        }
 
         // 将进程状态设为阻塞
         if let Some(proc_arc) = get_process(pid) {
@@ -70,8 +76,38 @@ fn stdin_prepare_to_wait() -> bool {
 /// 完成等待（第二阶段）
 ///
 /// 在 prepare_to_wait 后调用，实际让出 CPU。
+/// 如果没有其他进程可调度，会进入 HLT 循环等待中断唤醒。
 fn stdin_finish_wait() {
+    // 尝试切换到其他进程
     crate::force_reschedule();
+
+    // 如果 force_reschedule 返回，说明没有其他进程可运行
+    // 当前进程已被标记为 Blocked，需要等待中断（键盘/串口）唤醒
+    // 进入 HLT 循环，避免忙等消耗 CPU
+    loop {
+        // 必须在关中断状态下检查进程状态，避免与中断处理程序竞争
+        // enable_and_hlt 后中断是开启的，需要先关闭再检查
+        let should_continue = x86_64::instructions::interrupts::without_interrupts(|| {
+            if let Some(pid) = current_pid() {
+                if let Some(proc_arc) = get_process(pid) {
+                    let proc = proc_arc.lock();
+                    if proc.state != ProcessState::Blocked {
+                        // 已被唤醒（可能是键盘中断），退出等待
+                        return false;
+                    }
+                }
+            }
+            true // 继续等待
+        });
+
+        if !should_continue {
+            break;
+        }
+
+        // 启用中断并等待（HLT 会在下一个中断时唤醒）
+        // 键盘/串口中断会调用 wake_stdin_waiters() 将进程设为 Ready
+        x86_64::instructions::interrupts::enable_and_hlt();
+    }
 }
 
 /// 唤醒一个等待 stdin 的进程
@@ -1328,6 +1364,10 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
     // R23-5 fix: 阻塞模式 - 如果没有输入则等待
     // 使用 prepare-check-finish 模式避免丢失唤醒竞态
     if fd == 0 {
+        // Debug: print heap stats before allocation
+        #[cfg(debug_assertions)]
+        println!("[sys_read] fd=0 count={}", count);
+
         let mut tmp = vec![0u8; count];
         loop {
             // 先尝试读取
