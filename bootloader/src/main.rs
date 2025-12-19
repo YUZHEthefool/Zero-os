@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use log::info;
 use uefi::prelude::*;
-use uefi::proto::console::text::{Key, ScanCode};
+use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
 use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode};
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::table::boot::{AllocateType, MemoryType};
@@ -13,118 +13,6 @@ use uefi::CStr16;
 use uefi::Identify;
 use xmas_elf::program::Type;
 use xmas_elf::ElfFile;
-
-/// VGA I/O port write helper
-#[inline]
-unsafe fn outb(port: u16, val: u8) {
-    core::arch::asm!(
-        "out dx, al",
-        in("dx") port,
-        in("al") val,
-        options(preserves_flags, nostack)
-    );
-}
-
-/// VGA I/O port read helper
-#[inline]
-unsafe fn inb(port: u16) -> u8 {
-    let val: u8;
-    core::arch::asm!(
-        "in al, dx",
-        in("dx") port,
-        out("al") val,
-        options(preserves_flags, nostack)
-    );
-    val
-}
-
-/// Force VGA into 80x25 text mode (mode 3h)
-///
-/// OVMF/GOP leaves the display in graphics mode, so writes to 0xB8000 are invisible.
-/// This function reprograms the VGA adapter into standard 80x25 color text mode
-/// so VGA text buffer writes become visible.
-///
-/// Must be called after exit_boot_services() since it uses raw port I/O.
-fn force_vga_text_mode() {
-    // VGA Mode 3h register values (80x25 text, 16 colors)
-    // Based on standard VGA programming reference
-    const MISC_OUTPUT: u8 = 0x67;
-
-    const SEQ_REGS: [u8; 5] = [0x03, 0x00, 0x03, 0x00, 0x02];
-
-    const CRTC_REGS: [u8; 25] = [
-        0x5F, 0x4F, 0x50, 0x82, 0x55, 0x81, 0xBF, 0x1F, 0x00, 0x4F, 0x0D, 0x0E, 0x00,
-        0x00, 0x00, 0x00, 0x9C, 0x0E, 0x8F, 0x28, 0x1F, 0x96, 0xB9, 0xA3, 0xFF,
-    ];
-
-    const GC_REGS: [u8; 9] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0E, 0x00, 0xFF];
-
-    // Standard text mode AC registers (canonical values):
-    // Palette entries 0-15, then mode control, overscan, plane enable, h-panning, color select
-    const AC_REGS: [u8; 21] = [
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, // Palette 0-7
-        0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, // Palette 8-15
-        0x0C, // Mode control (index 0x10)
-        0x00, // Overscan (index 0x11)
-        0x0F, // Plane enable (index 0x12)
-        0x00, // H-panning (index 0x13)
-        0x00, // Color select (index 0x14)
-    ];
-
-    unsafe {
-        // Write Miscellaneous Output Register
-        outb(0x3C2, MISC_OUTPUT);
-
-        // Assert synchronous reset before sequencer programming
-        outb(0x3C4, 0x00);
-        outb(0x3C5, 0x01); // Assert reset
-
-        // Write Sequencer Registers (skip index 0 which is reset)
-        for (i, &val) in SEQ_REGS.iter().enumerate() {
-            outb(0x3C4, i as u8);
-            outb(0x3C5, val);
-        }
-
-        // Release synchronous reset
-        outb(0x3C4, 0x00);
-        outb(0x3C5, 0x03); // Release reset
-
-        // Unlock CRTC registers (clear bit 7 of register 0x11)
-        outb(0x3D4, 0x11);
-        let prev = inb(0x3D5);
-        outb(0x3D5, prev & 0x7F);
-
-        // Write CRTC Registers
-        for (i, &val) in CRTC_REGS.iter().enumerate() {
-            outb(0x3D4, i as u8);
-            outb(0x3D5, val);
-        }
-
-        // Write Graphics Controller Registers
-        for (i, &val) in GC_REGS.iter().enumerate() {
-            outb(0x3CE, i as u8);
-            outb(0x3CF, val);
-        }
-
-        // Write Attribute Controller Registers
-        // Must first reset the flip-flop by reading Input Status Register 1
-        for (i, &val) in AC_REGS.iter().enumerate() {
-            let _ = inb(0x3DA); // Reset flip-flop
-            outb(0x3C0, i as u8);
-            outb(0x3C0, val);
-        }
-
-        // Enable video output
-        let _ = inb(0x3DA);
-        outb(0x3C0, 0x20);
-
-        // Clear the screen (fill VGA buffer with spaces)
-        let vga = 0xB8000 as *mut u16;
-        for i in 0..(80 * 25) {
-            core::ptr::write_volatile(vga.offset(i), 0x0720); // Light gray space
-        }
-    }
-}
 
 /// 内存映射信息，传递给内核
 #[repr(C)]
@@ -135,10 +23,41 @@ pub struct MemoryMapInfo {
     pub descriptor_version: u32, // 描述符版本
 }
 
+/// 像素格式
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub enum PixelFormat {
+    /// RGB (8位红, 8位绿, 8位蓝, 8位保留)
+    Rgb = 0,
+    /// BGR (8位蓝, 8位绿, 8位红, 8位保留)
+    Bgr = 1,
+    /// 未知格式
+    Unknown = 2,
+}
+
+/// 帧缓冲区信息 (GOP framebuffer)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FramebufferInfo {
+    /// 帧缓冲区物理地址
+    pub base: u64,
+    /// 帧缓冲区大小（字节）
+    pub size: usize,
+    /// 水平分辨率（像素）
+    pub width: u32,
+    /// 垂直分辨率（像素）
+    pub height: u32,
+    /// 每行的字节数（stride）
+    pub stride: u32,
+    /// 像素格式
+    pub pixel_format: PixelFormat,
+}
+
 /// 引导信息结构，传递给内核
 #[repr(C)]
 pub struct BootInfo {
     pub memory_map: MemoryMapInfo,
+    pub framebuffer: FramebufferInfo,
 }
 
 #[entry]
@@ -362,7 +281,7 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     };
 
     // 构建四级页表结构，将物理内核地址映射到高半区虚拟地址
-    let (pml4_frame, entry_point_to_jump) = unsafe {
+    let (_pml4_frame, entry_point_to_jump) = unsafe {
         // 最早的 VGA 写入 - 在任何其他操作之前
         let vga = 0xb8000 as *mut u8;
         let msg = b"SETUP";
@@ -516,6 +435,46 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         (pml4_frame, entry_point)
     };
 
+    // 获取 GOP 帧缓冲区信息（必须在 exit_boot_services 之前）
+    let framebuffer_info = {
+        let boot_services = system_table.boot_services();
+        let gop_handle = boot_services
+            .get_handle_for_protocol::<GraphicsOutput>()
+            .expect("Failed to get GOP handle");
+        let mut gop = boot_services
+            .open_protocol_exclusive::<GraphicsOutput>(gop_handle)
+            .expect("Failed to open GOP");
+
+        let mode_info = gop.current_mode_info();
+        let (width, height) = mode_info.resolution();
+        let stride = mode_info.stride() as u32;
+
+        let pixel_format = match mode_info.pixel_format() {
+            GopPixelFormat::Rgb => PixelFormat::Rgb,
+            GopPixelFormat::Bgr => PixelFormat::Bgr,
+            _ => PixelFormat::Unknown,
+        };
+
+        let mut fb = gop.frame_buffer();
+        let fb_base = fb.as_mut_ptr() as u64;
+        let fb_size = fb.size();
+
+        info!(
+            "GOP framebuffer: {}x{}, stride={}, format={:?}",
+            width, height, stride, pixel_format
+        );
+        info!("Framebuffer at 0x{:x}, size {} bytes", fb_base, fb_size);
+
+        FramebufferInfo {
+            base: fb_base,
+            size: fb_size,
+            width: width as u32,
+            height: height as u32,
+            stride,
+            pixel_format,
+        }
+    };
+
     // 预先分配一块低地址缓冲区，用于在退出后保存内存映射副本，确保恒等映射可访问
     // 64 页（256 KiB）足以容纳常见的内存映射
     let (memory_map_copy_ptr, memory_map_copy_len) = {
@@ -564,24 +523,10 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 descriptor_size: memory_map_meta.desc_size,
                 descriptor_version: memory_map_meta.desc_version,
             },
+            framebuffer: framebuffer_info,
         };
         // 阻止 memory_map 被释放，因为内核需要访问它
         core::mem::forget(memory_map);
-    }
-
-    // Force VGA into text mode (mode 3h) after exit_boot_services
-    // OVMF/GOP leaves the display in graphics mode, so 0xB8000 writes are invisible
-    // This reprograms the VGA adapter into 80x25 text mode so kernel VGA output works
-    force_vga_text_mode();
-
-    // VGA text mode is now active - test write should be visible
-    unsafe {
-        let vga = 0xb8000 as *mut u8;
-        let msg = b"VGA OK!";
-        for (i, &byte) in msg.iter().enumerate() {
-            core::ptr::write_volatile(vga.offset(i as isize * 2), byte);
-            core::ptr::write_volatile(vga.offset(i as isize * 2 + 1), 0x0A); // Green on black
-        }
     }
 
     // 跳转到内核入口点 - 使用内联汇编确保正确跳转
@@ -594,18 +539,6 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             entry = in(reg) entry_point_to_jump,
             options(noreturn)
         );
-    }
-}
-
-fn wait_for_key(system_table: &mut SystemTable<Boot>) {
-    let mut events = [system_table.stdin().wait_for_key_event().unwrap()];
-    let _ = system_table.boot_services().wait_for_event(&mut events);
-
-    let _ = system_table.stdin().reset(false);
-
-    match system_table.stdin().read_key() {
-        Ok(Some(Key::Special(ScanCode::ESCAPE))) => {}
-        _ => {}
     }
 }
 

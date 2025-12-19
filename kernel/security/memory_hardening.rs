@@ -675,34 +675,74 @@ fn overlaps(start_a: u64, end_a: u64, start_b: u64, end_b: u64) -> bool {
 /// Check if a page address is within an MMIO region
 #[inline]
 fn is_mmio_page(vaddr: u64) -> bool {
-    overlaps(
+    // Check VGA region
+    if overlaps(
         vaddr,
         vaddr.saturating_add(0x1000),
         VGA_PHYS_ADDR,
         VGA_PHYS_ADDR + VGA_MMIO_SIZE as u64,
-    ) || overlaps(
+    ) {
+        return true;
+    }
+
+    // Check APIC region
+    if overlaps(
         vaddr,
         vaddr.saturating_add(0x1000),
         APIC_PHYS_ADDR,
         APIC_PHYS_ADDR + APIC_MMIO_SIZE as u64,
-    )
+    ) {
+        return true;
+    }
+
+    // Check GOP framebuffer region (dynamically determined)
+    if let Some((fb_base, fb_size)) = drivers::framebuffer::get_framebuffer_region() {
+        if overlaps(
+            vaddr,
+            vaddr.saturating_add(0x1000),
+            fb_base,
+            fb_base + fb_size as u64,
+        ) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Check if a 2MB region contains any MMIO address
 #[inline]
 fn is_mmio_2mb_region(pd_base: u64) -> bool {
     let pd_end = pd_base + 0x200000;
-    overlaps(
+
+    // Check VGA region
+    if overlaps(
         pd_base,
         pd_end,
         VGA_PHYS_ADDR,
         VGA_PHYS_ADDR + VGA_MMIO_SIZE as u64,
-    ) || overlaps(
+    ) {
+        return true;
+    }
+
+    // Check APIC region
+    if overlaps(
         pd_base,
         pd_end,
         APIC_PHYS_ADDR,
         APIC_PHYS_ADDR + APIC_MMIO_SIZE as u64,
-    )
+    ) {
+        return true;
+    }
+
+    // Check GOP framebuffer region (dynamically determined)
+    if let Some((fb_base, fb_size)) = drivers::framebuffer::get_framebuffer_region() {
+        if overlaps(pd_base, pd_end, fb_base, fb_base + fb_size as u64) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Align address down to page boundary

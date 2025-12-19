@@ -164,10 +164,15 @@ unsafe fn serial_outb(port: u16, val: u8) {
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
 
-    // 同时输出到VGA和串口
-    WRITER.lock().write_fmt(args).unwrap();
+    // 优先输出到 framebuffer（现代 GOP 方式）
+    if crate::framebuffer::is_initialized() {
+        crate::framebuffer::_print(args);
+    } else {
+        // 后备：输出到 VGA 文本缓冲区（旧式 BIOS）
+        WRITER.lock().write_fmt(args).unwrap();
+    }
 
-    // 将格式化后的文本也发送到串口，便于在-nographic模式下查看
+    // 始终同时发送到串口，便于在 -nographic 模式下查看
     struct SerialWriter;
     impl Write for SerialWriter {
         fn write_str(&mut self, s: &str) -> fmt::Result {

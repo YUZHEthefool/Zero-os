@@ -19,11 +19,42 @@ pub struct MemoryMapInfo {
     pub descriptor_version: u32,
 }
 
+/// 像素格式（与 bootloader 保持一致）
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// RGB (8位红, 8位绿, 8位蓝, 8位保留)
+    Rgb = 0,
+    /// BGR (8位蓝, 8位绿, 8位红, 8位保留)
+    Bgr = 1,
+    /// 未知格式
+    Unknown = 2,
+}
+
+/// 帧缓冲区信息 (GOP framebuffer)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FramebufferInfo {
+    /// 帧缓冲区物理地址
+    pub base: u64,
+    /// 帧缓冲区大小（字节）
+    pub size: usize,
+    /// 水平分辨率（像素）
+    pub width: u32,
+    /// 垂直分辨率（像素）
+    pub height: u32,
+    /// 每行的字节数（stride）
+    pub stride: u32,
+    /// 像素格式
+    pub pixel_format: PixelFormat,
+}
+
 /// Bootloader 传入的启动信息
 #[repr(C)]
 #[derive(Debug)]
 pub struct BootInfo {
     pub memory_map: MemoryMapInfo,
+    pub framebuffer: FramebufferInfo,
 }
 
 /// UEFI 内存描述符（按 UEFI 规范布局）

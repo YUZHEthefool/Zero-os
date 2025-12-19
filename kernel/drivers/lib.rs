@@ -2,6 +2,7 @@
 #![feature(abi_x86_interrupt)]
 extern crate alloc;
 
+pub mod framebuffer;
 pub mod keyboard;
 pub mod vga_buffer;
 

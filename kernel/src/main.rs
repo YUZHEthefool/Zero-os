@@ -61,15 +61,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         serial_write_str("Kernel _start entered\n");
     }
 
-    // 初始化VGA驱动
-    drivers::vga_buffer::init();
-
-    println!("==============================");
-    println!("  Zero-OS Microkernel v0.1");
-    println!("==============================");
-    println!();
-
-    // 解析 Bootloader 传递的 BootInfo 指针
+    // 解析 Bootloader 传递的 BootInfo 指针（必须在任何 println! 之前）
     // Bootloader 通过 rdi 寄存器传递 BootInfo 指针（System V AMD64 ABI）
     // 由于 identity mapping 仍然有效，可以直接访问该地址
     let boot_info: Option<&BootInfo> = if boot_info_ptr != 0 {
@@ -77,6 +69,35 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     } else {
         None
     };
+
+    // 初始化 framebuffer 控制台（现代 GOP 方式，必须在第一个 println! 之前）
+    if let Some(info) = boot_info {
+        // 转换 mm::memory::FramebufferInfo 到 drivers::framebuffer::FramebufferInfo
+        let fb_info = drivers::framebuffer::FramebufferInfo {
+            base: info.framebuffer.base,
+            size: info.framebuffer.size,
+            width: info.framebuffer.width,
+            height: info.framebuffer.height,
+            stride: info.framebuffer.stride,
+            pixel_format: match info.framebuffer.pixel_format {
+                mm::memory::PixelFormat::Rgb => drivers::framebuffer::PixelFormat::Rgb,
+                mm::memory::PixelFormat::Bgr => drivers::framebuffer::PixelFormat::Bgr,
+                mm::memory::PixelFormat::Unknown => drivers::framebuffer::PixelFormat::Unknown,
+            },
+        };
+        drivers::framebuffer::init(&fb_info);
+        unsafe {
+            serial_write_str("Framebuffer console initialized\n");
+        }
+    }
+
+    // 初始化VGA驱动（后备，framebuffer 初始化后 VGA 输出会被跳过）
+    drivers::vga_buffer::init();
+
+    println!("==============================");
+    println!("  Zero-OS Microkernel v0.1");
+    println!("==============================");
+    println!();
 
     // 阶段1：初始化中断处理
     println!("[1/3] Initializing interrupts...");
