@@ -69,9 +69,11 @@ build-shell:
 	@echo "=== 构建完成（Shell模式）==="
 
 # 通用QEMU参数
+# -vga std: 强制使用标准VGA模式，确保0xB8000文本缓冲区可用
 QEMU_COMMON = -bios $(OVMF_PATH) \
 	-drive format=raw,file=fat:rw:esp \
 	-m 256M \
+	-vga std \
 	-no-reboot -no-shutdown
 
 # 默认运行 - 图形窗口模式（可看到VGA输出）

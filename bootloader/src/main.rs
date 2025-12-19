@@ -496,8 +496,8 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         let vga = 0xb8000 as *mut u8;
         let msg1 = b"B4CR3";
         for (i, &byte) in msg1.iter().enumerate() {
-            *vga.offset(80 * 23 * 2 + i as isize * 2) = byte;
-            *vga.offset(80 * 23 * 2 + i as isize * 2 + 1) = 0x0A;
+            core::ptr::write_volatile(vga.offset(80 * 23 * 2 + i as isize * 2), byte);
+            core::ptr::write_volatile(vga.offset(80 * 23 * 2 + i as isize * 2 + 1), 0x0A);
         }
 
         // 加载新的页表
@@ -509,8 +509,8 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         // 在切换后写 VGA 测试
         let msg2 = b"AFCR3";
         for (i, &byte) in msg2.iter().enumerate() {
-            *vga.offset(80 * 23 * 2 + (i + 6) as isize * 2) = byte;
-            *vga.offset(80 * 23 * 2 + (i + 6) as isize * 2 + 1) = 0x0C;
+            core::ptr::write_volatile(vga.offset(80 * 23 * 2 + (i + 6) as isize * 2), byte);
+            core::ptr::write_volatile(vga.offset(80 * 23 * 2 + (i + 6) as isize * 2 + 1), 0x0C);
         }
 
         (pml4_frame, entry_point)
