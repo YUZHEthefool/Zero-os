@@ -1,5 +1,7 @@
 // VGA文本模式缓冲区实现
+// Uses volatile writes to ensure MMIO operations reach the VGA hardware
 use core::fmt;
+use core::ptr;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -69,10 +71,16 @@ impl Writer {
                 let col = self.column_position;
 
                 let color_code = self.color_code;
-                self.buffer.chars[row][col] = ScreenChar {
-                    ascii_character: byte,
-                    color_code,
-                };
+                // Use volatile write to ensure MMIO reaches VGA hardware
+                unsafe {
+                    ptr::write_volatile(
+                        &mut self.buffer.chars[row][col],
+                        ScreenChar {
+                            ascii_character: byte,
+                            color_code,
+                        },
+                    );
+                }
                 self.column_position += 1;
             }
         }
@@ -92,8 +100,9 @@ impl Writer {
     fn new_line(&mut self) {
         for row in 1..BUFFER_HEIGHT {
             for col in 0..BUFFER_WIDTH {
-                let character = self.buffer.chars[row][col];
-                self.buffer.chars[row - 1][col] = character;
+                // Use volatile read/write for MMIO safety
+                let character = unsafe { ptr::read_volatile(&self.buffer.chars[row][col]) };
+                unsafe { ptr::write_volatile(&mut self.buffer.chars[row - 1][col], character) };
             }
         }
         self.clear_row(BUFFER_HEIGHT - 1);
@@ -106,7 +115,8 @@ impl Writer {
             color_code: self.color_code,
         };
         for col in 0..BUFFER_WIDTH {
-            self.buffer.chars[row][col] = blank;
+            // Use volatile write for MMIO safety
+            unsafe { ptr::write_volatile(&mut self.buffer.chars[row][col], blank) };
         }
     }
 }

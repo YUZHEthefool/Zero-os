@@ -26,6 +26,75 @@ use audit::{AuditKind, AuditObject, AuditOutcome, AuditSubject};
 /// 最大参数数量（防止恶意用户传递过多参数）
 const MAX_ARG_COUNT: usize = 256;
 
+// ============================================================================
+// R23-5 fix: stdin 阻塞等待支持
+// ============================================================================
+
+use alloc::collections::VecDeque;
+
+/// stdin 等待队列
+///
+/// 当 sys_read(fd=0) 没有数据时，进程会被加入此队列并阻塞。
+/// 键盘/串口中断通过 wake_stdin_waiters() 唤醒等待者。
+static STDIN_WAITERS: spin::Mutex<VecDeque<ProcessId>> = spin::Mutex::new(VecDeque::new());
+
+/// 准备等待 stdin 输入（第一阶段）
+///
+/// 在检查缓冲区为空后调用此函数，将当前进程加入等待队列。
+/// 必须在持有键盘缓冲区检查的同一临界区内调用，以避免丢失唤醒。
+///
+/// # Returns
+///
+/// 成功入队返回 true，无当前进程返回 false
+fn stdin_prepare_to_wait() -> bool {
+    let pid = match current_pid() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    // 在关中断状态下操作
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        // 将当前进程加入等待队列
+        STDIN_WAITERS.lock().push_back(pid);
+
+        // 将进程状态设为阻塞
+        if let Some(proc_arc) = get_process(pid) {
+            let mut proc = proc_arc.lock();
+            proc.state = ProcessState::Blocked;
+        }
+    });
+
+    true
+}
+
+/// 完成等待（第二阶段）
+///
+/// 在 prepare_to_wait 后调用，实际让出 CPU。
+fn stdin_finish_wait() {
+    crate::force_reschedule();
+}
+
+/// 唤醒一个等待 stdin 的进程
+///
+/// 由键盘/串口中断处理器调用。
+/// 使用 wake_one 语义以避免惊群效应。
+pub fn wake_stdin_waiters() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut waiters = STDIN_WAITERS.lock();
+        // 清理已退出的进程并唤醒第一个有效等待者
+        while let Some(pid) = waiters.pop_front() {
+            if let Some(proc_arc) = get_process(pid) {
+                let mut proc = proc_arc.lock();
+                if proc.state == ProcessState::Blocked {
+                    proc.state = ProcessState::Ready;
+                    return; // 只唤醒一个
+                }
+            }
+            // 进程不存在或不在阻塞状态，继续检查下一个
+        }
+    });
+}
+
 /// 最大参数总字节数（argv + envp 字符串总大小上限）
 const MAX_ARG_TOTAL: usize = 128 * 1024;
 
@@ -1256,14 +1325,39 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
     validate_user_ptr_mut(buf, count)?;
 
     // stdin (fd 0): 从键盘缓冲区读取字符
-    // 非阻塞：如果没有输入，返回 0（EOF）
+    // R23-5 fix: 阻塞模式 - 如果没有输入则等待
+    // 使用 prepare-check-finish 模式避免丢失唤醒竞态
     if fd == 0 {
         let mut tmp = vec![0u8; count];
-        let bytes_read = drivers::keyboard_read(&mut tmp);
-        if bytes_read > 0 {
-            copy_to_user(buf, &tmp[..bytes_read])?;
+        loop {
+            // 先尝试读取
+            let bytes_read = drivers::keyboard_read(&mut tmp);
+            if bytes_read > 0 {
+                copy_to_user(buf, &tmp[..bytes_read])?;
+                return Ok(bytes_read);
+            }
+
+            // 无数据：先入队再检查（避免丢失唤醒）
+            if !stdin_prepare_to_wait() {
+                // 无当前进程，返回 0 (EOF)
+                return Ok(0);
+            }
+
+            // 二次检查：入队后可能有新数据到达
+            let bytes_read = drivers::keyboard_read(&mut tmp);
+            if bytes_read > 0 {
+                // 有数据了，取消等待并返回
+                // 注意：我们已经在等待队列中，但进程已被标记为 Blocked
+                // 下次唤醒会将我们设为 Ready，但我们不会真正睡眠
+                // 这是安全的：最坏情况是多一次调度
+                copy_to_user(buf, &tmp[..bytes_read])?;
+                return Ok(bytes_read);
+            }
+
+            // 确实没有数据，完成等待（让出 CPU）
+            stdin_finish_wait();
+            // 被唤醒后继续循环尝试读取
         }
-        return Ok(bytes_read);
     }
 
     // stdout/stderr 不支持读取

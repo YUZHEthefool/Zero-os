@@ -14,6 +14,118 @@ use uefi::Identify;
 use xmas_elf::program::Type;
 use xmas_elf::ElfFile;
 
+/// VGA I/O port write helper
+#[inline]
+unsafe fn outb(port: u16, val: u8) {
+    core::arch::asm!(
+        "out dx, al",
+        in("dx") port,
+        in("al") val,
+        options(preserves_flags, nostack)
+    );
+}
+
+/// VGA I/O port read helper
+#[inline]
+unsafe fn inb(port: u16) -> u8 {
+    let val: u8;
+    core::arch::asm!(
+        "in al, dx",
+        in("dx") port,
+        out("al") val,
+        options(preserves_flags, nostack)
+    );
+    val
+}
+
+/// Force VGA into 80x25 text mode (mode 3h)
+///
+/// OVMF/GOP leaves the display in graphics mode, so writes to 0xB8000 are invisible.
+/// This function reprograms the VGA adapter into standard 80x25 color text mode
+/// so VGA text buffer writes become visible.
+///
+/// Must be called after exit_boot_services() since it uses raw port I/O.
+fn force_vga_text_mode() {
+    // VGA Mode 3h register values (80x25 text, 16 colors)
+    // Based on standard VGA programming reference
+    const MISC_OUTPUT: u8 = 0x67;
+
+    const SEQ_REGS: [u8; 5] = [0x03, 0x00, 0x03, 0x00, 0x02];
+
+    const CRTC_REGS: [u8; 25] = [
+        0x5F, 0x4F, 0x50, 0x82, 0x55, 0x81, 0xBF, 0x1F, 0x00, 0x4F, 0x0D, 0x0E, 0x00,
+        0x00, 0x00, 0x00, 0x9C, 0x0E, 0x8F, 0x28, 0x1F, 0x96, 0xB9, 0xA3, 0xFF,
+    ];
+
+    const GC_REGS: [u8; 9] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0E, 0x00, 0xFF];
+
+    // Standard text mode AC registers (canonical values):
+    // Palette entries 0-15, then mode control, overscan, plane enable, h-panning, color select
+    const AC_REGS: [u8; 21] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, // Palette 0-7
+        0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, // Palette 8-15
+        0x0C, // Mode control (index 0x10)
+        0x00, // Overscan (index 0x11)
+        0x0F, // Plane enable (index 0x12)
+        0x00, // H-panning (index 0x13)
+        0x00, // Color select (index 0x14)
+    ];
+
+    unsafe {
+        // Write Miscellaneous Output Register
+        outb(0x3C2, MISC_OUTPUT);
+
+        // Assert synchronous reset before sequencer programming
+        outb(0x3C4, 0x00);
+        outb(0x3C5, 0x01); // Assert reset
+
+        // Write Sequencer Registers (skip index 0 which is reset)
+        for (i, &val) in SEQ_REGS.iter().enumerate() {
+            outb(0x3C4, i as u8);
+            outb(0x3C5, val);
+        }
+
+        // Release synchronous reset
+        outb(0x3C4, 0x00);
+        outb(0x3C5, 0x03); // Release reset
+
+        // Unlock CRTC registers (clear bit 7 of register 0x11)
+        outb(0x3D4, 0x11);
+        let prev = inb(0x3D5);
+        outb(0x3D5, prev & 0x7F);
+
+        // Write CRTC Registers
+        for (i, &val) in CRTC_REGS.iter().enumerate() {
+            outb(0x3D4, i as u8);
+            outb(0x3D5, val);
+        }
+
+        // Write Graphics Controller Registers
+        for (i, &val) in GC_REGS.iter().enumerate() {
+            outb(0x3CE, i as u8);
+            outb(0x3CF, val);
+        }
+
+        // Write Attribute Controller Registers
+        // Must first reset the flip-flop by reading Input Status Register 1
+        for (i, &val) in AC_REGS.iter().enumerate() {
+            let _ = inb(0x3DA); // Reset flip-flop
+            outb(0x3C0, i as u8);
+            outb(0x3C0, val);
+        }
+
+        // Enable video output
+        let _ = inb(0x3DA);
+        outb(0x3C0, 0x20);
+
+        // Clear the screen (fill VGA buffer with spaces)
+        let vga = 0xB8000 as *mut u16;
+        for i in 0..(80 * 25) {
+            core::ptr::write_volatile(vga.offset(i), 0x0720); // Light gray space
+        }
+    }
+}
+
 /// 内存映射信息，传递给内核
 #[repr(C)]
 pub struct MemoryMapInfo {
@@ -457,13 +569,18 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         core::mem::forget(memory_map);
     }
 
-    // CR3 切换后，直接写 VGA（exit_boot_services 后可能无法使用 UEFI 打印）
+    // Force VGA into text mode (mode 3h) after exit_boot_services
+    // OVMF/GOP leaves the display in graphics mode, so 0xB8000 writes are invisible
+    // This reprograms the VGA adapter into 80x25 text mode so kernel VGA output works
+    force_vga_text_mode();
+
+    // VGA text mode is now active - test write should be visible
     unsafe {
         let vga = 0xb8000 as *mut u8;
-        let msg = b"EXIT->";
+        let msg = b"VGA OK!";
         for (i, &byte) in msg.iter().enumerate() {
-            *vga.offset(80 * 24 * 2 + (i + 6) as isize * 2) = byte;
-            *vga.offset(80 * 24 * 2 + (i + 6) as isize * 2 + 1) = 0x0E;
+            core::ptr::write_volatile(vga.offset(i as isize * 2), byte);
+            core::ptr::write_volatile(vga.offset(i as isize * 2 + 1), 0x0A); // Green on black
         }
     }
 

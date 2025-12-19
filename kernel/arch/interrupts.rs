@@ -715,6 +715,9 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     // 键盘驱动会解码扫描码并将字符放入输入缓冲区
     drivers::push_scancode(scancode);
 
+    // R23-5 fix: 唤醒等待 stdin 输入的进程
+    kernel_core::wake_stdin_waiters();
+
     // 发送 EOI 到 PIC
     unsafe {
         core::arch::asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
@@ -759,8 +762,10 @@ extern "x86-interrupt" fn serial_interrupt_handler(_stack_frame: InterruptStackF
         }
     }
 
-    // 如果收到了输入，请求重调度以尽快唤醒等待输入的进程
+    // 如果收到了输入，唤醒等待输入的进程并请求重调度
     if received_any {
+        // R23-5 fix: 唤醒等待 stdin 输入的进程
+        kernel_core::wake_stdin_waiters();
         kernel_core::request_resched_from_irq();
     }
 
