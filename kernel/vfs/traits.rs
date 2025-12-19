@@ -2,11 +2,11 @@
 //!
 //! Core traits for filesystem and inode operations.
 
+use crate::types::{DirEntry, FileMode, FsError, OpenFlags, Stat};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
 use kernel_core::FileOps;
-use crate::types::{DirEntry, FileMode, FsError, OpenFlags, Stat};
 
 /// Filesystem trait
 ///
@@ -41,7 +41,12 @@ pub trait FileSystem: Send + Sync {
     ///
     /// # Returns
     /// The new inode or error
-    fn create(&self, parent: &Arc<dyn Inode>, name: &str, mode: FileMode) -> Result<Arc<dyn Inode>, FsError> {
+    fn create(
+        &self,
+        parent: &Arc<dyn Inode>,
+        name: &str,
+        mode: FileMode,
+    ) -> Result<Arc<dyn Inode>, FsError> {
         let _ = (parent, name, mode);
         Err(FsError::NotSupported)
     }

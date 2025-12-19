@@ -17,9 +17,9 @@
 //! 6. Kernel handles syscalls and program exits
 
 use alloc::string::ToString;
-use kernel_core::process::{create_process, get_process, FxSaveArea, ProcessState};
 use kernel_core::elf_loader::load_elf;
 use kernel_core::fork::create_fresh_address_space;
+use kernel_core::process::{create_process, get_process, FxSaveArea, ProcessState};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{PageTable, PageTableFlags};
 
@@ -33,7 +33,10 @@ fn dump_page_table_for_addr(addr: u64) {
     let pd_idx = ((addr >> 21) & 0x1FF) as usize;
     let pt_idx = ((addr >> 12) & 0x1FF) as usize;
 
-    println!("  Indices: PML4[{}] PDPT[{}] PD[{}] PT[{}]", pml4_idx, pdpt_idx, pd_idx, pt_idx);
+    println!(
+        "  Indices: PML4[{}] PDPT[{}] PD[{}] PT[{}]",
+        pml4_idx, pdpt_idx, pd_idx, pt_idx
+    );
 
     // Get current CR3
     let (cr3_frame, _) = Cr3::read();
@@ -48,11 +51,13 @@ fn dump_page_table_for_addr(addr: u64) {
         let pml4_virt = (phys_offset + pml4_phys) as *const PageTable;
         let pml4 = &*pml4_virt;
         let pml4_entry = &pml4[pml4_idx];
-        println!("  PML4[{}]: flags=0x{:x}, addr=0x{:x}, USER={}",
+        println!(
+            "  PML4[{}]: flags=0x{:x}, addr=0x{:x}, USER={}",
             pml4_idx,
             pml4_entry.flags().bits(),
             pml4_entry.addr().as_u64(),
-            pml4_entry.flags().contains(PageTableFlags::USER_ACCESSIBLE));
+            pml4_entry.flags().contains(PageTableFlags::USER_ACCESSIBLE)
+        );
 
         if !pml4_entry.flags().contains(PageTableFlags::PRESENT) {
             println!("  -> PML4 entry not present!");
@@ -64,11 +69,13 @@ fn dump_page_table_for_addr(addr: u64) {
         let pdpt_virt = (phys_offset + pdpt_phys) as *const PageTable;
         let pdpt = &*pdpt_virt;
         let pdpt_entry = &pdpt[pdpt_idx];
-        println!("  PDPT[{}]: flags=0x{:x}, addr=0x{:x}, USER={}",
+        println!(
+            "  PDPT[{}]: flags=0x{:x}, addr=0x{:x}, USER={}",
             pdpt_idx,
             pdpt_entry.flags().bits(),
             pdpt_entry.addr().as_u64(),
-            pdpt_entry.flags().contains(PageTableFlags::USER_ACCESSIBLE));
+            pdpt_entry.flags().contains(PageTableFlags::USER_ACCESSIBLE)
+        );
 
         if !pdpt_entry.flags().contains(PageTableFlags::PRESENT) {
             println!("  -> PDPT entry not present!");
@@ -85,12 +92,14 @@ fn dump_page_table_for_addr(addr: u64) {
         let pd_virt = (phys_offset + pd_phys) as *const PageTable;
         let pd = &*pd_virt;
         let pd_entry = &pd[pd_idx];
-        println!("  PD[{}]: flags=0x{:x}, addr=0x{:x}, USER={}, HUGE={}",
+        println!(
+            "  PD[{}]: flags=0x{:x}, addr=0x{:x}, USER={}, HUGE={}",
             pd_idx,
             pd_entry.flags().bits(),
             pd_entry.addr().as_u64(),
             pd_entry.flags().contains(PageTableFlags::USER_ACCESSIBLE),
-            pd_entry.flags().contains(PageTableFlags::HUGE_PAGE));
+            pd_entry.flags().contains(PageTableFlags::HUGE_PAGE)
+        );
 
         if !pd_entry.flags().contains(PageTableFlags::PRESENT) {
             println!("  -> PD entry not present!");
@@ -107,12 +116,14 @@ fn dump_page_table_for_addr(addr: u64) {
         let pt_virt = (phys_offset + pt_phys) as *const PageTable;
         let pt = &*pt_virt;
         let pt_entry = &pt[pt_idx];
-        println!("  PT[{}]: flags=0x{:x}, addr=0x{:x}, USER={}, NX={}",
+        println!(
+            "  PT[{}]: flags=0x{:x}, addr=0x{:x}, USER={}, NX={}",
             pt_idx,
             pt_entry.flags().bits(),
             pt_entry.addr().as_u64(),
             pt_entry.flags().contains(PageTableFlags::USER_ACCESSIBLE),
-            pt_entry.flags().contains(PageTableFlags::NO_EXECUTE));
+            pt_entry.flags().contains(PageTableFlags::NO_EXECUTE)
+        );
 
         if !pt_entry.flags().contains(PageTableFlags::PRESENT) {
             println!("  -> PT entry not present!");
@@ -132,6 +143,20 @@ fn dump_page_table_for_addr(addr: u64) {
 #[repr(C, align(8))]
 struct AlignedElfData<const N: usize>([u8; N]);
 
+/// Embedded Ring 3 test program (shell.elf) with proper alignment
+///
+/// This is a minimal interactive shell that demonstrates:
+/// - Keyboard input via sys_read
+/// - SYSCALL instruction from Ring 3
+/// - sys_write (fd 1, stdout)
+/// - sys_getpid, sys_getppid
+/// - sys_exit
+///
+/// Built-in commands: help, echo, pid, ppid, clear, exit
+#[cfg(feature = "shell")]
+static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("shell.elf").len() }> =
+    AlignedElfData(*include_bytes!("shell.elf"));
+
 /// Embedded Ring 3 test program (hello.elf) with proper alignment
 ///
 /// This is a minimal user-space program that tests:
@@ -139,13 +164,19 @@ struct AlignedElfData<const N: usize>([u8; N]);
 /// - sys_write (fd 1, stdout)
 /// - sys_getpid
 /// - sys_exit
-static HELLO_ELF_ALIGNED: AlignedElfData<{include_bytes!("hello.elf").len()}> =
+#[cfg(not(feature = "shell"))]
+static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("hello.elf").len() }> =
     AlignedElfData(*include_bytes!("hello.elf"));
 
 /// Get aligned reference to the ELF data
-fn hello_elf() -> &'static [u8] {
-    &HELLO_ELF_ALIGNED.0
+fn user_elf() -> &'static [u8] {
+    &USER_ELF_ALIGNED.0
 }
+
+#[cfg(feature = "shell")]
+const PROCESS_NAME: &str = "shell";
+#[cfg(not(feature = "shell"))]
+const PROCESS_NAME: &str = "hello";
 
 /// Run the Ring 3 test
 ///
@@ -158,7 +189,7 @@ fn hello_elf() -> &'static [u8] {
 /// Returns true if the test setup succeeded (actual execution is asynchronous).
 pub fn run_usermode_test() -> bool {
     println!("\n=== Ring 3 Execution Test ===\n");
-    println!("Embedded ELF size: {} bytes", hello_elf().len());
+    println!("Embedded ELF size: {} bytes", user_elf().len());
 
     // Save current CR3 so we can restore it after loading the ELF
     let (saved_cr3_frame, _) = Cr3::read();
@@ -168,7 +199,7 @@ pub fn run_usermode_test() -> bool {
     println!("[1/4] Creating user process...");
     // create_process(name: String, ppid: ProcessId, priority: Priority) -> Result<ProcessId, ProcessCreateError>
     // ppid = 0 means init process is parent, priority = 50 (default)
-    let pid = match create_process("hello".to_string(), 0, 50) {
+    let pid = match create_process(PROCESS_NAME.to_string(), 0, 50) {
         Ok(pid) => pid,
         Err(e) => {
             println!("      ✗ Failed to create process: {:?}", e);
@@ -194,7 +225,7 @@ pub fn run_usermode_test() -> bool {
     println!("[3/4] Loading ELF binary...");
 
     // Get reference to aligned ELF data
-    let elf_data = hello_elf();
+    let elf_data = user_elf();
 
     // Switch to user address space for ELF loading
     kernel_core::process::activate_memory_space(memory_space);
@@ -304,15 +335,14 @@ pub unsafe fn test_direct_ring3_jump() -> ! {
     println!("WARNING: This test will not return!\n");
 
     // Create address space
-    let (_pml4_frame, memory_space) = create_fresh_address_space()
-        .expect("Failed to create address space");
+    let (_pml4_frame, memory_space) =
+        create_fresh_address_space().expect("Failed to create address space");
 
     // Switch to new address space
     kernel_core::process::activate_memory_space(memory_space);
 
     // Load ELF
-    let load_result = load_elf(hello_elf())
-        .expect("Failed to load ELF");
+    let load_result = load_elf(user_elf()).expect("Failed to load ELF");
 
     println!("Jumping to Ring 3...");
     println!("  Entry: 0x{:x}", load_result.entry);

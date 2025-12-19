@@ -21,9 +21,9 @@ use core::convert::TryFrom;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::RwLock;
 
-use kernel_core::{FileOps, current_credentials};
 use crate::traits::{FileHandle, FileSystem, Inode};
 use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
+use kernel_core::{current_credentials, FileOps};
 
 /// Global filesystem ID counter
 static NEXT_FS_ID: AtomicU64 = AtomicU64::new(100);
@@ -72,11 +72,9 @@ fn quota_try_alloc(bytes: usize) -> bool {
 /// Release bytes back to the global quota
 fn quota_release(bytes: usize) {
     // Use fetch_update for atomic saturating subtraction to avoid race conditions
-    let _ = TOTAL_BYTES_USED.fetch_update(
-        Ordering::SeqCst,
-        Ordering::SeqCst,
-        |current| Some(current.saturating_sub(bytes)),
-    );
+    let _ = TOTAL_BYTES_USED.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        Some(current.saturating_sub(bytes))
+    });
 }
 
 /// Get current total bytes used by ramfs
@@ -125,7 +123,9 @@ enum NodeKind {
     /// Regular file with data buffer
     File { data: RwLock<Vec<u8>> },
     /// Directory with child entries
-    Dir { entries: RwLock<BTreeMap<String, Arc<RamFsInode>>> },
+    Dir {
+        entries: RwLock<BTreeMap<String, Arc<RamFsInode>>>,
+    },
 }
 
 /// RAM filesystem inode
@@ -185,13 +185,7 @@ impl RamFsInode {
     /// Look up a child entry in directory
     fn lookup_child(&self, name: &str) -> Result<Arc<RamFsInode>, FsError> {
         match &self.kind {
-            NodeKind::Dir { entries } => {
-                entries
-                    .read()
-                    .get(name)
-                    .cloned()
-                    .ok_or(FsError::NotFound)
-            }
+            NodeKind::Dir { entries } => entries.read().get(name).cloned().ok_or(FsError::NotFound),
             NodeKind::File { .. } => Err(FsError::NotDir),
         }
     }
@@ -345,37 +339,46 @@ impl Inode for RamFsInode {
 
                 // Handle "." and ".." at offsets 0 and 1
                 if offset == 0 {
-                    return Ok(Some((1, DirEntry {
-                        name: ".".to_string(),
-                        ino: self.ino,
-                        file_type: FileType::Directory,
-                    })));
+                    return Ok(Some((
+                        1,
+                        DirEntry {
+                            name: ".".to_string(),
+                            ino: self.ino,
+                            file_type: FileType::Directory,
+                        },
+                    )));
                 }
                 if offset == 1 {
                     // ".." points to self for root, otherwise would need parent reference
-                    return Ok(Some((2, DirEntry {
-                        name: "..".to_string(),
-                        ino: self.ino,
-                        file_type: FileType::Directory,
-                    })));
+                    return Ok(Some((
+                        2,
+                        DirEntry {
+                            name: "..".to_string(),
+                            ino: self.ino,
+                            file_type: FileType::Directory,
+                        },
+                    )));
                 }
 
                 // Real entries start at offset 2
                 let real_offset = offset - 2;
                 let entry = entries.iter().nth(real_offset);
 
-                    match entry {
+                match entry {
                     Some((name, inode)) => {
                         let file_type = if inode.is_dir() {
                             FileType::Directory
                         } else {
                             FileType::Regular
                         };
-                        Ok(Some((offset + 1, DirEntry {
-                            name: name.clone(),
-                            ino: inode.ino,
-                            file_type,
-                        })))
+                        Ok(Some((
+                            offset + 1,
+                            DirEntry {
+                                name: name.clone(),
+                                ino: inode.ino,
+                                file_type,
+                            },
+                        )))
                     }
                     None => Ok(None),
                 }
@@ -415,8 +418,7 @@ impl Inode for RamFsInode {
                 let current_len = data.len();
 
                 // Expand file if needed (with checked addition)
-                let required_len = offset.checked_add(data_in.len())
-                    .ok_or(FsError::Invalid)?;
+                let required_len = offset.checked_add(data_in.len()).ok_or(FsError::Invalid)?;
 
                 // V-3 fix: Enforce maximum file size to prevent memory exhaustion DoS
                 if required_len > MAX_FILE_SIZE {
@@ -586,7 +588,7 @@ impl FileSystem for RamFs {
         let final_perm = if mode.is_dir() {
             let parent_meta = parent.meta.read();
             if parent_meta.mode.perm & 0o2000 != 0 {
-                mode.perm | 0o2000  // Propagate setgid bit to subdirectories
+                mode.perm | 0o2000 // Propagate setgid bit to subdirectories
             } else {
                 mode.perm
             }

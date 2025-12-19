@@ -14,24 +14,14 @@
 
 use mm::memory::FrameAllocator;
 use mm::page_table::{
-    self,
-    MapError,
-    APIC_MMIO_SIZE,
-    APIC_PHYS_ADDR,
-    VGA_PHYS_ADDR,
-    ensure_pte_range,
-    map_mmio,
-    mmio_flags,
-    recursive_pdpt,
-    recursive_pd,
-    recursive_pt,
+    self, ensure_pte_range, map_mmio, mmio_flags, recursive_pd, recursive_pdpt, recursive_pt,
+    MapError, APIC_MMIO_SIZE, APIC_PHYS_ADDR, VGA_PHYS_ADDR,
 };
 use x86_64::{
-    PhysAddr,
-    VirtAddr,
     instructions::tlb,
-    structures::paging::{PageTable, PageTableFlags},
     structures::paging::page_table::PageTableEntry,
+    structures::paging::{PageTable, PageTableFlags},
+    PhysAddr, VirtAddr,
 };
 
 /// Strategy for handling the identity mapping after boot
@@ -162,7 +152,9 @@ pub fn cleanup_identity_map(
                     // Verify PML4[510] recursive entry is set
                     let pml4_510 = &pml4[510];
                     if pml4_510.is_unused() {
-                        return Err(HardeningError::PageTableMissing("PML4[510] recursive entry missing"));
+                        return Err(HardeningError::PageTableMissing(
+                            "PML4[510] recursive entry missing",
+                        ));
                     }
 
                     let pdpt = recursive_pdpt(0);
@@ -203,7 +195,9 @@ pub fn cleanup_identity_map(
                     }
 
                     tlb::flush_all();
-                    Ok(CleanupOutcome::ReadOnlyUpdated { updated_entries: updated })
+                    Ok(CleanupOutcome::ReadOnlyUpdated {
+                        updated_entries: updated,
+                    })
                 }
 
                 IdentityCleanupStrategy::Skip => Ok(CleanupOutcome::Skipped),
@@ -242,22 +236,18 @@ pub fn enforce_nx_for_kernel(
     };
 
     // Get kernel section boundaries from linker symbols
-    let text = SectionRange::new(
-        unsafe { &text_start as *const u8 as u64 },
-        unsafe { &text_end as *const u8 as u64 },
-    );
-    let rodata = SectionRange::new(
-        unsafe { &rodata_start as *const u8 as u64 },
-        unsafe { &rodata_end as *const u8 as u64 },
-    );
-    let data = SectionRange::new(
-        unsafe { &data_start as *const u8 as u64 },
-        unsafe { &data_end as *const u8 as u64 },
-    );
-    let bss = SectionRange::new(
-        unsafe { &bss_start as *const u8 as u64 },
-        unsafe { &bss_end as *const u8 as u64 },
-    );
+    let text = SectionRange::new(unsafe { &text_start as *const u8 as u64 }, unsafe {
+        &text_end as *const u8 as u64
+    });
+    let rodata = SectionRange::new(unsafe { &rodata_start as *const u8 as u64 }, unsafe {
+        &rodata_end as *const u8 as u64
+    });
+    let data = SectionRange::new(unsafe { &data_start as *const u8 as u64 }, unsafe {
+        &data_end as *const u8 as u64
+    });
+    let bss = SectionRange::new(unsafe { &bss_start as *const u8 as u64 }, unsafe {
+        &bss_end as *const u8 as u64
+    });
 
     // Demote huge pages to 4KB granularity across all sections
     unsafe {
@@ -290,7 +280,7 @@ pub fn enforce_nx_for_kernel(
             // Check if this is a huge page
             if pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
                 return Err(HardeningError::UnsafeOperation(
-                    "Cannot split 1GB huge page for kernel"
+                    "Cannot split 1GB huge page for kernel",
                 ));
             }
 
@@ -731,9 +721,9 @@ fn align_up(addr: u64) -> u64 {
 fn map_error_to_hardening(err: MapError) -> HardeningError {
     match err {
         MapError::FrameAllocationFailed => HardeningError::FrameAllocFailed,
-        MapError::ParentEntryHugePage => HardeningError::UnsafeOperation(
-            "Cannot demote huge page at requested granularity",
-        ),
+        MapError::ParentEntryHugePage => {
+            HardeningError::UnsafeOperation("Cannot demote huge page at requested granularity")
+        }
         MapError::PageAlreadyMapped => HardeningError::InconsistentTopology,
     }
 }

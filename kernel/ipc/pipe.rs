@@ -187,9 +187,19 @@ impl Pipe {
     /// * `Ok(n)` - 成功读取n字节（0表示EOF）
     /// * `Err(WouldBlock)` - 非阻塞模式下缓冲区为空
     /// * `Err(Closed)` - 管道已关闭
+    ///
+    /// # Z-11 fix: Lost-wakeup race condition
+    ///
+    /// 使用 prepare_to_wait/finish_wait 模式防止丢失唤醒：
+    /// 1. 在持有锁时调用 prepare_to_wait 加入等待队列
+    /// 2. 释放锁
+    /// 3. 调用 finish_wait 实际阻塞
+    ///
+    /// 这样即使写者在释放锁后立即唤醒，由于读者已在队列中，
+    /// 唤醒信号不会丢失。
     pub fn read(&self, dst: &mut [u8], flags: PipeFlags) -> Result<usize, PipeError> {
         loop {
-            {
+            let should_wait = {
                 let mut inner = self.inner.lock();
 
                 // 有数据可读
@@ -210,10 +220,18 @@ impl Pipe {
                 if flags.nonblock {
                     return Err(PipeError::WouldBlock);
                 }
-            } // 释放锁
 
-            // 阻塞等待数据
-            self.read_wait.wait();
+                // Z-11 fix: 在持有锁时加入等待队列
+                // 这样即使写者在我们释放锁后立即写入并唤醒，
+                // 我们已经在队列中，不会错过唤醒信号
+                self.read_wait.prepare_to_wait()
+            }; // 释放锁
+
+            // 如果成功加入等待队列，实际阻塞
+            if should_wait {
+                self.read_wait.finish_wait();
+            }
+            // 被唤醒后循环回去重新检查条件
         }
     }
 
@@ -227,11 +245,15 @@ impl Pipe {
     /// * `Ok(n)` - 成功写入n字节
     /// * `Err(BrokenPipe)` - 读端已关闭
     /// * `Err(WouldBlock)` - 非阻塞模式下缓冲区已满
+    ///
+    /// # Z-11 fix: Lost-wakeup race condition
+    ///
+    /// 使用 prepare_to_wait/finish_wait 模式防止丢失唤醒。
     pub fn write(&self, src: &[u8], flags: PipeFlags) -> Result<usize, PipeError> {
         let mut total_written = 0;
 
         while total_written < src.len() {
-            {
+            let should_wait = {
                 let mut inner = self.inner.lock();
 
                 // 检查读端是否全部关闭
@@ -262,10 +284,15 @@ impl Pipe {
                     }
                     return Err(PipeError::WouldBlock);
                 }
-            } // 释放锁
 
-            // 阻塞等待空间
-            self.write_wait.wait();
+                // Z-11 fix: 在持有锁时加入等待队列
+                self.write_wait.prepare_to_wait()
+            }; // 释放锁
+
+            // 如果成功加入等待队列，实际阻塞
+            if should_wait {
+                self.write_wait.finish_wait();
+            }
         }
 
         Ok(total_written)

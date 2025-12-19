@@ -56,7 +56,10 @@ pub struct FileMode {
 impl FileMode {
     /// Create a new file mode
     pub const fn new(file_type: FileType, perm: u16) -> Self {
-        Self { file_type, perm: perm & 0o7777 }
+        Self {
+            file_type,
+            perm: perm & 0o7777,
+        }
     }
 
     /// Create mode for regular file with given permissions
@@ -220,23 +223,23 @@ impl FsError {
     /// Convert to syscall error number (negative errno)
     pub fn to_errno(self) -> i64 {
         match self {
-            FsError::NotFound => -2,    // ENOENT
-            FsError::NotDir => -20,     // ENOTDIR
-            FsError::IsDir => -21,      // EISDIR
-            FsError::Exists => -17,     // EEXIST
+            FsError::NotFound => -2,      // ENOENT
+            FsError::NotDir => -20,       // ENOTDIR
+            FsError::IsDir => -21,        // EISDIR
+            FsError::Exists => -17,       // EEXIST
             FsError::NotSupported => -38, // ENOSYS
-            FsError::Io => -5,          // EIO
-            FsError::Invalid => -22,    // EINVAL
-            FsError::NoMem => -12,      // ENOMEM
-            FsError::Pipe => -32,       // EPIPE
-            FsError::BadFd => -9,       // EBADF
-            FsError::PermDenied => -13, // EACCES
-            FsError::ReadOnly => -30,   // EROFS
-            FsError::NoSpace => -28,    // ENOSPC
-            FsError::NameTooLong => -36, // ENAMETOOLONG
-            FsError::NotEmpty => -39,   // ENOTEMPTY
-            FsError::CrossDev => -18,   // EXDEV
-            FsError::Seek => -29,       // ESPIPE
+            FsError::Io => -5,            // EIO
+            FsError::Invalid => -22,      // EINVAL
+            FsError::NoMem => -12,        // ENOMEM
+            FsError::Pipe => -32,         // EPIPE
+            FsError::BadFd => -9,         // EBADF
+            FsError::PermDenied => -13,   // EACCES
+            FsError::ReadOnly => -30,     // EROFS
+            FsError::NoSpace => -28,      // ENOSPC
+            FsError::NameTooLong => -36,  // ENAMETOOLONG
+            FsError::NotEmpty => -39,     // ENOTEMPTY
+            FsError::CrossDev => -18,     // EXDEV
+            FsError::Seek => -29,         // ESPIPE
         }
     }
 }

@@ -78,8 +78,7 @@ impl MitigationStatus {
     /// speculative execution attacks.
     pub fn hardened(&self) -> bool {
         // Branch prediction protection
-        let branch_protected =
-            self.ibrs_enabled || self.stibp_enabled || self.retpoline_compiler;
+        let branch_protected = self.ibrs_enabled || self.stibp_enabled || self.retpoline_compiler;
 
         // If retpoline is required but not compiled in, and no hardware fix
         if self.retpoline_required && !self.retpoline_compiler && !self.ibrs_enabled {
@@ -131,20 +130,20 @@ const IA32_PRED_CMD: u32 = 0x49;
 const IA32_ARCH_CAPABILITIES: u32 = 0x10A;
 
 // IA32_SPEC_CTRL bits
-const SPEC_CTRL_IBRS: u64 = 1 << 0;  // Indirect Branch Restricted Speculation
+const SPEC_CTRL_IBRS: u64 = 1 << 0; // Indirect Branch Restricted Speculation
 const SPEC_CTRL_STIBP: u64 = 1 << 1; // Single Thread Indirect Branch Predictors
-const SPEC_CTRL_SSBD: u64 = 1 << 2;  // Speculative Store Bypass Disable
+const SPEC_CTRL_SSBD: u64 = 1 << 2; // Speculative Store Bypass Disable
 
 // IA32_PRED_CMD bits
-const PRED_CMD_IBPB: u64 = 1 << 0;   // Indirect Branch Predictor Barrier
+const PRED_CMD_IBPB: u64 = 1 << 0; // Indirect Branch Predictor Barrier
 
 // IA32_ARCH_CAPABILITIES bits
-const ARCH_CAP_RDCL_NO: u64 = 1 << 0;     // Not susceptible to Meltdown
-const ARCH_CAP_IBRS_ALL: u64 = 1 << 1;    // IBRS covers all predictors
-const ARCH_CAP_RSBA: u64 = 1 << 2;        // RSB Alternate (needs mitigation)
-const ARCH_CAP_SKIP_L1DFL: u64 = 1 << 3;  // Skip L1D flush on VMENTRY
-const ARCH_CAP_SSB_NO: u64 = 1 << 4;      // Not susceptible to SSB
-const ARCH_CAP_MDS_NO: u64 = 1 << 5;      // Not susceptible to MDS
+const ARCH_CAP_RDCL_NO: u64 = 1 << 0; // Not susceptible to Meltdown
+const ARCH_CAP_IBRS_ALL: u64 = 1 << 1; // IBRS covers all predictors
+const ARCH_CAP_RSBA: u64 = 1 << 2; // RSB Alternate (needs mitigation)
+const ARCH_CAP_SKIP_L1DFL: u64 = 1 << 3; // Skip L1D flush on VMENTRY
+const ARCH_CAP_SSB_NO: u64 = 1 << 4; // Not susceptible to SSB
+const ARCH_CAP_MDS_NO: u64 = 1 << 5; // Not susceptible to MDS
 
 // ============================================================================
 // Detection Functions
@@ -198,7 +197,7 @@ pub fn get_vulnerabilities() -> VulnerabilityInfo {
 
     let mut info = VulnerabilityInfo {
         meltdown_susceptible: true,
-        spectre_v1_susceptible: true,  // Always assume susceptible
+        spectre_v1_susceptible: true, // Always assume susceptible
         spectre_v2_susceptible: true,
         ssb_susceptible: true,
         mds_susceptible: true,

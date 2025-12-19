@@ -10,7 +10,7 @@
 use lazy_static::lazy_static;
 use x86_64::{
     instructions::tables::load_tss,
-    registers::segmentation::{CS, DS, SS, Segment},
+    registers::segmentation::{Segment, CS, DS, SS},
     structures::{
         gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector},
         tss::TaskStateSegment,

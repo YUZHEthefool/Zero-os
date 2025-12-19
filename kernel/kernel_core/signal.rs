@@ -41,27 +41,27 @@ pub struct Signal(u8);
 
 impl Signal {
     // Standard POSIX signals
-    pub const SIGHUP: Signal = Signal(1);    // Hangup
-    pub const SIGINT: Signal = Signal(2);    // Interrupt (Ctrl+C)
-    pub const SIGQUIT: Signal = Signal(3);   // Quit (Ctrl+\)
-    pub const SIGILL: Signal = Signal(4);    // Illegal instruction
-    pub const SIGTRAP: Signal = Signal(5);   // Trace/breakpoint trap
-    pub const SIGABRT: Signal = Signal(6);   // Abort
-    pub const SIGBUS: Signal = Signal(7);    // Bus error
-    pub const SIGFPE: Signal = Signal(8);    // Floating-point exception
-    pub const SIGKILL: Signal = Signal(9);   // Kill (cannot be caught/ignored)
-    pub const SIGUSR1: Signal = Signal(10);  // User-defined signal 1
-    pub const SIGSEGV: Signal = Signal(11);  // Segmentation fault
-    pub const SIGUSR2: Signal = Signal(12);  // User-defined signal 2
-    pub const SIGPIPE: Signal = Signal(13);  // Broken pipe
-    pub const SIGALRM: Signal = Signal(14);  // Alarm clock
-    pub const SIGTERM: Signal = Signal(15);  // Termination
-    pub const SIGCHLD: Signal = Signal(17);  // Child status changed
-    pub const SIGCONT: Signal = Signal(18);  // Continue if stopped
-    pub const SIGSTOP: Signal = Signal(19);  // Stop (cannot be caught/ignored)
-    pub const SIGTSTP: Signal = Signal(20);  // Stop typed at terminal
-    pub const SIGTTIN: Signal = Signal(21);  // Background read from tty
-    pub const SIGTTOU: Signal = Signal(22);  // Background write to tty
+    pub const SIGHUP: Signal = Signal(1); // Hangup
+    pub const SIGINT: Signal = Signal(2); // Interrupt (Ctrl+C)
+    pub const SIGQUIT: Signal = Signal(3); // Quit (Ctrl+\)
+    pub const SIGILL: Signal = Signal(4); // Illegal instruction
+    pub const SIGTRAP: Signal = Signal(5); // Trace/breakpoint trap
+    pub const SIGABRT: Signal = Signal(6); // Abort
+    pub const SIGBUS: Signal = Signal(7); // Bus error
+    pub const SIGFPE: Signal = Signal(8); // Floating-point exception
+    pub const SIGKILL: Signal = Signal(9); // Kill (cannot be caught/ignored)
+    pub const SIGUSR1: Signal = Signal(10); // User-defined signal 1
+    pub const SIGSEGV: Signal = Signal(11); // Segmentation fault
+    pub const SIGUSR2: Signal = Signal(12); // User-defined signal 2
+    pub const SIGPIPE: Signal = Signal(13); // Broken pipe
+    pub const SIGALRM: Signal = Signal(14); // Alarm clock
+    pub const SIGTERM: Signal = Signal(15); // Termination
+    pub const SIGCHLD: Signal = Signal(17); // Child status changed
+    pub const SIGCONT: Signal = Signal(18); // Continue if stopped
+    pub const SIGSTOP: Signal = Signal(19); // Stop (cannot be caught/ignored)
+    pub const SIGTSTP: Signal = Signal(20); // Stop typed at terminal
+    pub const SIGTTIN: Signal = Signal(21); // Background read from tty
+    pub const SIGTTOU: Signal = Signal(22); // Background write to tty
 
     /// Create signal from raw signal number
     pub fn from_raw(raw: i32) -> Result<Self, SignalError> {
@@ -251,38 +251,44 @@ pub fn default_action(signal: Signal) -> SignalAction {
 ///
 /// The action taken on success, or error
 ///
-/// # Permission Model (temporary until UID/capability system)
+/// # Permission Model (Z-9 fix: POSIX-compliant UID/EUID checks)
 ///
-/// - Process can send signals to itself
-/// - Parent can send signals to child
-/// - Child can send signals to parent
-/// - PID 1 is protected (only self can signal)
+/// POSIX permission rules for kill():
+/// - Root (euid == 0) can signal any process
+/// - Process can signal itself
+/// - sender.uid == target.uid
+/// - sender.euid == target.uid
+/// - PID 1 (init) is additionally protected: only self can signal
 pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, SignalError> {
     // 注意：我们需要调用调度器的 resume_stopped，它在 sched crate 中
     // 由于循环依赖的限制，我们通过回调机制实现
 
-    // 【安全修复 S-4】权限检查（深度防御）
-    // 即使 sys_kill 已检查，内部调用也需要验证
-    if let Some(sender) = process::current_pid() {
-        // PID 1 保护
-        if pid == 1 && sender != 1 {
+    // 【安全修复 Z-9】POSIX 权限检查（深度防御）
+    // 使用 UID/EUID 而非仅父子关系
+    if let Some(sender_pid) = process::current_pid() {
+        // PID 1 (init) 保护：只有 init 自己可以向自己发信号
+        if pid == 1 && sender_pid != 1 {
             return Err(SignalError::PermissionDenied);
         }
 
-        // 非自己的进程需要检查父子关系
-        if sender != pid {
-            let sender_ppid = process::get_process(sender)
-                .map(|p| p.lock().ppid);
+        // 非自己的进程需要进行 POSIX 权限检查
+        if sender_pid != pid {
+            // 获取发送者凭证
+            let sender_creds = process::current_credentials().ok_or(SignalError::NoSuchProcess)?;
 
+            // 获取目标进程凭证
             let target_arc = process::get_process(pid).ok_or(SignalError::NoSuchProcess)?;
-            let target_ppid = target_arc.lock().ppid;
+            let target_uid = target_arc.lock().uid;
 
-            // 父进程向子进程
-            let is_parent_to_child = target_ppid == sender;
-            // 子进程向父进程
-            let is_child_to_parent = sender_ppid == Some(pid);
+            // POSIX 权限检查：
+            // 1. Root (euid == 0) 可以发信号给任何进程
+            // 2. sender.uid == target.uid
+            // 3. sender.euid == target.uid
+            let has_permission = sender_creds.euid == 0
+                || sender_creds.uid == target_uid
+                || sender_creds.euid == target_uid;
 
-            if !is_parent_to_child && !is_child_to_parent {
+            if !has_permission {
                 return Err(SignalError::PermissionDenied);
             }
         }

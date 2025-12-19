@@ -7,18 +7,21 @@
 //! All syscalls are audited with entry and exit events for security monitoring.
 //! Events include: syscall number, arguments, result, and process context.
 
+use crate::fork::PAGE_REF_COUNT;
+use crate::process::{
+    cleanup_zombie, create_process, current_pid, get_process, terminate_process, ProcessId,
+    ProcessState,
+};
+use crate::usercopy::UserAccessGuard;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use alloc::string::{String, ToString};
 use core::mem;
-use crate::fork::PAGE_REF_COUNT;
-use crate::process::{ProcessId, ProcessState, terminate_process, cleanup_zombie, create_process, current_pid, get_process};
-use crate::usercopy::UserAccessGuard;
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
 // Audit integration for syscall security monitoring
-use audit::{AuditKind, AuditOutcome, AuditSubject, AuditObject};
+use audit::{AuditKind, AuditObject, AuditOutcome, AuditSubject};
 
 /// 最大参数数量（防止恶意用户传递过多参数）
 const MAX_ARG_COUNT: usize = 256;
@@ -45,72 +48,72 @@ const MAX_RW_SIZE: usize = 1 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyscallNumber {
     // 进程管理
-    Exit = 60,          // 退出进程
-    Fork = 57,          // 创建子进程
-    Exec = 59,          // 执行程序
-    Wait = 61,          // 等待子进程
-    GetPid = 39,        // 获取进程ID
-    GetPPid = 110,      // 获取父进程ID
-    Kill = 62,          // 发送信号
-    
+    Exit = 60,     // 退出进程
+    Fork = 57,     // 创建子进程
+    Exec = 59,     // 执行程序
+    Wait = 61,     // 等待子进程
+    GetPid = 39,   // 获取进程ID
+    GetPPid = 110, // 获取父进程ID
+    Kill = 62,     // 发送信号
+
     // 文件I/O
-    Read = 0,           // 读取文件
-    Write = 1,          // 写入文件
-    Open = 2,           // 打开文件
-    Close = 3,          // 关闭文件
-    Stat = 4,           // 获取文件状态
-    Lseek = 8,          // 移动文件指针
-    
+    Read = 0,  // 读取文件
+    Write = 1, // 写入文件
+    Open = 2,  // 打开文件
+    Close = 3, // 关闭文件
+    Stat = 4,  // 获取文件状态
+    Lseek = 8, // 移动文件指针
+
     // 内存管理
-    Brk = 12,           // 改变数据段大小
-    Mmap = 9,           // 内存映射
-    Munmap = 11,        // 取消内存映射
-    Mprotect = 10,      // 设置内存保护
-    
+    Brk = 12,      // 改变数据段大小
+    Mmap = 9,      // 内存映射
+    Munmap = 11,   // 取消内存映射
+    Mprotect = 10, // 设置内存保护
+
     // 进程间通信
-    Pipe = 22,          // 创建管道
-    Dup = 32,           // 复制文件描述符
-    Dup2 = 33,          // 复制文件描述符到指定位置
-    
+    Pipe = 22, // 创建管道
+    Dup = 32,  // 复制文件描述符
+    Dup2 = 33, // 复制文件描述符到指定位置
+
     // 时间相关
-    Time = 201,         // 获取时间
-    Sleep = 35,         // 睡眠
-    Futex = 202,        // 快速用户空间互斥锁
+    Time = 201,  // 获取时间
+    Sleep = 35,  // 睡眠
+    Futex = 202, // 快速用户空间互斥锁
 
     // 其他
-    Yield = 24,         // 主动让出CPU
-    GetCwd = 79,        // 获取当前工作目录
-    Chdir = 80,         // 改变当前工作目录
+    Yield = 24,  // 主动让出CPU
+    GetCwd = 79, // 获取当前工作目录
+    Chdir = 80,  // 改变当前工作目录
 }
 
 /// 系统调用错误码
 #[repr(i64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyscallError {
-    Success = 0,        // 成功
-    EPERM = -1,         // 操作不允许
-    ENOENT = -2,        // 文件或目录不存在
-    ESRCH = -3,         // 进程不存在
-    EINTR = -4,         // 系统调用被中断
-    EIO = -5,           // I/O错误
-    ENXIO = -6,         // 设备不存在
-    E2BIG = -7,         // 参数列表过长
-    ENOEXEC = -8,       // 执行格式错误
-    EBADF = -9,         // 文件描述符错误
-    ECHILD = -10,       // 没有子进程
-    EAGAIN = -11,       // 资源暂时不可用
-    ENOMEM = -12,       // 内存不足
-    EACCES = -13,       // 权限不足
-    EFAULT = -14,       // 地址错误
-    EBUSY = -16,        // 设备或资源忙
-    EEXIST = -17,       // 文件已存在
-    ENOTDIR = -20,      // 不是目录
-    EISDIR = -21,       // 是目录
-    EINVAL = -22,       // 无效参数
-    ENFILE = -23,       // 系统打开文件过多
-    EMFILE = -24,       // 进程打开文件过多
-    EPIPE = -32,        // 管道破裂
-    ENOSYS = -38,       // 功能未实现
+    Success = 0,   // 成功
+    EPERM = -1,    // 操作不允许
+    ENOENT = -2,   // 文件或目录不存在
+    ESRCH = -3,    // 进程不存在
+    EINTR = -4,    // 系统调用被中断
+    EIO = -5,      // I/O错误
+    ENXIO = -6,    // 设备不存在
+    E2BIG = -7,    // 参数列表过长
+    ENOEXEC = -8,  // 执行格式错误
+    EBADF = -9,    // 文件描述符错误
+    ECHILD = -10,  // 没有子进程
+    EAGAIN = -11,  // 资源暂时不可用
+    ENOMEM = -12,  // 内存不足
+    EACCES = -13,  // 权限不足
+    EFAULT = -14,  // 地址错误
+    EBUSY = -16,   // 设备或资源忙
+    EEXIST = -17,  // 文件已存在
+    ENOTDIR = -20, // 不是目录
+    EISDIR = -21,  // 是目录
+    EINVAL = -22,  // 无效参数
+    ENFILE = -23,  // 系统打开文件过多
+    EMFILE = -24,  // 进程打开文件过多
+    EPIPE = -32,   // 管道破裂
+    ENOSYS = -38,  // 功能未实现
 }
 
 impl SyscallError {
@@ -155,7 +158,8 @@ pub type FutexCallback = fn(usize, i32, u32, u32) -> Result<usize, SyscallError>
 /// 由 vfs 模块注册，处理文件打开
 /// 参数: (path, flags, mode) -> FileOps box 或错误
 /// 返回的 FileOps 由 syscall 模块存入 fd_table
-pub type VfsOpenCallback = fn(&str, u32, u32) -> Result<crate::process::FileDescriptor, SyscallError>;
+pub type VfsOpenCallback =
+    fn(&str, u32, u32) -> Result<crate::process::FileDescriptor, SyscallError>;
 
 /// VFS 获取文件状态回调类型
 ///
@@ -338,35 +342,38 @@ fn verify_user_memory(ptr: *const u8, len: usize, require_write: bool) -> Result
 
     // 遍历页表验证映射
     unsafe {
-        mm::page_table::with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
-            let mut page_addr = start & !0xfff; // 对齐到页边界
-            while page_addr < end {
-                // 查询页表获取映射信息和标志
-                let (_, flags) = manager
-                    .translate_with_flags(VirtAddr::new(page_addr as u64))
-                    .ok_or(SyscallError::EFAULT)?;
+        mm::page_table::with_current_manager(
+            VirtAddr::new(0),
+            |manager| -> Result<(), SyscallError> {
+                let mut page_addr = start & !0xfff; // 对齐到页边界
+                while page_addr < end {
+                    // 查询页表获取映射信息和标志
+                    let (_, flags) = manager
+                        .translate_with_flags(VirtAddr::new(page_addr as u64))
+                        .ok_or(SyscallError::EFAULT)?;
 
-                // 检查页是否存在且用户可访问
-                if !flags.contains(PageTableFlags::PRESENT)
-                    || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
-                {
-                    return Err(SyscallError::EFAULT);
+                    // 检查页是否存在且用户可访问
+                    if !flags.contains(PageTableFlags::PRESENT)
+                        || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+                    {
+                        return Err(SyscallError::EFAULT);
+                    }
+
+                    // 如果需要写入权限，检查 WRITABLE 或 BIT_9 (COW) 标志
+                    // COW 页面标记为只读但有 BIT_9，写入时会触发 #PF 并由 COW 处理器创建可写副本
+                    // 真正的只读页面（如代码段）没有这两个标志，应该拒绝写入
+                    if require_write
+                        && !flags.contains(PageTableFlags::WRITABLE)
+                        && !flags.contains(PageTableFlags::BIT_9)
+                    {
+                        return Err(SyscallError::EFAULT);
+                    }
+
+                    page_addr = page_addr.checked_add(0x1000).ok_or(SyscallError::EFAULT)?;
                 }
-
-                // 如果需要写入权限，检查 WRITABLE 或 BIT_9 (COW) 标志
-                // COW 页面标记为只读但有 BIT_9，写入时会触发 #PF 并由 COW 处理器创建可写副本
-                // 真正的只读页面（如代码段）没有这两个标志，应该拒绝写入
-                if require_write
-                    && !flags.contains(PageTableFlags::WRITABLE)
-                    && !flags.contains(PageTableFlags::BIT_9)
-                {
-                    return Err(SyscallError::EFAULT);
-                }
-
-                page_addr = page_addr.checked_add(0x1000).ok_or(SyscallError::EFAULT)?;
-            }
-            Ok(())
-        })
+                Ok(())
+            },
+        )
     }
 }
 
@@ -390,8 +397,7 @@ fn copy_from_user(dest: &mut [u8], user_src: *const u8) -> Result<(), SyscallErr
     validate_user_ptr(user_src, dest.len())?;
 
     // 使用容错拷贝：逐字节复制，页错误时返回 EFAULT
-    crate::usercopy::copy_from_user_safe(dest, user_src)
-        .map_err(|_| SyscallError::EFAULT)
+    crate::usercopy::copy_from_user_safe(dest, user_src).map_err(|_| SyscallError::EFAULT)
 }
 
 /// 将内核缓冲区的数据安全复制到用户态缓冲区
@@ -417,8 +423,7 @@ fn copy_to_user(user_dst: *mut u8, src: &[u8]) -> Result<(), SyscallError> {
 
     // 使用容错拷贝：逐字节复制，页错误时返回 EFAULT
     // COW 页面会在 usercopy 过程中触发 #PF，由 COW 处理器处理
-    crate::usercopy::copy_to_user_safe(user_dst, src)
-        .map_err(|_| SyscallError::EFAULT)
+    crate::usercopy::copy_to_user_safe(user_dst, src).map_err(|_| SyscallError::EFAULT)
 }
 
 /// 从用户空间复制以 '\0' 结尾的 C 字符串到内核缓冲区
@@ -473,9 +478,7 @@ fn copy_user_str_array(list_ptr: *const *const u8) -> Result<Vec<Vec<u8>>, Sysca
 
     for idx in 0..MAX_ARG_COUNT {
         // 计算当前条目地址
-        let entry_addr = base
-            .checked_add(idx * word)
-            .ok_or(SyscallError::EFAULT)?;
+        let entry_addr = base.checked_add(idx * word).ok_or(SyscallError::EFAULT)?;
 
         // V-2 fix: 使用容错拷贝读取指针值
         // 这确保了即使用户在我们读取时取消映射，也不会导致内核 panic
@@ -485,13 +488,13 @@ fn copy_user_str_array(list_ptr: *const *const u8) -> Result<Vec<Vec<u8>>, Sysca
         let entry = usize::from_ne_bytes(raw_ptr) as *const u8;
 
         if entry.is_null() {
-            break;  // NULL 终止
+            break; // NULL 终止
         }
 
         // 复制字符串内容（copy_user_cstring 现在也使用容错拷贝）
         let s = copy_user_cstring(entry)?;
         total = total
-            .checked_add(s.len() + 1)  // +1 for trailing '\0'
+            .checked_add(s.len() + 1) // +1 for trailing '\0'
             .ok_or(SyscallError::E2BIG)?;
         if total > MAX_ARG_TOTAL {
             return Err(SyscallError::E2BIG);
@@ -561,7 +564,12 @@ pub fn syscall_dispatcher(
         // 进程管理
         60 => sys_exit(arg0 as i32),
         57 => sys_fork(),
-        59 => sys_exec(arg0 as *const u8, arg1 as usize, arg2 as *const *const u8, arg3 as *const *const u8),
+        59 => sys_exec(
+            arg0 as *const u8,
+            arg1 as usize,
+            arg2 as *const *const u8,
+            arg3 as *const *const u8,
+        ),
         61 => sys_wait(arg0 as *mut i32),
         39 => sys_getpid(),
         110 => sys_getppid(),
@@ -578,7 +586,14 @@ pub fn syscall_dispatcher(
 
         // 内存管理
         12 => sys_brk(arg0 as usize),
-        9 => sys_mmap(arg0 as usize, arg1 as usize, arg2 as i32, arg3 as i32, arg4 as i32, arg5 as i64),
+        9 => sys_mmap(
+            arg0 as usize,
+            arg1 as usize,
+            arg2 as i32,
+            arg3 as i32,
+            arg4 as i32,
+            arg5 as i64,
+        ),
         11 => sys_munmap(arg0 as usize, arg1 as usize),
 
         // Futex
@@ -678,9 +693,11 @@ fn sys_exec(
     argv: *const *const u8,
     envp: *const *const u8,
 ) -> SyscallResult {
-    use crate::fork::create_fresh_address_space;
     use crate::elf_loader::{load_elf, USER_STACK_SIZE};
-    use crate::process::{get_process, current_pid, activate_memory_space, ProcessState, free_address_space};
+    use crate::fork::create_fresh_address_space;
+    use crate::process::{
+        activate_memory_space, current_pid, free_address_space, get_process, ProcessState,
+    };
 
     // 获取当前进程
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
@@ -691,7 +708,10 @@ fn sys_exec(
         return Err(SyscallError::EINVAL);
     }
     if image_len > MAX_EXEC_IMAGE_SIZE {
-        println!("sys_exec: ELF size {} exceeds limit {}", image_len, MAX_EXEC_IMAGE_SIZE);
+        println!(
+            "sys_exec: ELF size {} exceeds limit {}",
+            image_len, MAX_EXEC_IMAGE_SIZE
+        );
         return Err(SyscallError::E2BIG);
     }
 
@@ -705,8 +725,8 @@ fn sys_exec(
     let envp_vec = copy_user_str_array(envp)?;
 
     // 创建新的地址空间
-    let (_new_pml4_frame, new_memory_space) = create_fresh_address_space()
-        .map_err(|_| SyscallError::ENOMEM)?;
+    let (_new_pml4_frame, new_memory_space) =
+        create_fresh_address_space().map_err(|_| SyscallError::ENOMEM)?;
 
     // 保存旧地址空间以便失败时恢复或成功时释放
     let old_memory_space = {
@@ -726,7 +746,11 @@ fn sys_exec(
 
     impl ExecSpaceGuard {
         fn new(old_space: usize, new_space: usize) -> Self {
-            Self { old_space, new_space, committed: false }
+            Self {
+                old_space,
+                new_space,
+                committed: false,
+            }
         }
 
         /// Mark the exec as successful, preventing rollback on drop
@@ -785,9 +809,10 @@ fn sys_exec(
     let word = mem::size_of::<usize>();
 
     // 计算字符串总大小
-    let string_bytes: usize = argv_vec.iter()
+    let string_bytes: usize = argv_vec
+        .iter()
         .chain(envp_vec.iter())
-        .map(|s| s.len() + 1)  // +1 for '\0'
+        .map(|s| s.len() + 1) // +1 for '\0'
         .sum();
 
     // 指针区大小: argc + argv_ptrs + NULL + envp_ptrs + NULL
@@ -796,12 +821,14 @@ fn sys_exec(
 
     // 检查栈空间是否足够
     let stack_top = load_result.user_stack_top as usize;
-    let stack_base = stack_top.checked_sub(USER_STACK_SIZE).ok_or(SyscallError::EFAULT)?;
+    let stack_base = stack_top
+        .checked_sub(USER_STACK_SIZE)
+        .ok_or(SyscallError::EFAULT)?;
 
     // Allow supervisor access to user pages for stack construction when SMAP is enabled
     let _user_access = UserAccessGuard::new();
 
-    let total_needed = string_bytes + pointer_bytes + 16;  // +16 for alignment
+    let total_needed = string_bytes + pointer_bytes + 16; // +16 for alignment
     if total_needed > USER_STACK_SIZE {
         return Err(SyscallError::E2BIG);
     }
@@ -819,11 +846,11 @@ fn sys_exec(
         }
         unsafe {
             core::ptr::copy_nonoverlapping(s.as_ptr(), sp as *mut u8, len);
-            *((sp + len) as *mut u8) = 0;  // NUL 终止
+            *((sp + len) as *mut u8) = 0; // NUL 终止
         }
         argv_ptrs.push(sp);
     }
-    argv_ptrs.reverse();  // 恢复正序
+    argv_ptrs.reverse(); // 恢复正序
 
     // 2. 复制 envp 字符串
     for s in envp_vec.iter().rev() {
@@ -854,8 +881,10 @@ fn sys_exec(
     let final_sp = sp - pointer_bytes;
     if (final_sp & 0xF) == 0 {
         // 当前是 16 对齐，需要调整为 16+8
-        sp -= word;  // 添加填充使最终 RSP % 16 == 8
-        unsafe { *(sp as *mut usize) = 0; }
+        sp -= word; // 添加填充使最终 RSP % 16 == 8
+        unsafe {
+            *(sp as *mut usize) = 0;
+        }
     }
 
     // 6. 压入指针区（从高地址向低地址）
@@ -886,7 +915,7 @@ fn sys_exec(
     }
 
     let final_rsp = sp as u64;
-    let argv_base = (sp + word) as u64;  // argv[0] 的地址
+    let argv_base = (sp + word) as u64; // argv[0] 的地址
 
     // 更新进程 PCB
     let old_space = {
@@ -940,8 +969,10 @@ fn sys_exec(
         free_address_space(old_space);
     }
 
-    println!("sys_exec: entry=0x{:x}, rsp=0x{:x}, argc={}",
-             load_result.entry, final_rsp, argc);
+    println!(
+        "sys_exec: entry=0x{:x}, rsp=0x{:x}, argc={}",
+        load_result.entry, final_rsp, argc
+    );
 
     Ok(0)
 }
@@ -974,7 +1005,7 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
             }
             // 先标记为等待状态
             proc.state = ProcessState::Blocked;
-            proc.waiting_child = Some(0);  // 0 表示等待任意子进程
+            proc.waiting_child = Some(0); // 0 表示等待任意子进程
             proc.children.clone()
         };
 
@@ -1017,7 +1048,10 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
             // 清理僵尸进程资源
             cleanup_zombie(child_pid);
 
-            println!("sys_wait: reaped child {} with exit code {}", child_pid, exit_code);
+            println!(
+                "sys_wait: reaped child {} with exit code {}",
+                child_pid, exit_code
+            );
             return Ok(child_pid);
         }
 
@@ -1077,37 +1111,43 @@ fn sys_getppid() -> SyscallResult {
 ///
 /// 成功返回 0，失败返回错误码
 ///
-/// # Permission Model（临时实现，等待 UID/capability 系统）
+/// # Permission Model (Z-9 fix: POSIX-compliant UID/EUID checks)
 ///
+/// POSIX permission rules for kill():
+/// - Root (euid == 0) 可以发信号给任何进程
 /// - 进程可以向自己发送任意信号
-/// - 父进程可以向子进程发送信号
-/// - 子进程可以向父进程发送信号
+/// - sender.uid == target.uid
+/// - sender.euid == target.uid
 /// - PID 1 (init) 受保护，只有自己能向自己发信号
 fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
-    use crate::signal::{Signal, send_signal, signal_name};
+    use crate::signal::{send_signal, signal_name, Signal};
 
-    // 【安全修复 S-2】权限检查
-    // 临时实现：只允许 self, parent→child, child→parent
+    // 【安全修复 Z-9】POSIX 权限检查（防御深度）
+    // send_signal 也会进行相同检查，这里提前拒绝以提供更清晰的错误
     if let Some(self_pid) = current_pid() {
         // PID 1 保护：只有 init 自己能向自己发信号
         if pid == 1 && self_pid != 1 {
             return Err(SyscallError::EPERM);
         }
 
-        // 非自己的进程需要检查父子关系
+        // 非自己的进程需要进行 POSIX 权限检查
         if self_pid != pid {
+            // 获取发送者凭证
+            let sender_creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
+
+            // 获取目标进程凭证
             let target = get_process(pid).ok_or(SyscallError::ESRCH)?;
-            let target_ppid = target.lock().ppid;
+            let target_uid = target.lock().uid;
 
-            // 检查是否为父进程向子进程发送
-            let is_parent_to_child = target_ppid == self_pid;
+            // POSIX 权限检查：
+            // 1. Root (euid == 0) 可以发信号给任何进程
+            // 2. sender.uid == target.uid
+            // 3. sender.euid == target.uid
+            let has_permission = sender_creds.euid == 0
+                || sender_creds.uid == target_uid
+                || sender_creds.euid == target_uid;
 
-            // 检查是否为子进程向父进程发送
-            let is_child_to_parent = get_process(self_pid)
-                .map(|p| p.lock().ppid == pid)
-                .unwrap_or(false);
-
-            if !is_parent_to_child && !is_child_to_parent {
+            if !has_permission {
                 return Err(SyscallError::EPERM);
             }
         }
@@ -1199,6 +1239,11 @@ fn sys_pipe(fds: *mut i32) -> SyscallResult {
 ///
 /// 限制单次读取大小为 MAX_RW_SIZE (1MB)，防止用户请求超大 count
 /// 导致内核堆耗尽。在分配缓冲区前先验证用户指针有效性。
+///
+/// # Security (Z-4 fix)
+///
+/// 回调返回的 bytes_read 必须 clamp 到请求的 count，防止恶意/错误回调
+/// 返回超大值导致切片越界 panic。
 fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
     // X-2 安全修复：限制大小并提前验证
     let count = match count {
@@ -1210,11 +1255,15 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
     // 预先验证用户缓冲区，避免在分配后发现指针无效
     validate_user_ptr_mut(buf, count)?;
 
-    // stdin (fd 0): 简化实现，返回零填充数据
+    // stdin (fd 0): 从键盘缓冲区读取字符
+    // 非阻塞：如果没有输入，返回 0（EOF）
     if fd == 0 {
-        let data = vec![0u8; count];
-        copy_to_user(buf, &data)?;
-        return Ok(data.len());
+        let mut tmp = vec![0u8; count];
+        let bytes_read = drivers::keyboard_read(&mut tmp);
+        if bytes_read > 0 {
+            copy_to_user(buf, &tmp[..bytes_read])?;
+        }
+        return Ok(bytes_read);
     }
 
     // stdout/stderr 不支持读取
@@ -1232,6 +1281,10 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
     let mut tmp = vec![0u8; count];
     let bytes_read = read_fn(fd, &mut tmp)?;
 
+    // Z-4 安全修复：将回调返回值 clamp 到请求的大小
+    // 防止恶意/错误回调返回超大值导致切片越界 panic
+    let bytes_read = bytes_read.min(count);
+
     // 复制到用户空间
     copy_to_user(buf, &tmp[..bytes_read])?;
     Ok(bytes_read)
@@ -1243,6 +1296,11 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
 ///
 /// 限制单次写入大小为 MAX_RW_SIZE (1MB)，防止用户请求超大 count
 /// 导致内核堆耗尽。在分配缓冲区前先验证用户指针有效性。
+///
+/// # Security (Z-4 fix)
+///
+/// 回调返回的 bytes_written 必须 clamp 到请求的 count，防止恶意/错误回调
+/// 返回超大值。
 fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
     // X-2 安全修复：限制大小并提前验证
     let count = match count {
@@ -1277,7 +1335,10 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
         };
 
         // 在锁外执行写入
-        write_fn(fd, &tmp)
+        let bytes_written = write_fn(fd, &tmp)?;
+
+        // Z-4 安全修复：将回调返回值 clamp 到请求的大小
+        Ok(bytes_written.min(count))
     }
 }
 
@@ -1290,8 +1351,11 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
 ///
 /// # Returns
 /// 成功返回文件描述符，失败返回错误码
+///
+/// # Security (Z-3 fix)
+/// 使用 fault-tolerant copy_user_cstring 复制用户路径，防止 TOCTOU 和内核 panic
 fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
-    use crate::usercopy::UserAccessGuard;
+    use crate::usercopy::copy_user_cstring;
 
     // 验证路径指针
     if path.is_null() {
@@ -1302,28 +1366,13 @@ fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
-    // 复制路径字符串（最大 4096 字节）
+    // 安全复制路径字符串 (Z-3 fix: fault-tolerant usercopy)
     let path_str = {
-        let _guard = UserAccessGuard::new();
-        let mut buf = [0u8; 4096];
-        let mut len = 0;
-
-        // 逐字节复制直到遇到 NUL 或达到最大长度
-        for i in 0..4095 {
-            let byte = unsafe { *path.add(i) };
-            if byte == 0 {
-                break;
-            }
-            buf[i] = byte;
-            len = i + 1;
-        }
-
-        if len == 0 {
+        let path_bytes = copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+        if path_bytes.is_empty() {
             return Err(SyscallError::EINVAL);
         }
-
-        // 转换为字符串
-        core::str::from_utf8(&buf[..len])
+        core::str::from_utf8(&path_bytes)
             .map_err(|_| SyscallError::EINVAL)?
             .to_string()
     };
@@ -1354,8 +1403,11 @@ fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
 ///
 /// # Returns
 /// 成功返回 0，失败返回错误码
+///
+/// # Security (Z-3 fix)
+/// 使用 fault-tolerant copy_user_cstring 复制用户路径，防止 TOCTOU 和内核 panic
 fn sys_stat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
-    use crate::usercopy::UserAccessGuard;
+    use crate::usercopy::copy_user_cstring;
 
     // 验证路径指针
     if path.is_null() {
@@ -1367,28 +1419,13 @@ fn sys_stat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
         return Err(SyscallError::EFAULT);
     }
 
-    // 复制路径字符串（最大 4096 字节）
+    // 安全复制路径字符串 (Z-3 fix: fault-tolerant usercopy)
     let path_str = {
-        let _guard = UserAccessGuard::new();
-        let mut buf = [0u8; 4096];
-        let mut len = 0;
-
-        // 逐字节复制直到遇到 NUL 或达到最大长度
-        for i in 0..4095 {
-            let byte = unsafe { *path.add(i) };
-            if byte == 0 {
-                break;
-            }
-            buf[i] = byte;
-            len = i + 1;
-        }
-
-        if len == 0 {
+        let path_bytes = copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+        if path_bytes.is_empty() {
             return Err(SyscallError::EINVAL);
         }
-
-        // 转换为字符串
-        core::str::from_utf8(&buf[..len])
+        core::str::from_utf8(&path_bytes)
             .map_err(|_| SyscallError::EINVAL)?
             .to_string()
     };
@@ -1499,10 +1536,10 @@ fn sys_mmap(
     fd: i32,
     _offset: i64,
 ) -> SyscallResult {
-    use x86_64::VirtAddr;
-    use x86_64::structures::paging::{PageTableFlags, Page};
     use mm::memory::FrameAllocator;
     use mm::page_table::with_current_manager;
+    use x86_64::structures::paging::{Page, PageTableFlags};
+    use x86_64::VirtAddr;
 
     // 获取当前进程
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
@@ -1519,10 +1556,7 @@ fn sys_mmap(
     }
 
     // 对齐到页边界（使用 checked_add 防止整数溢出）
-    let length_aligned = length
-        .checked_add(0xfff)
-        .ok_or(SyscallError::EINVAL)?
-        & !0xfff;
+    let length_aligned = length.checked_add(0xfff).ok_or(SyscallError::EINVAL)? & !0xfff;
 
     // 构建页表标志
     let mut page_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
@@ -1649,7 +1683,10 @@ fn sys_mmap(
         }
     }
 
-    println!("sys_mmap: pid={}, mapped {} bytes at 0x{:x}", pid, length_aligned, base);
+    println!(
+        "sys_mmap: pid={}, mapped {} bytes at 0x{:x}",
+        pid, length_aligned, base
+    );
 
     Ok(base)
 }
@@ -1658,10 +1695,10 @@ fn sys_mmap(
 ///
 /// 使用当前进程的地址空间进行取消映射，确保进程隔离
 fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
-    use x86_64::VirtAddr;
-    use x86_64::structures::paging::Page;
     use mm::memory::FrameAllocator;
     use mm::page_table::with_current_manager;
+    use x86_64::structures::paging::Page;
+    use x86_64::VirtAddr;
 
     // 验证参数
     if addr & 0xfff != 0 {
@@ -1676,10 +1713,7 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
     // 对齐到页边界（使用 checked_add 防止整数溢出）
-    let length_aligned = length
-        .checked_add(0xfff)
-        .ok_or(SyscallError::EINVAL)?
-        & !0xfff;
+    let length_aligned = length.checked_add(0xfff).ok_or(SyscallError::EINVAL)? & !0xfff;
 
     // 检查该区域是否在进程的 mmap 记录中
     let recorded_length = {
@@ -1730,7 +1764,10 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         proc.mmap_regions.remove(&addr);
     }
 
-    println!("sys_munmap: pid={}, unmapped {} bytes at 0x{:x}", pid, length_aligned, addr);
+    println!(
+        "sys_munmap: pid={}, unmapped {} bytes at 0x{:x}",
+        pid, length_aligned, addr
+    );
 
     Ok(0)
 }
@@ -1768,7 +1805,11 @@ fn sys_futex(uaddr: usize, op: i32, val: u32) -> SyscallResult {
     }
 
     // 验证用户内存可访问
-    verify_user_memory(uaddr as *const u8, core::mem::size_of::<u32>(), op == FUTEX_WAIT)?;
+    verify_user_memory(
+        uaddr as *const u8,
+        core::mem::size_of::<u32>(),
+        op == FUTEX_WAIT,
+    )?;
 
     // 获取回调函数
     let futex_fn = {
@@ -1796,8 +1837,6 @@ fn sys_futex(uaddr: usize, op: i32, val: u32) -> SyscallResult {
 
 /// sys_yield - 主动让出CPU
 fn sys_yield() -> SyscallResult {
-    println!("Process yielding CPU");
-
     // 将当前进程状态设置为Ready
     if let Some(pid) = current_pid() {
         if let Some(process) = get_process(pid) {
@@ -1835,7 +1874,7 @@ impl SyscallStats {
             failed_calls: 0,
         }
     }
-    
+
     pub fn print(&self) {
         println!("=== Syscall Statistics ===");
         println!("Total calls:  {}", self.total_calls);

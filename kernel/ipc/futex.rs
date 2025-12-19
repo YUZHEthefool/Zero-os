@@ -9,8 +9,8 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use spin::Mutex;
 use kernel_core::process::ProcessId;
+use spin::Mutex;
 
 use crate::sync::WaitQueue;
 
@@ -64,28 +64,33 @@ lazy_static::lazy_static! {
 ///
 /// 用于 futex_wait 在入队前二次检查值，防止 lost-wake 竞态
 fn read_user_u32(uaddr: usize) -> Result<u32, FutexError> {
-    use x86_64::VirtAddr;
-    use x86_64::structures::paging::PageTableFlags;
     use mm::page_table::PageTableManager;
+    use x86_64::structures::paging::PageTableFlags;
+    use x86_64::VirtAddr;
 
     // 验证用户内存
     unsafe {
-        mm::page_table::with_current_manager(VirtAddr::new(0), |manager: &mut PageTableManager| -> Result<u32, FutexError> {
-            let page_addr = uaddr & !0xfff;
-            if let Some((_, flags)) = manager.translate_with_flags(VirtAddr::new(page_addr as u64)) {
-                if !flags.contains(PageTableFlags::PRESENT)
-                    || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+        mm::page_table::with_current_manager(
+            VirtAddr::new(0),
+            |manager: &mut PageTableManager| -> Result<u32, FutexError> {
+                let page_addr = uaddr & !0xfff;
+                if let Some((_, flags)) =
+                    manager.translate_with_flags(VirtAddr::new(page_addr as u64))
                 {
+                    if !flags.contains(PageTableFlags::PRESENT)
+                        || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+                    {
+                        return Err(FutexError::Fault);
+                    }
+                } else {
                     return Err(FutexError::Fault);
                 }
-            } else {
-                return Err(FutexError::Fault);
-            }
 
-            // 安全：已验证用户内存
-            let value = core::ptr::read_volatile(uaddr as *const u32);
-            Ok(value)
-        })
+                // 安全：已验证用户内存
+                let value = core::ptr::read_volatile(uaddr as *const u32);
+                Ok(value)
+            },
+        )
     }
 }
 
@@ -225,11 +230,8 @@ pub fn cleanup_process_futexes(pid: ProcessId) {
     let mut table = FUTEX_TABLE.lock();
 
     // 收集要移除的键
-    let keys_to_remove: alloc::vec::Vec<FutexKey> = table
-        .keys()
-        .filter(|(p, _)| *p == pid)
-        .cloned()
-        .collect();
+    let keys_to_remove: alloc::vec::Vec<FutexKey> =
+        table.keys().filter(|(p, _)| *p == pid).cloned().collect();
 
     // 唤醒所有等待者并移除条目
     for key in keys_to_remove {

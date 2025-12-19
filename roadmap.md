@@ -525,16 +525,17 @@ All critical issues have been resolved:
 | 2025-12-16 | Claude + Codex (19th) | 0 new | Audit subsystem implemented (hash-chained events) |
 | 2025-12-17 | Claude + Codex (20th) | 8 new | 4 fixed (X-2: DoS, X-4: mount perms, X-6: IPC, X-7: TLB), 4 deferred |
 | 2025-12-17 | Claude + Codex (21st) | 10 new | 4 fixed (Y-1: SFMASK, Y-2: SYSRET, Y-3: DR6/DR7, Y-6: enter_usermode), 6 open |
-| 2025-12-18 | Claude + Codex (22nd) | 11 new | 2 fixed (Z-6: RNG entropy, Z-7: kernel stack), 9 open |
+| 2025-12-18 | Claude + Codex (22nd) | 11 new | **ALL 11 FIXED** (Z-1 to Z-11) |
 
 ### Current Status
 
-- Total issues tracked: 110
-- Fixed: 80 (73%)
-- Open: 30 (27%)
-  - 2 CRITICAL fixed this round (Z-6: RNG entropy fallback, Z-7: kernel stack allocation)
-  - 5 HIGH open (Z-1: FPU/SIMD, Z-2: stack align, Z-3: user ptr, Z-4: callback len, Z-8: fork rollback, Z-9: signal perms)
-  - 3 MEDIUM open (Z-5: context switch, Z-10: ELF rollback, Z-11: pipe wakeup)
+- Total issues tracked: 119
+- Fixed: 95 (80%)
+- Open: 24 (20%)
+  - **Round 22: ALL 11 issues FIXED**
+    - 2 CRITICAL: Z-6 (RNG entropy), Z-7 (kernel stack)
+    - 6 HIGH: Z-1 (FPU/SIMD), Z-2 (stack align), Z-3 (usercopy), Z-4 (callback len), Z-8 (fork COW), Z-9 (signal perms)
+    - 3 MEDIUM: Z-5 (context switch), Z-10 (ELF rollback), Z-11 (pipe wakeup)
   - 13 Deferred (A-3, H-25, H-26, H-33, H-34, M-18, W-3, W-4, X-1, X-5, Y-7 - mostly SMP)
   - A-1 partially resolved (cooperative scheduling)
   - A-2 fully resolved (address space isolation)
@@ -566,6 +567,8 @@ See [qa-2025-12-10.md](qa-2025-12-10.md), [qa-2025-12-10-v2.md](qa-2025-12-10-v2
 | 0.5.0 | 2025-12-17 | Phase 6 foundation - SYSCALL/SYSRET, Ring 3 transition, enter_usermode |
 | 0.5.1 | 2025-12-17 | Ring 3 security hardening - SYSRET canonical checks, SFMASK, DR clearing, RFLAGS sanitization |
 | 0.5.2 | 2025-12-18 | Critical security fixes - RNG entropy (Z-6), kernel stack allocation (Z-7) |
+| 0.5.3 | 2025-12-18 | HIGH priority fixes - usercopy (Z-3), callback validation (Z-4), signal perms (Z-9), pipe wakeup (Z-11) |
+| 0.5.4 | 2025-12-18 | Complete Round 22 - FPU/SIMD (Z-1), stack align (Z-2), context switch (Z-5), fork COW (Z-8), ELF rollback (Z-10) |
 | 1.0.0 | TBD | First stable release |
 
 ---

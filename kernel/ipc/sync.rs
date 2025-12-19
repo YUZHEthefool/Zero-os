@@ -178,6 +178,88 @@ impl WaitQueue {
         self.waiters.lock().len()
     }
 
+    /// Z-11 fix: 准备等待（添加到队列但不立即阻塞）
+    ///
+    /// 用于实现条件变量语义，避免 lost-wakeup 竞态条件。
+    /// 调用者应在持有相关锁的情况下调用此函数，然后释放锁，
+    /// 最后调用 `finish_wait()` 来实际阻塞。
+    ///
+    /// # Returns
+    ///
+    /// 如果成功加入队列返回 true，如果无当前进程或队列已关闭返回 false
+    pub fn prepare_to_wait(&self) -> bool {
+        let pid = match process::current_pid() {
+            Some(p) => p,
+            None => return false,
+        };
+
+        // 如果已关闭则不阻塞
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+
+        interrupts::without_interrupts(|| {
+            // 再次检查未关闭
+            if self.closed.load(Ordering::Relaxed) {
+                return false;
+            }
+
+            // 将当前进程加入等待队列
+            self.waiters.lock().push_back(pid);
+
+            // 将进程状态设为阻塞
+            if let Some(proc_arc) = process::get_process(pid) {
+                let mut proc = proc_arc.lock();
+                proc.state = ProcessState::Blocked;
+            }
+
+            true
+        })
+    }
+
+    /// Z-11 fix: 完成等待（实际阻塞）
+    ///
+    /// 必须在 `prepare_to_wait()` 返回 true 之后调用。
+    /// 在调用此函数之前应释放相关锁。
+    pub fn finish_wait(&self) {
+        // 触发调度，让出CPU
+        kernel_core::force_reschedule();
+    }
+
+    /// Z-11 fix: 取消等待（从队列移除）
+    ///
+    /// 如果在 `prepare_to_wait()` 后发现条件已满足，
+    /// 调用此函数取消等待而不阻塞。
+    ///
+    /// # Returns
+    ///
+    /// 如果成功从队列移除返回 true
+    pub fn cancel_wait(&self) -> bool {
+        let pid = match process::current_pid() {
+            Some(p) => p,
+            None => return false,
+        };
+
+        interrupts::without_interrupts(|| {
+            let mut waiters = self.waiters.lock();
+
+            // 从队列中移除当前进程
+            if let Some(pos) = waiters.iter().position(|&p| p == pid) {
+                waiters.remove(pos);
+
+                // 恢复进程状态为就绪
+                if let Some(proc_arc) = process::get_process(pid) {
+                    let mut proc = proc_arc.lock();
+                    proc.state = ProcessState::Ready;
+                }
+
+                true
+            } else {
+                false
+            }
+        })
+    }
+
     /// 检查队列是否已关闭（例如端点被销毁）
     ///
     /// # X-6 安全增强
@@ -232,12 +314,11 @@ impl KMutex {
     pub fn lock(&self) {
         loop {
             // 尝试获取锁
-            if self.locked.compare_exchange(
-                false,
-                true,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ).is_ok() {
+            if self
+                .locked
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
                 // 成功获取锁
                 if let Some(pid) = process::current_pid() {
                     *self.owner.lock() = Some(pid);
@@ -254,12 +335,11 @@ impl KMutex {
     ///
     /// 如果锁可用，获取锁并返回true；否则返回false
     pub fn try_lock(&self) -> bool {
-        if self.locked.compare_exchange(
-            false,
-            true,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ).is_ok() {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
             if let Some(pid) = process::current_pid() {
                 *self.owner.lock() = Some(pid);
             }
@@ -321,12 +401,11 @@ impl Semaphore {
             let current = self.count.load(Ordering::SeqCst);
             if current > 0 {
                 // 尝试减少计数
-                if self.count.compare_exchange(
-                    current,
-                    current - 1,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ).is_ok() {
+                if self
+                    .count
+                    .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
                     return;
                 }
                 // CAS失败，重试
@@ -347,12 +426,11 @@ impl Semaphore {
             if current == 0 {
                 return false;
             }
-            if self.count.compare_exchange(
-                current,
-                current - 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ).is_ok() {
+            if self
+                .count
+                .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
                 return true;
             }
         }

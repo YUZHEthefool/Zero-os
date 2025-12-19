@@ -215,12 +215,7 @@ fn ensure_secret() -> u64 {
 
     // Race-safe initialization
     let new_secret = mix64(tsc_entropy());
-    match KPTR_SECRET.compare_exchange(
-        0,
-        new_secret,
-        Ordering::SeqCst,
-        Ordering::Acquire,
-    ) {
+    match KPTR_SECRET.compare_exchange(0, new_secret, Ordering::SeqCst, Ordering::Acquire) {
         Ok(_) => new_secret,
         Err(existing) => existing,
     }

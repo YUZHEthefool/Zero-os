@@ -62,7 +62,7 @@ pub fn run_all_tests() {
     println!();
     println!("=== Component Integration Tests ===");
     println!();
-    
+
     test_page_table();
     test_process_control_block();
     test_scheduler();
@@ -70,7 +70,7 @@ pub fn run_all_tests() {
     test_syscalls();
     test_context_switch();
     test_memory_mapping();
-    
+
     println!();
     println!("=== All Component Tests Passed! ===");
     println!();

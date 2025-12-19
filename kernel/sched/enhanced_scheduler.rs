@@ -10,15 +10,15 @@
 
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
-use kernel_core::process::{self, Process, ProcessId, ProcessState, Priority};
-use spin::Mutex;
+use kernel_core::process::{self, Priority, Process, ProcessId, ProcessState};
 use lazy_static::lazy_static;
+use spin::Mutex;
 use x86_64::instructions::interrupts;
 
 // 导入arch模块的上下文切换功能
-use arch::{switch_context, save_context, enter_usermode};
-use arch::{set_kernel_stack, default_kernel_stack_top};
 use arch::Context as ArchContext;
+use arch::{default_kernel_stack_top, set_kernel_stack};
+use arch::{enter_usermode, save_context, switch_context};
 
 // 类型别名以保持兼容性
 pub type Pid = ProcessId;
@@ -64,7 +64,7 @@ impl SchedulerStats {
             processes_terminated: 0,
         }
     }
-    
+
     pub fn print(&self) {
         println!("=== Scheduler Statistics ===");
         println!("Context switches: {}", self.total_switches);
@@ -373,11 +373,7 @@ impl Scheduler {
     /// 获取进程数量
     pub fn process_count() -> usize {
         interrupts::without_interrupts(|| {
-            READY_QUEUE
-                .lock()
-                .values()
-                .map(|bucket| bucket.len())
-                .sum()
+            READY_QUEUE.lock().values().map(|bucket| bucket.len()).sum()
         })
     }
 
@@ -480,7 +476,9 @@ impl Scheduler {
             } else {
                 default_kernel_stack_top()
             };
-            unsafe { set_kernel_stack(effective_kstack_top); }
+            unsafe {
+                set_kernel_stack(effective_kstack_top);
+            }
 
             // Debug output for Ring 3 transition (minimal)
             // Uncomment for debugging: println!("[SCHED] -> PID {} (Ring {})", next_pid, if next_is_user { 3 } else { 0 });

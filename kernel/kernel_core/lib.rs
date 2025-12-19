@@ -9,40 +9,56 @@ extern crate drivers;
 // 导出 vga_buffer 模块中的其他公共函数
 pub use drivers::vga_buffer;
 
+pub mod elf_loader;
+pub mod fork;
 pub mod process;
+pub mod scheduler_hook;
 pub mod signal;
 pub mod syscall;
-pub mod fork;
 pub mod time;
-pub mod scheduler_hook;
-pub mod elf_loader;
 pub mod usercopy;
 
-pub use signal::{Signal, SignalAction, SignalError, PendingSignals, send_signal, default_action, signal_name, register_resume_callback};
-pub use fork::{sys_fork, ForkError, ForkResult, PAGE_REF_COUNT, create_fresh_address_space};
+pub use elf_loader::{load_elf, ElfLoadError, ElfLoadResult, USER_STACK_SIZE, USER_STACK_TOP};
+pub use fork::{create_fresh_address_space, sys_fork, ForkError, ForkResult, PAGE_REF_COUNT};
 pub use process::{
-    register_ipc_cleanup, allocate_kernel_stack, kernel_stack_slot,
-    KernelStackError, KSTACK_BASE, KSTACK_STRIDE, free_kernel_stack, free_address_space,
-    FileOps, FileDescriptor, MAX_FD,
+    add_supplementary_group,
+    allocate_kernel_stack,
+    current_credentials,
+    current_egid,
+    current_euid,
+    current_supplementary_groups,
+    current_umask,
+    free_address_space,
+    free_kernel_stack,
+    kernel_stack_slot,
+    register_ipc_cleanup,
+    remove_supplementary_group,
+    set_current_supplementary_groups,
+    set_current_umask,
     // DAC support
-    Credentials, current_credentials, current_euid, current_egid,
-    current_supplementary_groups, set_current_supplementary_groups,
-    add_supplementary_group, remove_supplementary_group, NGROUPS_MAX,
-    current_umask, set_current_umask,
+    Credentials,
+    FileDescriptor,
+    FileOps,
+    KernelStackError,
+    KSTACK_BASE,
+    KSTACK_STRIDE,
+    MAX_FD,
+    NGROUPS_MAX,
+};
+pub use scheduler_hook::{
+    force_reschedule, on_scheduler_tick, register_resched_callback, register_timer_callback,
+    request_resched_from_irq, reschedule_if_needed,
+};
+pub use signal::{
+    default_action, register_resume_callback, send_signal, signal_name, PendingSignals, Signal,
+    SignalAction, SignalError,
+};
+pub use syscall::{
+    register_fd_close_callback, register_fd_read_callback, register_fd_write_callback,
+    register_futex_callback, register_pipe_callback, register_vfs_lseek_callback,
+    register_vfs_open_callback, register_vfs_stat_callback, SyscallError, VfsStat,
 };
 pub use time::{current_timestamp_ms, get_ticks, on_timer_tick};
-pub use scheduler_hook::{
-    register_timer_callback, register_resched_callback,
-    on_scheduler_tick, reschedule_if_needed, force_reschedule,
-    request_resched_from_irq,
-};
-pub use elf_loader::{load_elf, ElfLoadError, ElfLoadResult, USER_STACK_TOP, USER_STACK_SIZE};
-pub use syscall::{
-    register_pipe_callback, register_fd_read_callback, register_fd_write_callback, register_fd_close_callback,
-    register_futex_callback,
-    register_vfs_open_callback, register_vfs_stat_callback, register_vfs_lseek_callback,
-    SyscallError, VfsStat,
-};
 
 pub fn init() {
     process::init(); // 必须最先初始化，确保 BOOT_CR3 被缓存

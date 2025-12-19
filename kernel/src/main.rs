@@ -10,10 +10,10 @@ use mm::memory::BootInfo;
 #[macro_use]
 extern crate drivers;
 extern crate arch;
-extern crate mm;
-extern crate sched;
 extern crate ipc;
 extern crate kernel_core;
+extern crate mm;
+extern crate sched;
 extern crate security;
 extern crate vfs;
 #[macro_use]
@@ -21,11 +21,11 @@ extern crate audit;
 
 // 演示模块
 mod demo;
-mod process_demo;
-mod syscall_demo;
-mod interrupt_demo;
 mod integration_test;
+mod interrupt_demo;
+mod process_demo;
 mod stack_guard;
+mod syscall_demo;
 mod usermode_test;
 
 // 串口端口
@@ -55,7 +55,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     unsafe {
         core::arch::asm!("cli", options(nomem, nostack));
     }
-    
+
     // 发送串口消息表示内核已启动
     unsafe {
         serial_write_str("Kernel _start entered\n");
@@ -82,7 +82,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("[1/3] Initializing interrupts...");
     arch::interrupts::init();
     println!("      ✓ IDT loaded with 20+ handlers");
-    
+
     // 阶段2：初始化内存管理
     println!("[2/3] Initializing memory management...");
     if let Some(info) = boot_info {
@@ -138,8 +138,8 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         let sec_config = security::SecurityConfig {
             phys_offset: mm::page_table::get_physical_memory_offset(),
             cleanup_strategy: security::IdentityCleanupStrategy::RemoveWritable,
-            enforce_nx: true,                 // 启用 NX 强制执行
-            validate_wxorx: true,             // 验证 W^X 策略
+            enforce_nx: true,     // 启用 NX 强制执行
+            validate_wxorx: true, // 验证 W^X 策略
             initialize_rng: true,
             strict_wxorx: true,               // 严格模式：发现 RWX 即报错
             enable_kptr_guard: true,          // 启用内核指针混淆
@@ -152,7 +152,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 println!("      ✓ Security hardening applied");
                 println!("        - Identity map: {:?}", report.identity_cleanup);
                 if let Some(nx) = &report.nx_summary {
-                    println!("        - NX enforced: {} pages protected", nx.data_nx_pages);
+                    println!(
+                        "        - NX enforced: {} pages protected",
+                        nx.data_nx_pages
+                    );
                 }
                 if report.rng_ready {
                     println!("        - CSPRNG ready (ChaCha20 + RDRAND/RDSEED)");
@@ -228,7 +231,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
     // 阶段3：测试基础功能
     println!("[3/3] Running basic tests...");
-    
+
     // 测试内存分配
     use alloc::vec::Vec;
     let mut test_vec = Vec::new();
@@ -236,41 +239,41 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         test_vec.push(i);
     }
     println!("      ✓ Heap allocation test passed");
-    
+
     // 显示内存统计
     let mem_stats = mm::memory::FrameAllocator::new().stats();
     println!("      ✓ Memory stats available");
-    
+
     println!();
     println!("=== System Information ===");
     mem_stats.print();
-    
+
     println!();
     println!("=== Verifying Core Subsystems ===");
     println!();
-    
+
     // 验证各个模块已编译
     println!("[4/8] Verifying architecture support...");
     println!("      ✓ arch crate loaded");
     println!("      ✓ Context switch module available");
-    
+
     println!("[5/8] Initializing kernel core...");
-    kernel_core::init();  // 初始化进程管理和 BOOT_CR3 缓存（必须在调度器前）
+    kernel_core::init(); // 初始化进程管理和 BOOT_CR3 缓存（必须在调度器前）
     println!("      ✓ Process management ready");
     println!("      ✓ System calls framework ready");
     println!("      ✓ Fork/COW implementation compiled");
 
     println!("[6/8] Initializing scheduler...");
-    sched::enhanced_scheduler::init();  // 注册定时器和重调度回调
+    sched::enhanced_scheduler::init(); // 注册定时器和重调度回调
     println!("      ✓ Enhanced scheduler initialized");
-    
+
     println!("[7/8] Initializing IPC...");
-    ipc::init();  // 初始化IPC子系统并注册清理回调
+    ipc::init(); // 初始化IPC子系统并注册清理回调
     println!("      ✓ Capability-based endpoints enabled");
     println!("      ✓ Process cleanup callback registered");
 
     println!("[7.5/8] Initializing VFS...");
-    vfs::init();  // 初始化虚拟文件系统
+    vfs::init(); // 初始化虚拟文件系统
     println!("      ✓ devfs mounted at /dev");
     println!("      ✓ Device files: null, zero, console");
 
@@ -287,7 +290,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 0,
                 0, // timestamp 0 = boot
             );
-            println!("      ✓ Audit subsystem ready (capacity: {} events)", audit::DEFAULT_CAPACITY);
+            println!(
+                "      ✓ Audit subsystem ready (capacity: {} events)",
+                audit::DEFAULT_CAPACITY
+            );
             println!("      ✓ Hash-chained tamper evidence enabled");
         }
         Err(e) => {
@@ -298,7 +304,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("[8/8] Verifying memory management...");
     println!("      ✓ Page table manager compiled");
     println!("      ✓ mmap/munmap available");
-    
+
     // 运行集成测试
     integration_test::run_all_tests();
 
@@ -341,6 +347,8 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
     // 启用中断（IDT 已初始化完成）
     // 注意：在启用中断前，确保所有中断处理程序已正确设置
+    // 启用串口接收中断（在 sti 前，最小化中断禁用期间积压数据的窗口）
+    arch::interrupts::enable_serial_interrupts();
     unsafe {
         core::arch::asm!("sti", options(nomem, nostack));
     }
@@ -357,10 +365,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         }
 
         unsafe {
-            core::arch::asm!(
-                "hlt",
-                options(nomem, nostack, preserves_flags)
-            );
+            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
         }
     }
 }

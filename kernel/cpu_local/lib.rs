@@ -73,7 +73,12 @@ impl<T> CpuLocal<T> {
     pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         let id = current_cpu_id();
         // Hard bound check to prevent UB with non-zero-based APIC IDs
-        assert!(id < MAX_CPUS, "CPU ID {} out of range (max {})", id, MAX_CPUS);
+        assert!(
+            id < MAX_CPUS,
+            "CPU ID {} out of range (max {})",
+            id,
+            MAX_CPUS
+        );
         // Safety: bound check above guarantees the slot exists and was initialized in get_slots()
         let slot = unsafe {
             let arr = &*self.get_slots().get();

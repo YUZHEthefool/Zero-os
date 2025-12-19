@@ -2,15 +2,14 @@
 //!
 //! 提供对x86_64页表的完整管理功能
 
+use spin::Mutex;
 use x86_64::{
     structures::paging::{
-        page_table::PageTableEntry,
-        Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
-        FrameAllocator, Mapper, OffsetPageTable, Translate,
+        page_table::PageTableEntry, FrameAllocator, Mapper, OffsetPageTable, Page, PageTable,
+        PageTableFlags, PhysFrame, Size4KiB, Translate,
     },
     PhysAddr, VirtAddr,
 };
-use spin::Mutex;
 
 /// 物理内存高半区偏移（bootloader 映射 0xffffffff80000000 -> 0）
 /// 覆盖物理地址 0-1GB
@@ -81,7 +80,7 @@ impl PageTableManager {
 
         PageTableManager { mapper }
     }
-    
+
     /// 映射虚拟页到物理帧
     pub fn map_page(
         &mut self,
@@ -91,7 +90,7 @@ impl PageTableManager {
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     ) -> Result<(), MapError> {
         use x86_64::structures::paging::mapper::MapToError;
-        
+
         unsafe {
             self.mapper
                 .map_to(page, frame, flags, frame_allocator)
@@ -102,34 +101,30 @@ impl PageTableManager {
                 })?
                 .flush();
         }
-        
+
         Ok(())
     }
-    
+
     /// 取消映射虚拟页
     pub fn unmap_page(&mut self, page: Page) -> Result<PhysFrame, UnmapError> {
         use x86_64::structures::paging::mapper::UnmapError as X64UnmapError;
-        
-        let (frame, flush) = self.mapper
-            .unmap(page)
-            .map_err(|e| match e {
-                X64UnmapError::PageNotMapped => UnmapError::PageNotMapped,
-                X64UnmapError::ParentEntryHugePage => UnmapError::ParentEntryHugePage,
-                X64UnmapError::InvalidFrameAddress(_) => UnmapError::InvalidFrameAddress,
-            })?;
-        
+
+        let (frame, flush) = self.mapper.unmap(page).map_err(|e| match e {
+            X64UnmapError::PageNotMapped => UnmapError::PageNotMapped,
+            X64UnmapError::ParentEntryHugePage => UnmapError::ParentEntryHugePage,
+            X64UnmapError::InvalidFrameAddress(_) => UnmapError::InvalidFrameAddress,
+        })?;
+
         flush.flush();
         Ok(frame)
     }
-    
+
     /// 转换虚拟地址到物理地址
     pub fn translate_addr(&self, addr: VirtAddr) -> Option<PhysAddr> {
         use x86_64::structures::paging::mapper::TranslateResult;
 
         match self.mapper.translate(addr) {
-            TranslateResult::Mapped { frame, offset, .. } => {
-                Some(frame.start_address() + offset)
-            }
+            TranslateResult::Mapped { frame, offset, .. } => Some(frame.start_address() + offset),
             TranslateResult::NotMapped | TranslateResult::InvalidFrameAddress(_) => None,
         }
     }
@@ -139,9 +134,12 @@ impl PageTableManager {
         use x86_64::structures::paging::mapper::TranslateResult;
 
         match self.mapper.translate(addr) {
-            TranslateResult::Mapped { frame, offset, flags, .. } => {
-                Some((frame.start_address() + offset, flags))
-            }
+            TranslateResult::Mapped {
+                frame,
+                offset,
+                flags,
+                ..
+            } => Some((frame.start_address() + offset, flags)),
             TranslateResult::NotMapped | TranslateResult::InvalidFrameAddress(_) => None,
         }
     }
@@ -153,7 +151,7 @@ impl PageTableManager {
         flags: PageTableFlags,
     ) -> Result<(), UpdateFlagsError> {
         use x86_64::structures::paging::mapper::FlagUpdateError;
-        
+
         unsafe {
             self.mapper
                 .update_flags(page, flags)
@@ -163,10 +161,10 @@ impl PageTableManager {
                 })?
                 .flush();
         }
-        
+
         Ok(())
     }
-    
+
     /// 映射一个连续的虚拟地址范围
     pub fn map_range(
         &mut self,
@@ -177,32 +175,28 @@ impl PageTableManager {
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     ) -> Result<(), MapError> {
         let page_count = (size + 0xfff) / 0x1000;
-        
+
         for i in 0..page_count {
             let offset = (i * 0x1000) as u64;
             let page = Page::containing_address(start_virt + offset);
             let frame = PhysFrame::containing_address(start_phys + offset);
-            
+
             self.map_page(page, frame, flags, frame_allocator)?;
         }
-        
+
         Ok(())
     }
-    
+
     /// 取消映射一个连续的虚拟地址范围
-    pub fn unmap_range(
-        &mut self,
-        start_virt: VirtAddr,
-        size: usize,
-    ) -> Result<(), UnmapError> {
+    pub fn unmap_range(&mut self, start_virt: VirtAddr, size: usize) -> Result<(), UnmapError> {
         let page_count = (size + 0xfff) / 0x1000;
-        
+
         for i in 0..page_count {
             let offset = (i * 0x1000) as u64;
             let page = Page::containing_address(start_virt + offset);
             self.unmap_page(page)?;
         }
-        
+
         Ok(())
     }
 }
@@ -300,7 +294,10 @@ pub unsafe fn init(physical_memory_offset: VirtAddr) {
     let manager = PageTableManager::new(get_phys_offset());
     *PAGE_TABLE_MANAGER.lock() = Some(manager);
 
-    println!("Page table manager initialized (PHYS_OFFSET: 0x{:x})", PHYSICAL_MEMORY_OFFSET);
+    println!(
+        "Page table manager initialized (PHYS_OFFSET: 0x{:x})",
+        PHYSICAL_MEMORY_OFFSET
+    );
 }
 
 /// 获取全局页表管理器
@@ -364,9 +361,7 @@ pub unsafe fn recursive_pdpt(pml4_idx: usize) -> &'static mut PageTable {
 /// 调用者必须确保对应的页表条目存在且有效
 #[inline]
 pub unsafe fn recursive_pd(pml4_idx: usize, pdpt_idx: usize) -> &'static mut PageTable {
-    let addr = RECURSIVE_PD_BASE
-        + (pml4_idx as u64) * 0x20_0000
-        + (pdpt_idx as u64) * 0x1000;
+    let addr = RECURSIVE_PD_BASE + (pml4_idx as u64) * 0x20_0000 + (pdpt_idx as u64) * 0x1000;
     &mut *(addr as *mut PageTable)
 }
 
@@ -376,7 +371,11 @@ pub unsafe fn recursive_pd(pml4_idx: usize, pdpt_idx: usize) -> &'static mut Pag
 ///
 /// 调用者必须确保对应的页表条目存在且有效
 #[inline]
-pub unsafe fn recursive_pt(pml4_idx: usize, pdpt_idx: usize, pd_idx: usize) -> &'static mut PageTable {
+pub unsafe fn recursive_pt(
+    pml4_idx: usize,
+    pdpt_idx: usize,
+    pd_idx: usize,
+) -> &'static mut PageTable {
     let addr = RECURSIVE_PT_BASE
         + (pml4_idx as u64) * 0x4000_0000
         + (pdpt_idx as u64) * 0x20_0000

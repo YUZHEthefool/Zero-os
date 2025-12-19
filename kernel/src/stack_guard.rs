@@ -91,9 +91,7 @@ pub unsafe fn install() -> Result<(), GuardPageError> {
                 println!("  Warning: Failed to set up IST guard stack: {:?}", e);
                 println!("  Double-fault handler will use static stack (less safe)");
                 // 仍然返回成功，因为内核栈已设置
-                println!(
-                    "  Guard page stack installed (partial):"
-                );
+                println!("  Guard page stack installed (partial):");
                 println!(
                     "    - Kernel stack: 0x{:x} ({}KB + 4KB guard)",
                     kernel_stack_top.as_u64(),
@@ -104,11 +102,12 @@ pub unsafe fn install() -> Result<(), GuardPageError> {
         };
 
         // 3. 更新 IST0
-        arch::set_ist_stack(arch::DOUBLE_FAULT_IST_INDEX as usize, double_fault_stack_top);
-
-        println!(
-            "  Guard page stacks installed:"
+        arch::set_ist_stack(
+            arch::DOUBLE_FAULT_IST_INDEX as usize,
+            double_fault_stack_top,
         );
+
+        println!("  Guard page stacks installed:");
         println!(
             "    - Kernel stack: 0x{:x} ({}KB + 4KB guard)",
             kernel_stack_top.as_u64(),

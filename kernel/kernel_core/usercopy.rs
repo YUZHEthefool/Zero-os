@@ -34,8 +34,8 @@
 //! be performing user copies concurrently.
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use cpu_local::{current_cpu_id, CpuLocal};
 use x86_64::registers::control::{Cr4, Cr4Flags};
-use cpu_local::{CpuLocal, current_cpu_id};
 
 /// User-copy state with PID binding for SMP safety (V-5 fix)
 ///
@@ -134,11 +134,16 @@ impl UserAccessGuard {
             let prev_depth = SMAP_GUARD_DEPTH.with(|d| d.fetch_add(1, Ordering::SeqCst));
             if prev_depth == 0 {
                 // Set AC flag to allow supervisor access to user pages
-                unsafe { core::arch::asm!("stac", options(nostack, nomem)); }
+                unsafe {
+                    core::arch::asm!("stac", options(nostack, nomem));
+                }
             }
         }
 
-        UserAccessGuard { smap_active, cpu_id }
+        UserAccessGuard {
+            smap_active,
+            cpu_id,
+        }
     }
 }
 
@@ -173,7 +178,9 @@ impl Drop for UserAccessGuard {
             assert!(prev_depth > 0, "SMAP guard depth underflow");
             if prev_depth == 1 {
                 // Clear AC flag to restore SMAP protection
-                unsafe { core::arch::asm!("clac", options(nostack, nomem)); }
+                unsafe {
+                    core::arch::asm!("clac", options(nostack, nomem));
+                }
             }
         }
     }
@@ -196,10 +203,7 @@ impl Drop for UserAccessGuard {
 #[inline]
 pub fn is_in_usercopy() -> bool {
     let pid = current_pid_raw();
-    USER_COPY_STATE.with(|s| {
-        s.active.load(Ordering::SeqCst)
-            && s.pid.load(Ordering::SeqCst) == pid
-    })
+    USER_COPY_STATE.with(|s| s.active.load(Ordering::SeqCst) && s.pid.load(Ordering::SeqCst) == pid)
 }
 
 /// Set the fault flag (called from page_fault_handler)
@@ -237,7 +241,8 @@ impl UserCopyGuard {
             s.faulted.store(false, Ordering::SeqCst);
             s.pid.store(current_pid_raw(), Ordering::SeqCst);
             s.start.store(buffer_start, Ordering::SeqCst);
-            s.end.store(buffer_start.saturating_add(len), Ordering::SeqCst);
+            s.end
+                .store(buffer_start.saturating_add(len), Ordering::SeqCst);
             s.active.store(true, Ordering::SeqCst);
         });
         UserCopyGuard { cpu_id }
@@ -436,9 +441,8 @@ pub fn try_handle_usercopy_fault(fault_addr: usize) -> bool {
 
     // Ensure the fault belongs to the active buffer range to avoid
     // swallowing unrelated user faults
-    let (start, end) = USER_COPY_STATE.with(|s| {
-        (s.start.load(Ordering::SeqCst), s.end.load(Ordering::SeqCst))
-    });
+    let (start, end) =
+        USER_COPY_STATE.with(|s| (s.start.load(Ordering::SeqCst), s.end.load(Ordering::SeqCst)));
     if start == 0 || fault_addr < start || fault_addr >= end {
         return false;
     }
@@ -449,4 +453,78 @@ pub fn try_handle_usercopy_fault(fault_addr: usize) -> bool {
     // Return true to indicate this is a usercopy fault
     // The page_fault_handler should terminate the process gracefully
     true
+}
+
+/// Maximum length for user-space C strings (paths, arguments)
+pub const MAX_CSTRING_LEN: usize = 4096;
+
+/// Fault-tolerant copy of a NUL-terminated string from user space
+///
+/// Copies bytes from user space until a NUL terminator is found or
+/// MAX_CSTRING_LEN is reached. Returns the string bytes WITHOUT the NUL.
+///
+/// # Arguments
+/// * `src` - Source user space pointer to NUL-terminated string
+///
+/// # Returns
+/// * `Ok(Vec<u8>)` - String bytes (not including NUL terminator)
+/// * `Err(())` - Page fault occurred, null pointer, or string too long
+///
+/// # Security (Z-3 fix)
+///
+/// This function uses fault-tolerant byte-by-byte copy to safely handle:
+/// - Unmapped user memory (returns EFAULT instead of kernel panic)
+/// - TOCTOU attacks where memory is unmapped during copy
+/// - Overly long strings (bounded by MAX_CSTRING_LEN)
+pub fn copy_user_cstring(src: *const u8) -> Result<alloc::vec::Vec<u8>, ()> {
+    use alloc::vec::Vec;
+
+    if src.is_null() {
+        return Err(());
+    }
+
+    // Validate that starting address is in user space
+    let start_addr = src as usize;
+    if start_addr >= USER_SPACE_TOP {
+        return Err(());
+    }
+
+    // Allow supervisor access to user pages when SMAP is enabled
+    let _smap_guard = UserAccessGuard::new();
+
+    // Set up the copy state - we don't know exact length, use max
+    let _guard = UserCopyGuard::new(start_addr, MAX_CSTRING_LEN);
+
+    let mut result = Vec::with_capacity(256); // Typical path length
+
+    for i in 0..MAX_CSTRING_LEN {
+        // Check if a fault occurred in previous iteration
+        if check_and_clear_fault() {
+            return Err(());
+        }
+
+        // Validate each byte address is still in user space
+        let byte_addr = match start_addr.checked_add(i) {
+            Some(addr) if addr < USER_SPACE_TOP => addr,
+            _ => return Err(()),
+        };
+
+        // Read one byte from user space
+        let byte = unsafe { core::ptr::read_volatile(byte_addr as *const u8) };
+
+        // Check for fault after read
+        if check_and_clear_fault() {
+            return Err(());
+        }
+
+        // NUL terminator found - done
+        if byte == 0 {
+            return Ok(result);
+        }
+
+        result.push(byte);
+    }
+
+    // String too long (no NUL found within MAX_CSTRING_LEN)
+    Err(())
 }

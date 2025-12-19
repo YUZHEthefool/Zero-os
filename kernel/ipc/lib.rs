@@ -9,59 +9,29 @@ use alloc::boxed::Box;
 extern crate drivers;
 
 pub use kernel_core::process;
-use kernel_core::{SyscallError, FileOps};
+use kernel_core::{FileOps, SyscallError};
 
-pub mod ipc;
-pub mod sync;
-pub mod pipe;
 pub mod futex;
+pub mod ipc;
+pub mod pipe;
+pub mod sync;
 
 pub use ipc::{
-    cleanup_process_endpoints,
-    destroy_endpoint,
-    grant_access,
-    receive_message,
-    receive_message_blocking,
-    receive_message_with_retries,
-    register_endpoint,
-    revoke_access,
-    send_message,
-    send_message_notify,
-    get_queue_length,
-    EndpointId,
-    IpcError,
-    Message,
-    ReceivedMessage,
+    cleanup_process_endpoints, destroy_endpoint, get_queue_length, grant_access, receive_message,
+    receive_message_blocking, receive_message_with_retries, register_endpoint, revoke_access,
+    send_message, send_message_notify, EndpointId, IpcError, Message, ReceivedMessage,
 };
 
-pub use sync::{
-    WaitQueue,
-    KMutex,
-    Semaphore,
-    CondVar,
-};
+pub use sync::{CondVar, KMutex, Semaphore, WaitQueue};
 
 pub use pipe::{
-    create_pipe,
-    create_pipe_with_capacity,
-    PipeHandle,
-    PipeEndType,
-    PipeError,
-    PipeFlags,
-    PipeId,
-    PipeStatus,
-    DEFAULT_PIPE_CAPACITY,
+    create_pipe, create_pipe_with_capacity, PipeEndType, PipeError, PipeFlags, PipeHandle, PipeId,
+    PipeStatus, DEFAULT_PIPE_CAPACITY,
 };
 
 pub use futex::{
-    FutexTable,
-    FutexError,
-    FUTEX_WAIT,
-    FUTEX_WAKE,
-    futex_wait,
-    futex_wake,
-    cleanup_process_futexes,
-    active_futex_count,
+    active_futex_count, cleanup_process_futexes, futex_wait, futex_wake, FutexError, FutexTable,
+    FUTEX_WAIT, FUTEX_WAKE,
 };
 
 // ============================================================================
@@ -86,7 +56,8 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
         let mut proc = process.lock();
 
         // 分配读端 fd
-        let rfd = proc.allocate_fd(Box::new(read_handle) as Box<dyn FileOps>)
+        let rfd = proc
+            .allocate_fd(Box::new(read_handle) as Box<dyn FileOps>)
             .ok_or(SyscallError::EMFILE)?;
 
         // 分配写端 fd，失败时回滚
@@ -102,7 +73,10 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
         (rfd, wfd)
     };
 
-    println!("sys_pipe: created pipe (read_fd={}, write_fd={})", read_fd, write_fd);
+    println!(
+        "sys_pipe: created pipe (read_fd={}, write_fd={})",
+        read_fd, write_fd
+    );
     Ok((read_fd, write_fd))
 }
 
@@ -218,7 +192,9 @@ fn fs_error_to_syscall(err: vfs::types::FsError) -> SyscallError {
         FsError::ReadOnly => SyscallError::EACCES,
         FsError::NoSpace | FsError::NoMem => SyscallError::ENOMEM,
         FsError::Io => SyscallError::EIO,
-        FsError::Invalid | FsError::NameTooLong | FsError::CrossDev | FsError::Seek => SyscallError::EINVAL,
+        FsError::Invalid | FsError::NameTooLong | FsError::CrossDev | FsError::Seek => {
+            SyscallError::EINVAL
+        }
         FsError::NotSupported => SyscallError::ENOSYS,
         FsError::Pipe => SyscallError::EPIPE,
         FsError::NotEmpty => SyscallError::EBUSY,
@@ -240,24 +216,24 @@ fn fs_error_to_syscall(err: vfs::types::FsError) -> SyscallError {
 ///
 /// FUTEX_WAIT: 成功返回 0，值不匹配返回 EAGAIN
 /// FUTEX_WAKE: 返回实际唤醒的进程数量
-fn futex_callback(uaddr: usize, op: i32, val: u32, current_value: u32) -> Result<usize, SyscallError> {
+fn futex_callback(
+    uaddr: usize,
+    op: i32,
+    val: u32,
+    current_value: u32,
+) -> Result<usize, SyscallError> {
     use process::current_pid;
 
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
 
     match op {
-        futex::FUTEX_WAIT => {
-            futex_wait(pid, uaddr, val, current_value)
-                .map_err(|e| match e {
-                    FutexError::WouldBlock => SyscallError::EAGAIN,
-                    FutexError::Fault => SyscallError::EFAULT,
-                    FutexError::NoProcess => SyscallError::ESRCH,
-                    FutexError::InvalidOperation => SyscallError::EINVAL,
-                })
-        }
-        futex::FUTEX_WAKE => {
-            Ok(futex_wake(pid, uaddr, val as usize))
-        }
+        futex::FUTEX_WAIT => futex_wait(pid, uaddr, val, current_value).map_err(|e| match e {
+            FutexError::WouldBlock => SyscallError::EAGAIN,
+            FutexError::Fault => SyscallError::EFAULT,
+            FutexError::NoProcess => SyscallError::ESRCH,
+            FutexError::InvalidOperation => SyscallError::EINVAL,
+        }),
+        futex::FUTEX_WAKE => Ok(futex_wake(pid, uaddr, val as usize)),
         _ => Err(SyscallError::EINVAL),
     }
 }

@@ -38,6 +38,9 @@ pub const USER_STACK_SIZE: usize = 0x20_0000;
 /// 页大小
 const PAGE_SIZE: usize = 0x1000;
 
+/// Z-10 fix: 页映射记录类型，用于失败时统一回滚
+type MappedEntry = (Page<Size4KiB>, PhysFrame<Size4KiB>);
+
 /// ELF 加载错误
 #[derive(Debug, Clone, Copy)]
 pub enum ElfLoadError {
@@ -93,15 +96,32 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
     // 验证 ELF 头
     validate_elf_header(&elf)?;
 
+    // Z-10 fix: 追踪所有已映射的页，用于失败时统一回滚
+    // 这确保如果段 N 失败，段 0..N-1 的映射也会被清理
+    //
+    // 【性能优化】预分配容量避免动态扩容导致的堆分配
+    // 估算：典型 ELF 约 10 个 LOAD 段 + 512 页用户栈
+    // 每段平均 10 页 = 100 页 + 512 = ~612 页
+    // 使用 1024 作为合理上限，避免堆碎片化
+    let mut all_mappings: Vec<MappedEntry> = Vec::with_capacity(1024);
+
     // 加载所有 PT_LOAD 段
     for ph in elf.program_iter() {
         if ph.get_type() == Ok(PhType::Load) {
-            load_segment(&elf, &ph)?;
+            if let Err(e) = load_segment_tracked(&elf, &ph, &mut all_mappings) {
+                // 回滚所有已成功映射的段
+                rollback_all_mappings(&mut all_mappings);
+                return Err(e);
+            }
         }
     }
 
     // 分配用户栈
-    allocate_user_stack()?;
+    if let Err(e) = allocate_user_stack_tracked(&mut all_mappings) {
+        // 回滚所有已加载的段
+        rollback_all_mappings(&mut all_mappings);
+        return Err(e);
+    }
 
     Ok(ElfLoadResult {
         entry: elf.header.pt2.entry_point(),
@@ -143,8 +163,22 @@ fn validate_elf_header(elf: &ElfFile) -> Result<(), ElfLoadError> {
     Ok(())
 }
 
-/// 加载单个程序段
-fn load_segment(elf: &ElfFile, ph: &xmas_elf::program::ProgramHeader) -> Result<(), ElfLoadError> {
+/// Z-10 fix: 加载单个程序段并追踪映射，便于失败时全局回滚
+///
+/// # Arguments
+///
+/// * `elf` - ELF 文件引用
+/// * `ph` - 程序头
+/// * `tracked` - 全局映射追踪向量，成功映射的页会被追加到此向量
+///
+/// # Returns
+///
+/// 成功返回 Ok(())，失败时调用方负责使用 tracked 进行全局回滚
+fn load_segment_tracked(
+    elf: &ElfFile,
+    ph: &xmas_elf::program::ProgramHeader,
+    tracked: &mut Vec<MappedEntry>,
+) -> Result<(), ElfLoadError> {
     let vaddr = ph.virtual_addr() as usize;
     let memsz = ph.mem_size() as usize;
     let filesz = ph.file_size() as usize;
@@ -195,14 +229,22 @@ fn load_segment(elf: &ElfFile, ph: &xmas_elf::program::ProgramHeader) -> Result<
         flags |= PageTableFlags::NO_EXECUTE;
     }
 
-    // 映射页面（带回滚支持）
+    // Z-10 fix: 本段成功映射的页（用于数据复制）
+    // 【性能优化】预分配精确容量，避免 push 时重新分配
+    let mut segment_mapped: Vec<MappedEntry> = Vec::with_capacity(page_count);
     let mut frame_alloc = FrameAllocator::new();
-    let mut mapped: Vec<(Page<Size4KiB>, PhysFrame<Size4KiB>)> = Vec::new();
 
-    println!("  load_segment: vaddr=0x{:x}, memsz={}, filesz={}, pages={}",
-             vaddr, memsz, filesz, page_count);
-    println!("    flags: R={} W={} X={} => PTFlags: 0x{:x}",
-             true, ph.flags().is_write(), ph.flags().is_execute(), flags.bits());
+    println!(
+        "  load_segment: vaddr=0x{:x}, memsz={}, filesz={}, pages={}",
+        vaddr, memsz, filesz, page_count
+    );
+    println!(
+        "    flags: R={} W={} X={} => PTFlags: 0x{:x}",
+        true,
+        ph.flags().is_write(),
+        ph.flags().is_execute(),
+        flags.bits()
+    );
 
     // 注意：用户地址空间的 4MB-6MB 区域已准备好 4KB 页表
     // ELF 加载器直接创建新的 4KB 页映射
@@ -218,18 +260,20 @@ fn load_segment(elf: &ElfFile, ph: &xmas_elf::program::ProgramHeader) -> Result<
                     .ok_or(ElfLoadError::OutOfMemory)?;
 
                 if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
-                    println!("ELF loader: map_page FAILED for va=0x{:x}: {:?}", va.as_u64(), e);
-                    // 【关键修复】回滚已映射的页，避免泄漏物理帧或留下半成品映射
+                    println!(
+                        "ELF loader: map_page FAILED for va=0x{:x}: {:?}",
+                        va.as_u64(),
+                        e
+                    );
+                    // Z-10 fix: 释放刚分配但未映射成功的帧
+                    // 调用方会使用 tracked 回滚所有已成功映射的页
                     frame_alloc.deallocate_frame(frame);
-                    for (cleanup_page, cleanup_frame) in mapped.drain(..) {
-                        if mgr.unmap_page(cleanup_page).is_ok() {
-                            frame_alloc.deallocate_frame(cleanup_frame);
-                        }
-                    }
                     return Err(ElfLoadError::MapFailed);
                 }
 
-                mapped.push((page, frame));
+                // Z-10 fix: 追加到本段和全局追踪向量
+                segment_mapped.push((page, frame));
+                tracked.push((page, frame));
             }
             Ok(())
         })?;
@@ -237,25 +281,25 @@ fn load_segment(elf: &ElfFile, ph: &xmas_elf::program::ProgramHeader) -> Result<
 
     // 【修复】使用直映物理地址访问内存，避免依赖当前 CR3
     // 首先清零所有映射的页面（防止信息泄漏）
-    for (_, frame) in mapped.iter() {
+    for (_, frame) in segment_mapped.iter() {
         let base = phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
-        unsafe { ptr::write_bytes(base, 0, PAGE_SIZE); }
+        unsafe {
+            ptr::write_bytes(base, 0, PAGE_SIZE);
+        }
     }
 
     // 复制文件内容到正确的偏移位置
     let mut remaining_copy = filesz;
     let mut src_off = offset;
-    for (idx, (_, frame)) in mapped.iter().enumerate() {
-        if remaining_copy == 0 { break; }
+    for (idx, (_, frame)) in segment_mapped.iter().enumerate() {
+        if remaining_copy == 0 {
+            break;
+        }
         let base = phys_to_virt(frame.start_address()).as_mut_ptr::<u8>();
         let start = if idx == 0 { page_offset } else { 0 };
         let len = cmp::min(PAGE_SIZE - start, remaining_copy);
         unsafe {
-            ptr::copy_nonoverlapping(
-                elf.input.as_ptr().add(src_off),
-                base.add(start),
-                len,
-            );
+            ptr::copy_nonoverlapping(elf.input.as_ptr().add(src_off), base.add(start), len);
         }
         remaining_copy -= len;
         src_off += len;
@@ -264,8 +308,16 @@ fn load_segment(elf: &ElfFile, ph: &xmas_elf::program::ProgramHeader) -> Result<
     Ok(())
 }
 
-/// 分配用户栈
-fn allocate_user_stack() -> Result<(), ElfLoadError> {
+/// Z-10 fix: 分配用户栈并追踪映射，便于失败时全局回滚
+///
+/// # Arguments
+///
+/// * `tracked` - 全局映射追踪向量，成功映射的页会被追加到此向量
+///
+/// # Returns
+///
+/// 成功返回 Ok(())，失败时调用方负责使用 tracked 进行全局回滚
+fn allocate_user_stack_tracked(tracked: &mut Vec<MappedEntry>) -> Result<(), ElfLoadError> {
     let stack_base = USER_STACK_TOP as usize - USER_STACK_SIZE;
     let page_count = USER_STACK_SIZE / PAGE_SIZE;
 
@@ -274,9 +326,10 @@ fn allocate_user_stack() -> Result<(), ElfLoadError> {
         | PageTableFlags::USER_ACCESSIBLE
         | PageTableFlags::NO_EXECUTE;
 
-    // 【修复】带回滚支持的栈分配
+    // Z-10 fix: 本段成功映射的页（用于数据清零）
+    // 【性能优化】预分配精确容量，避免 push 时重新分配
+    let mut stack_mapped: Vec<MappedEntry> = Vec::with_capacity(page_count);
     let mut frame_alloc = FrameAllocator::new();
-    let mut mapped: Vec<(Page<Size4KiB>, PhysFrame<Size4KiB>)> = Vec::new();
 
     unsafe {
         page_table::with_current_manager(VirtAddr::new(0), |mgr| -> Result<(), ElfLoadError> {
@@ -288,18 +341,21 @@ fn allocate_user_stack() -> Result<(), ElfLoadError> {
                     .allocate_frame()
                     .ok_or(ElfLoadError::OutOfMemory)?;
 
-                if let Err(_) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
-                    // 回滚已映射的页
+                if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
+                    println!(
+                        "ELF loader: map_page FAILED for stack va=0x{:x}: {:?}",
+                        va.as_u64(),
+                        e
+                    );
+                    // Z-10 fix: 释放刚分配但未映射成功的帧
+                    // 调用方会使用 tracked 回滚所有已成功映射的页
                     frame_alloc.deallocate_frame(frame);
-                    for (cleanup_page, cleanup_frame) in mapped.drain(..) {
-                        if mgr.unmap_page(cleanup_page).is_ok() {
-                            frame_alloc.deallocate_frame(cleanup_frame);
-                        }
-                    }
                     return Err(ElfLoadError::MapFailed);
                 }
 
-                mapped.push((page, frame));
+                // Z-10 fix: 追加到本段和全局追踪向量
+                stack_mapped.push((page, frame));
+                tracked.push((page, frame));
             }
             Ok(())
         })?;
@@ -307,15 +363,62 @@ fn allocate_user_stack() -> Result<(), ElfLoadError> {
 
     // 【修复】使用直映物理地址清零栈区域
     let mut remaining = USER_STACK_SIZE;
-    for (_, frame) in mapped.iter() {
+    for (_, frame) in stack_mapped.iter() {
         let base = unsafe { phys_to_virt(frame.start_address()).as_mut_ptr::<u8>() };
         let len = cmp::min(PAGE_SIZE, remaining);
-        unsafe { ptr::write_bytes(base, 0, len); }
+        unsafe {
+            ptr::write_bytes(base, 0, len);
+        }
         remaining -= len;
-        if remaining == 0 { break; }
+        if remaining == 0 {
+            break;
+        }
     }
 
     Ok(())
+}
+
+/// Z-10 fix: 回滚所有已追踪的映射（段 + 栈）
+///
+/// 当 ELF 加载过程中任何步骤失败时，调用此函数清理所有已成功建立的映射，
+/// 防止物理帧泄漏和半成品地址空间。
+///
+/// # Arguments
+///
+/// * `tracked` - 已追踪的映射向量，函数会清空此向量
+///
+/// # Safety
+///
+/// 必须在当前进程的地址空间上下文中调用（CR3 指向目标页表）
+fn rollback_all_mappings(tracked: &mut Vec<MappedEntry>) {
+    if tracked.is_empty() {
+        return;
+    }
+
+    println!("ELF loader: rolling back {} mapped pages", tracked.len());
+
+    let mut frame_alloc = FrameAllocator::new();
+
+    unsafe {
+        page_table::with_current_manager(VirtAddr::new(0), |mgr| {
+            while let Some((page, _expected_frame)) = tracked.pop() {
+                // 尝试取消映射并释放物理帧
+                match mgr.unmap_page(page) {
+                    Ok(unmapped_frame) => {
+                        frame_alloc.deallocate_frame(unmapped_frame);
+                    }
+                    Err(e) => {
+                        println!(
+                            "ELF rollback: unmap_page failed for va=0x{:x}: {:?}",
+                            page.start_address().as_u64(),
+                            e
+                        );
+                        // 继续尝试回滚其他页，不要因为一个失败就停止
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// 打印 ELF 文件信息（调试用）

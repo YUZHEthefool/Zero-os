@@ -5,6 +5,11 @@ edition = "2021"
 
 # 移除内核内部 workspace 配置，避免与顶层 workspace 冲突
 
+[features]
+default = []
+# Enable interactive shell instead of hello test program
+shell = []
+
 [dependencies]
 spin = "0.9"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }

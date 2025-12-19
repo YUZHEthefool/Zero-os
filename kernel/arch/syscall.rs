@@ -23,8 +23,8 @@
 //! - R11 = 用户态 RFLAGS
 //! - CS/SS 根据 STAR MSR 切换
 
-use core::arch::asm;
 use crate::gdt;
+use core::arch::asm;
 
 /// IA32_STAR MSR 地址
 const IA32_STAR: u32 = 0xC000_0081;
@@ -78,23 +78,27 @@ const SYSCALL_FRAME_SIZE: usize = SYSCALL_FRAME_QWORDS * 8;
 /// 临时栈大小（4KB，仅用于单核）
 const SYSCALL_SCRATCH_SIZE: usize = 4096;
 
+/// FPU/SIMD 保存区大小（FXSAVE/FXRSTOR 需要 512 字节且 16 字节对齐）
+/// Z-1 fix: 用于在 syscall 路径中保存/恢复用户态 FPU 状态
+const FPU_SAVE_AREA_SIZE: usize = 512;
+
 // 帧内各寄存器的偏移量
-const OFF_RAX: usize = 0;       // 系统调用号 / 返回值
-const OFF_RCX: usize = 8;       // 用户 RIP
-const OFF_RDX: usize = 16;      // arg2
-const OFF_RBX: usize = 24;      // callee-saved
-const OFF_RSP: usize = 32;      // 用户 RSP
-const OFF_RBP: usize = 40;      // callee-saved
-const OFF_RSI: usize = 48;      // arg1
-const OFF_RDI: usize = 56;      // arg0
-const OFF_R8: usize = 64;       // arg4
-const OFF_R9: usize = 72;       // arg5
-const OFF_R10: usize = 80;      // arg3
-const OFF_R11: usize = 88;      // 用户 RFLAGS
-const OFF_R12: usize = 96;      // callee-saved
-const OFF_R13: usize = 104;     // callee-saved
-const OFF_R14: usize = 112;     // callee-saved
-const OFF_R15: usize = 120;     // callee-saved
+const OFF_RAX: usize = 0; // 系统调用号 / 返回值
+const OFF_RCX: usize = 8; // 用户 RIP
+const OFF_RDX: usize = 16; // arg2
+const OFF_RBX: usize = 24; // callee-saved
+const OFF_RSP: usize = 32; // 用户 RSP
+const OFF_RBP: usize = 40; // callee-saved
+const OFF_RSI: usize = 48; // arg1
+const OFF_RDI: usize = 56; // arg0
+const OFF_R8: usize = 64; // arg4
+const OFF_R9: usize = 72; // arg5
+const OFF_R10: usize = 80; // arg3
+const OFF_R11: usize = 88; // 用户 RFLAGS
+const OFF_R12: usize = 96; // callee-saved
+const OFF_R13: usize = 104; // callee-saved
+const OFF_R14: usize = 112; // callee-saved
+const OFF_R15: usize = 120; // callee-saved
 
 /// 对齐的栈存储（确保 16 字节对齐满足 ABI 要求）
 #[repr(C, align(16))]
@@ -197,8 +201,8 @@ pub unsafe fn init_syscall_msr(syscall_entry: u64) {
 
     // 写入 SFMASK (SYSCALL 时清除的 RFLAGS 位)
     // 清除 IF/TF/DF/AC 以及 IOPL/NT/RF，防止特权/调试位带入内核
-    let sfmask = RFLAGS_IF | RFLAGS_TF | RFLAGS_DF | RFLAGS_AC
-               | RFLAGS_IOPL | RFLAGS_NT | RFLAGS_RF;
+    let sfmask =
+        RFLAGS_IF | RFLAGS_TF | RFLAGS_DF | RFLAGS_AC | RFLAGS_IOPL | RFLAGS_NT | RFLAGS_RF;
     wrmsr(IA32_SFMASK, sfmask);
 
     // 启用 EFER.SCE (System Call Extensions)
@@ -211,7 +215,10 @@ pub unsafe fn init_syscall_msr(syscall_entry: u64) {
     println!("  STAR:   0x{:016x}", star_value);
     println!("  LSTAR:  0x{:016x}", syscall_entry);
     println!("  SFMASK: 0x{:016x}", sfmask);
-    println!("  Kernel CS: 0x{:x}, SYSRET base: 0x{:x}", kernel_cs, sysret_base);
+    println!(
+        "  Kernel CS: 0x{:x}, SYSRET base: 0x{:x}",
+        kernel_cs, sysret_base
+    );
 }
 
 /// 检查 SYSCALL/SYSRET 是否已初始化
@@ -302,10 +309,9 @@ extern "C" fn syscall_dispatcher_bridge(
 ///    SMP 环境下需要改为 per-CPU 变量。当前由于 SFMASK 清除 IF 位，
 ///    在单核环境下不会重入。
 ///
-/// 2. **FPU/SIMD 状态**：此存根不保存/恢复 FPU/SIMD 状态。如果系统调用
-///    路径使用 SSE/AVX 指令，用户态 FP 状态可能被破坏。当前假设内核
-///    系统调用路径避免使用 SIMD。如需支持，应在分发器调用前后添加
-///    FXSAVE/FXRSTOR。
+/// 2. **FPU/SIMD 状态**：在分发器调用前后使用 FXSAVE64/FXRSTOR64 保存并
+///    恢复用户态 FPU/SIMD 状态。当前仍为单核实现，SMP 场景需要改为 per-CPU
+///    保存区。（Z-1 fix）
 ///
 /// # Safety
 ///
@@ -364,22 +370,27 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         // ========================================
         "mov r12, rsp",                             // r12 = 临时栈上的帧指针
 
-        // 栈对齐修复：System V ABI 要求 call 前 RSP ≡ 8 (mod 16)
-        // 当前 RSP 在 frame 底部 (scratch_stack + scratch_size - frame_size)
-        // 这是 16 字节对齐的，所以需要 sub 8 使其变为 8 mod 16
-        "sub rsp, 8",                               // 对齐调整
-        "call {get_rsp0}",                          // 获取 TSS RSP0
-        "add rsp, 8",                               // 恢复（可选，因为马上切换栈）
+        // 获取内核栈顶（TSS RSP0）- 栈已 16B 对齐无需额外调整
+        "call {get_rsp0}",                          // 返回值在 rax
         "mov rsp, rax",                             // 切换到内核栈
 
-        // 在内核栈上分配帧并复制
-        "sub rsp, {frame_size}",
+        // Z-1 fix: 在内核栈上分配 FPU 保存区与通用寄存器帧
+        // 内存布局（从高到低）：
+        //   [TSS RSP0]        <- 内核栈顶（16B 对齐）
+        //   [FPU save area]   <- 512 字节，16B 对齐
+        //   [syscall frame]   <- 128 字节，通用寄存器
+        "sub rsp, {fpu_save_size}",                 // 512B FPU 保存区
+        "sub rsp, {frame_size}",                    // 128B 通用寄存器帧
         "mov rdi, rsp",                             // dst = 内核栈帧
         "mov rsi, r12",                             // src = 临时栈帧
         "mov rcx, {frame_qwords}",                  // count
         "rep movsq",                                // 复制帧
 
         "mov r12, rsp",                             // r12 = 内核栈帧指针（保留用于恢复）
+        "lea r13, [rsp + {frame_size}]",            // r13 = FPU 保存区指针（位于帧上方）
+
+        // Z-1 fix: 保存用户 FPU/SIMD 状态
+        "fxsave64 [r13]",
 
         // ========================================
         // 阶段 5: 调用系统调用分发器
@@ -396,17 +407,24 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "mov r8,  [r12 + {off_r10}]",               // arg3 (原 R10，不是 RCX)
         "mov r9,  [r12 + {off_r8}]",                // arg4 (原 R8)
 
-        // arg5 需要通过栈传递
+        // Z-2 fix: 栈对齐修复
+        // 当前 RSP 是 16B 对齐（frame 和 FPU 区都是 16 的倍数）
+        // System V ABI: call 前 RSP 必须 16B 对齐（call 后入口 RSP+8 是 16B 对齐）
+        // 需要 sub 8 + push = 16B，保持对齐
+        "sub rsp, 8",                               // 对齐填充
         "push qword ptr [r12 + {off_r9}]",          // arg5 (原 R9)
 
         "call {dispatcher}",                        // 调用分发器
 
-        "add rsp, 8",                               // 清理栈参数
+        "add rsp, 16",                              // 清理栈参数 + 对齐填充
 
         // ========================================
         // 阶段 6: 恢复寄存器
         // ========================================
         "cli",                                      // 禁用中断
+
+        // Z-1 fix: 恢复用户 FPU/SIMD 状态
+        "fxrstor64 [r13]",
 
         // SYSRET 安全检查：用户 RIP/RSP 必须是规范地址且在低半区
         // 这是防御 CVE-2014-4699/CVE-2014-9322 类漏洞的关键
@@ -459,6 +477,8 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         // IRETQ 回退路径：非规范或高半区地址
         // ========================================
         "2:",
+        // Z-1 fix: IRETQ 路径也需要恢复 FPU 状态（r13 仍指向 FPU 保存区）
+        "fxrstor64 [r13]",
         "mov rcx, [r12 + {off_rcx}]",               // 用户 RIP
         "mov rbx, [r12 + {off_rbx}]",
         "mov rbp, [r12 + {off_rbp}]",
@@ -488,6 +508,7 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         scratch_size = const SYSCALL_SCRATCH_SIZE,
         frame_size = const SYSCALL_FRAME_SIZE,
         frame_qwords = const SYSCALL_FRAME_QWORDS,
+        fpu_save_size = const FPU_SAVE_AREA_SIZE,
         off_rax = const OFF_RAX,
         off_rcx = const OFF_RCX,
         off_rdx = const OFF_RDX,
@@ -527,5 +548,8 @@ mod tests {
         assert_eq!(SYSCALL_FRAME_SIZE, 128);
         // 验证所有偏移量都在帧范围内
         assert!(OFF_R15 + 8 <= SYSCALL_FRAME_SIZE);
+        // Z-1 fix: 验证 FPU 保存区大小和对齐要求
+        assert_eq!(FPU_SAVE_AREA_SIZE, 512);
+        assert_eq!(FPU_SAVE_AREA_SIZE % 16, 0); // FXSAVE 需要 16B 对齐
     }
 }

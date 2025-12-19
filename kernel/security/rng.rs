@@ -323,12 +323,8 @@ impl ChaCha20Rng {
 
         // Key (8 words)
         for i in 0..8 {
-            state[4 + i] = u32::from_le_bytes([
-                key[i * 4],
-                key[i * 4 + 1],
-                key[i * 4 + 2],
-                key[i * 4 + 3],
-            ]);
+            state[4 + i] =
+                u32::from_le_bytes([key[i * 4], key[i * 4 + 1], key[i * 4 + 2], key[i * 4 + 3]]);
         }
 
         // Counter (starts at 0)
@@ -468,10 +464,9 @@ mod tests {
     fn test_chacha20_quarter_round() {
         // Test vector from RFC 7539
         let mut state = [
-            0x879531e0, 0xc5ecf37d, 0x516461b1, 0xc9a62f8a,
-            0x44c20ef3, 0x3390af7f, 0xd9fc690b, 0x2a5f714c,
-            0x53372767, 0xb00a5631, 0x974c541a, 0x359e9963,
-            0x5c971061, 0x3d631689, 0x2098d9d6, 0x91dbd320,
+            0x879531e0, 0xc5ecf37d, 0x516461b1, 0xc9a62f8a, 0x44c20ef3, 0x3390af7f, 0xd9fc690b,
+            0x2a5f714c, 0x53372767, 0xb00a5631, 0x974c541a, 0x359e9963, 0x5c971061, 0x3d631689,
+            0x2098d9d6, 0x91dbd320,
         ];
 
         ChaCha20Rng::quarter_round(&mut state, 2, 7, 8, 13);

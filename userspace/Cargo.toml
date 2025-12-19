@@ -14,6 +14,10 @@ crate-type = ["staticlib", "rlib"]
 name = "hello"
 path = "src/main.rs"
 
+[[bin]]
+name = "shell"
+path = "src/shell.rs"
+
 [profile.dev]
 panic = "abort"
 opt-level = "z"

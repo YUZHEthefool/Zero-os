@@ -146,13 +146,23 @@ impl AuditSubject {
     /// Create a new audit subject
     #[inline]
     pub const fn new(pid: u32, uid: u32, gid: u32, cap_id: Option<u64>) -> Self {
-        Self { pid, uid, gid, cap_id }
+        Self {
+            pid,
+            uid,
+            gid,
+            cap_id,
+        }
     }
 
     /// Create a kernel subject (pid 0)
     #[inline]
     pub const fn kernel() -> Self {
-        Self { pid: 0, uid: 0, gid: 0, cap_id: None }
+        Self {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+            cap_id: None,
+        }
     }
 }
 
@@ -336,7 +346,11 @@ fn hash_object(hasher: &mut Fnv1a64, obj: &AuditObject) {
         AuditObject::None => {
             hasher.write_u8(0);
         }
-        AuditObject::Path { inode, mode, path_hash } => {
+        AuditObject::Path {
+            inode,
+            mode,
+            path_hash,
+        } => {
             hasher.write_u8(1);
             hasher.write_u64(*inode);
             hasher.write_u32(*mode);
@@ -580,7 +594,10 @@ pub fn init(capacity: usize) -> Result<(), AuditError> {
         Ok(())
     })?;
 
-    println!("  Audit subsystem initialized (capacity: {} events)", capacity);
+    println!(
+        "  Audit subsystem initialized (capacity: {} events)",
+        capacity
+    );
     Ok(())
 }
 

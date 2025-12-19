@@ -5,6 +5,8 @@
 //! - /dev/zero - Returns infinite zeros on read, discards writes
 //! - /dev/console - Kernel console (serial output)
 
+use crate::traits::{FileHandle, FileSystem, Inode};
+use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -12,10 +14,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::RwLock;
 use kernel_core::FileOps;
-use crate::traits::{FileHandle, FileSystem, Inode};
-use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
+use spin::RwLock;
 
 /// Global device filesystem ID counter
 static NEXT_FS_ID: AtomicU64 = AtomicU64::new(1);
@@ -357,9 +357,9 @@ impl Inode for ConsoleDevInode {
         Ok(Box::new(ConsoleDevFile { flags }))
     }
 
-    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, FsError> {
-        // Console read not implemented yet (would need keyboard input queue)
-        Ok(0)
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        // Console read: read from keyboard input buffer (non-blocking)
+        Ok(drivers::keyboard_read(buf))
     }
 
     fn write_at(&self, _offset: u64, data: &[u8]) -> Result<usize, FsError> {
@@ -442,8 +442,9 @@ impl DevFileOps for ZeroDevFile {
 }
 
 impl DevFileOps for ConsoleDevFile {
-    fn dev_read(&self, _buf: &mut [u8]) -> Result<usize, FsError> {
-        Ok(0) // No input yet
+    fn dev_read(&self, buf: &mut [u8]) -> Result<usize, FsError> {
+        // Console read: read from keyboard input buffer (non-blocking)
+        Ok(drivers::keyboard_read(buf))
     }
 
     fn dev_write(&self, data: &[u8]) -> Result<usize, FsError> {

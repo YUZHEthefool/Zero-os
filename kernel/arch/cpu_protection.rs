@@ -48,9 +48,18 @@ impl CpuProtectionStatus {
     /// Print status summary
     pub fn print(&self) {
         println!("CPU Protection Status:");
-        println!("  SMEP: supported={}, enabled={}", self.smep_supported, self.smep_enabled);
-        println!("  SMAP: supported={}, enabled={}", self.smap_supported, self.smap_enabled);
-        println!("  UMIP: supported={}, enabled={}", self.umip_supported, self.umip_enabled);
+        println!(
+            "  SMEP: supported={}, enabled={}",
+            self.smep_supported, self.smep_enabled
+        );
+        println!(
+            "  SMAP: supported={}, enabled={}",
+            self.smap_supported, self.smap_enabled
+        );
+        println!(
+            "  UMIP: supported={}, enabled={}",
+            self.umip_supported, self.umip_enabled
+        );
     }
 }
 

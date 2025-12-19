@@ -7,20 +7,20 @@
 //! - Syscall callback registration
 //! - DAC (Discretionary Access Control) permission enforcement
 
+use crate::devfs::DevFs;
+use crate::ramfs::RamFs;
+use crate::traits::{FileHandle, FileSystem, Inode};
+use crate::types::{DirEntry, FileMode, FsError, OpenFlags, Stat};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use spin::RwLock;
 use kernel_core::{
-    FileOps, FileDescriptor, SyscallError, VfsStat,
-    current_euid, current_egid, current_supplementary_groups, current_umask,
+    current_egid, current_euid, current_supplementary_groups, current_umask, FileDescriptor,
+    FileOps, SyscallError, VfsStat,
 };
-use crate::devfs::DevFs;
-use crate::ramfs::RamFs;
-use crate::traits::{FileHandle, FileSystem, Inode};
-use crate::types::{DirEntry, FileMode, FsError, OpenFlags, Stat};
+use spin::RwLock;
 
 /// Check if current process has required access permissions on a file
 ///
@@ -38,7 +38,12 @@ use crate::types::{DirEntry, FileMode, FsError, OpenFlags, Stat};
 ///
 /// # Returns
 /// `true` if access is permitted, `false` otherwise
-fn check_access_permission(stat: &Stat, need_read: bool, need_write: bool, need_exec: bool) -> bool {
+fn check_access_permission(
+    stat: &Stat,
+    need_read: bool,
+    need_write: bool,
+    need_exec: bool,
+) -> bool {
     // Get current process credentials (default to root if no process context)
     let euid = current_euid().unwrap_or(0);
     let egid = current_egid().unwrap_or(0);
@@ -248,10 +253,7 @@ impl Vfs {
         }
 
         // Walk path components
-        let components: Vec<&str> = relative_path
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
+        let components: Vec<&str> = relative_path.split('/').filter(|s| !s.is_empty()).collect();
 
         for (idx, component) in components.iter().enumerate() {
             if !current.is_dir() {
@@ -278,7 +280,12 @@ impl Vfs {
     /// Open a file by path
     ///
     /// Supports O_CREAT for file creation and O_EXCL for exclusive creation.
-    pub fn open(&self, path: &str, flags: OpenFlags, create_mode: u16) -> Result<Box<dyn FileOps>, FsError> {
+    pub fn open(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        create_mode: u16,
+    ) -> Result<Box<dyn FileOps>, FsError> {
         let path = normalize_path(path);
 
         // Resolve existing path or create on demand
@@ -490,7 +497,11 @@ impl Vfs {
             } else {
                 "/"
             };
-            Ok((mount_path.clone(), Arc::clone(&mount.fs), relative.to_string()))
+            Ok((
+                mount_path.clone(),
+                Arc::clone(&mount.fs),
+                relative.to_string(),
+            ))
         } else {
             // No mount found, check if we have a root fs
             let root_fs = self.root_fs.read();
@@ -616,7 +627,9 @@ fn fs_error_to_syscall(e: FsError) -> SyscallError {
         FsError::ReadOnly => SyscallError::EACCES,
         FsError::NoSpace | FsError::NoMem => SyscallError::ENOMEM,
         FsError::Io => SyscallError::EIO,
-        FsError::Invalid | FsError::NameTooLong | FsError::CrossDev | FsError::Seek => SyscallError::EINVAL,
+        FsError::Invalid | FsError::NameTooLong | FsError::CrossDev | FsError::Seek => {
+            SyscallError::EINVAL
+        }
         FsError::NotSupported => SyscallError::ENOSYS,
         FsError::BadFd => SyscallError::EBADF,
         FsError::Pipe => SyscallError::EPIPE,
@@ -630,7 +643,8 @@ fn vfs_open_callback(path: &str, flags: u32, mode: u32) -> Result<FileDescriptor
     let open_flags = OpenFlags::from_bits(flags);
     let perm = (mode & 0o7777) as u16;
 
-    VFS.open(path, open_flags, perm).map_err(fs_error_to_syscall)
+    VFS.open(path, open_flags, perm)
+        .map_err(fs_error_to_syscall)
 }
 
 /// VFS stat callback for syscall registration
@@ -663,7 +677,11 @@ fn vfs_stat_callback(path: &str) -> Result<VfsStat, SyscallError> {
 ///
 /// Called by sys_lseek to seek within a file
 /// Receives a &dyn Any reference and attempts to downcast to FileHandle
-fn vfs_lseek_callback(file_any: &dyn core::any::Any, offset: i64, whence: i32) -> Result<u64, SyscallError> {
+fn vfs_lseek_callback(
+    file_any: &dyn core::any::Any,
+    offset: i64,
+    whence: i32,
+) -> Result<u64, SyscallError> {
     use crate::traits::FileHandle;
     use crate::types::SeekWhence;
 
@@ -676,12 +694,11 @@ fn vfs_lseek_callback(file_any: &dyn core::any::Any, offset: i64, whence: i32) -
             _ => return Err(SyscallError::EINVAL),
         };
 
-        file_handle.seek(offset, seek_whence)
-            .map_err(|e| match e {
-                FsError::Seek => SyscallError::EINVAL,
-                FsError::Invalid => SyscallError::EINVAL,
-                _ => SyscallError::EIO,
-            })
+        file_handle.seek(offset, seek_whence).map_err(|e| match e {
+            FsError::Seek => SyscallError::EINVAL,
+            FsError::Invalid => SyscallError::EINVAL,
+            _ => SyscallError::EIO,
+        })
     } else {
         // Not a VFS FileHandle (e.g., pipe), seek not supported
         Err(SyscallError::EINVAL)

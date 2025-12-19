@@ -1,4 +1,6 @@
-use crate::process::{ProcessId, ProcessState, Priority, get_process, set_current_pid, current_pid};
+use crate::process::{
+    current_pid, get_process, set_current_pid, Priority, ProcessId, ProcessState,
+};
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 
@@ -7,10 +9,10 @@ use spin::Mutex;
 pub struct PriorityScheduler {
     /// 就绪队列，按优先级组织（优先级 -> 进程ID列表）
     ready_queues: BTreeMap<Priority, alloc::vec::Vec<ProcessId>>,
-    
+
     /// 当前运行的进程ID
     current_process: Option<ProcessId>,
-    
+
     /// 调度统计
     stats: SchedulerStats,
 }
@@ -23,7 +25,7 @@ impl PriorityScheduler {
             stats: SchedulerStats::default(),
         }
     }
-    
+
     /// 添加进程到就绪队列
     pub fn add_process(&mut self, pid: ProcessId) {
         if let Some(process) = get_process(pid) {
@@ -31,16 +33,16 @@ impl PriorityScheduler {
             let priority = proc.dynamic_priority;
             proc.state = ProcessState::Ready;
             drop(proc);
-            
+
             self.ready_queues
                 .entry(priority)
                 .or_insert_with(alloc::vec::Vec::new)
                 .push(pid);
-            
+
             self.stats.enqueued += 1;
         }
     }
-    
+
     /// 从就绪队列移除进程
     pub fn remove_process(&mut self, pid: ProcessId) -> bool {
         for (_priority, queue) in self.ready_queues.iter_mut() {
@@ -51,14 +53,14 @@ impl PriorityScheduler {
         }
         false
     }
-    
+
     /// 选择下一个要运行的进程
     pub fn schedule(&mut self) -> Option<ProcessId> {
         // 如果有当前进程，先处理它
         if let Some(current_pid) = self.current_process {
             if let Some(process) = get_process(current_pid) {
                 let mut proc = process.lock();
-                
+
                 // 检查进程状态
                 match proc.state {
                     ProcessState::Running => {
@@ -73,7 +75,7 @@ impl PriorityScheduler {
                             proc.state = ProcessState::Ready;
                             let priority = proc.dynamic_priority;
                             drop(proc);
-                            
+
                             self.ready_queues
                                 .entry(priority)
                                 .or_insert_with(alloc::vec::Vec::new)
@@ -93,58 +95,58 @@ impl PriorityScheduler {
                     }
                 }
             }
-            
+
             self.current_process = None;
         }
-        
+
         // 从最高优先级队列中选择进程
         while let Some((&priority, queue)) = self.ready_queues.iter_mut().next() {
             if queue.is_empty() {
                 self.ready_queues.remove(&priority);
                 continue;
             }
-            
+
             // 从队列头部取出进程（FIFO）
             let pid = queue.remove(0);
-            
+
             if let Some(process) = get_process(pid) {
                 let mut proc = process.lock();
-                
+
                 // 确保进程仍然是就绪状态
                 if proc.state == ProcessState::Ready {
                     proc.state = ProcessState::Running;
                     proc.reset_time_slice();
                     drop(proc);
-                    
+
                     self.current_process = Some(pid);
                     self.stats.scheduled += 1;
                     set_current_pid(Some(pid));
-                    
+
                     return Some(pid);
                 }
             }
         }
-        
+
         // 没有可运行的进程
         set_current_pid(None);
         None
     }
-    
+
     /// 时钟中断处理（每个时钟滴答调用）
     pub fn tick(&mut self) {
         if let Some(current_pid) = self.current_process {
             if let Some(process) = get_process(current_pid) {
                 let mut proc = process.lock();
-                
+
                 if proc.state == ProcessState::Running {
                     // 减少时间片
                     if proc.time_slice > 0 {
                         proc.time_slice -= 1;
                     }
-                    
+
                     // 增加CPU时间
                     proc.cpu_time += 1;
-                    
+
                     // 定期提升优先级（防止饥饿）
                     if proc.cpu_time % 100 == 0 {
                         proc.update_dynamic_priority();
@@ -152,10 +154,10 @@ impl PriorityScheduler {
                 }
             }
         }
-        
+
         self.stats.ticks += 1;
     }
-    
+
     /// 阻塞当前进程
     pub fn block_current(&mut self) {
         if let Some(current_pid) = self.current_process {
@@ -167,7 +169,7 @@ impl PriorityScheduler {
             self.current_process = None;
         }
     }
-    
+
     /// 唤醒进程
     pub fn wake_up(&mut self, pid: ProcessId) {
         if let Some(process) = get_process(pid) {
@@ -176,22 +178,22 @@ impl PriorityScheduler {
                 proc.state = ProcessState::Ready;
                 let priority = proc.dynamic_priority;
                 drop(proc);
-                
+
                 self.ready_queues
                     .entry(priority)
                     .or_insert_with(alloc::vec::Vec::new)
                     .push(pid);
-                
+
                 self.stats.woken += 1;
             }
         }
     }
-    
+
     /// 获取调度器统计信息
     pub fn get_stats(&self) -> SchedulerStats {
         self.stats
     }
-    
+
     /// 获取就绪队列中的进程数
     pub fn ready_count(&self) -> usize {
         self.ready_queues.values().map(|q| q.len()).sum()
@@ -201,10 +203,10 @@ impl PriorityScheduler {
 /// 调度器统计信息
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SchedulerStats {
-    pub scheduled: u64,  // 调度次数
-    pub enqueued: u64,   // 入队次数
-    pub woken: u64,      // 唤醒次数
-    pub ticks: u64,      // 时钟滴答数
+    pub scheduled: u64, // 调度次数
+    pub enqueued: u64,  // 入队次数
+    pub woken: u64,     // 唤醒次数
+    pub ticks: u64,     // 时钟滴答数
 }
 
 impl SchedulerStats {
@@ -283,10 +285,12 @@ pub fn run() -> ! {
             // 现在只是简单地打印信息
             if let Some(process) = get_process(pid) {
                 let proc = process.lock();
-                println!("Running process: PID={}, Name={}, Priority={}, TimeSlice={}ms",
-                         pid, proc.name, proc.dynamic_priority, proc.time_slice);
+                println!(
+                    "Running process: PID={}, Name={}, Priority={}, TimeSlice={}ms",
+                    pid, proc.name, proc.dynamic_priority, proc.time_slice
+                );
             }
-            
+
             // 模拟进程执行
             x86_64::instructions::hlt();
         } else {

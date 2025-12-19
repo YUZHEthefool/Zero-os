@@ -6,12 +6,15 @@ extern crate alloc;
 #[macro_use]
 extern crate drivers;
 
-pub mod memory;
 pub mod buddy_allocator;
+pub mod memory;
 pub mod page_table;
 
-pub use page_table::{PageTableManager, MapError, UnmapError, UpdateFlagsError, with_current_manager, phys_to_virt, PHYSICAL_MEMORY_OFFSET};
-pub use memory::{BootInfo, MemoryMapInfo, FrameAllocator};
+pub use memory::{BootInfo, FrameAllocator, MemoryMapInfo};
+pub use page_table::{
+    phys_to_virt, with_current_manager, MapError, PageTableManager, UnmapError, UpdateFlagsError,
+    PHYSICAL_MEMORY_OFFSET,
+};
 
 pub fn init() {
     println!("Memory management module initialized");

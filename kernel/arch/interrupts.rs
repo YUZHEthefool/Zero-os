@@ -9,12 +9,12 @@
 //!
 //! V-4 fix: 直接读取CR4而非使用全局缓存，确保SMP环境下每个CPU正确检测SMAP状态。
 
-use core::sync::atomic::{AtomicU64, Ordering};
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
-use lazy_static::lazy_static;
-use kernel_core::on_scheduler_tick;
-use crate::gdt;
 use crate::context_switch;
+use crate::gdt;
+use core::sync::atomic::{AtomicU64, Ordering};
+use kernel_core::on_scheduler_tick;
+use lazy_static::lazy_static;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 // Serial port for debug output (0x3F8)
 const SERIAL_PORT: u16 = 0x3F8;
@@ -42,7 +42,9 @@ const SERIAL_PORT: u16 = 0x3F8;
 fn clac_if_smap() {
     use x86_64::registers::control::{Cr4, Cr4Flags};
     if Cr4::read().contains(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION) {
-        unsafe { core::arch::asm!("clac", options(nostack, nomem)); }
+        unsafe {
+            core::arch::asm!("clac", options(nostack, nomem));
+        }
     }
 }
 
@@ -70,7 +72,11 @@ unsafe fn serial_write_hex(val: u64) {
     serial_write_str("0x");
     for i in (0..16).rev() {
         let nibble = ((val >> (i * 4)) & 0xF) as u8;
-        let c = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        let c = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
         serial_outb(SERIAL_PORT, c);
     }
 }
@@ -220,6 +226,7 @@ lazy_static! {
         // 硬件中断处理器 (32-255)
         idt[32].set_handler_fn(timer_interrupt_handler);      // IRQ 0: Timer
         idt[33].set_handler_fn(keyboard_interrupt_handler);   // IRQ 1: Keyboard
+        idt[36].set_handler_fn(serial_interrupt_handler);     // IRQ 4: Serial COM1
 
         idt
     };
@@ -234,15 +241,85 @@ pub fn init() {
     context_switch::init_fpu();
 
     // 初始化 8259 PIC，重映射 IRQ 向量避免与 CPU 异常冲突
-    unsafe { pic_init(); }
+    unsafe {
+        pic_init();
+    }
 
-    // 加载中断描述符表
+    // 加载中断描述符表（必须在初始化硬件中断之前）
     IDT.load();
+
+    // 初始化串口接收中断（用于 -nographic 模式输入）
+    // 注意：必须在 IDT 加载后调用，确保中断处理器已就绪
+    unsafe {
+        serial_init_interrupt();
+    }
 
     println!("Interrupt Descriptor Table (IDT) loaded");
     println!("  Exception handlers: 20 (double fault uses IST)");
-    println!("  Hardware interrupt handlers: 2 (Timer, Keyboard)");
+    println!("  Hardware interrupt handlers: 3 (Timer, Keyboard, Serial)");
     println!("  FPU/SIMD support enabled (FXSAVE/FXRSTOR ready)");
+}
+
+/// 初始化串口接收中断
+///
+/// 配置 COM1 (0x3F8) 以触发接收数据中断
+///
+/// 关键：必须配置 MCR 的 OUT2 位 (bit 3)，否则 UART 中断信号
+/// 无法传递到 8259 PIC，导致中断永远不会触发。
+unsafe fn serial_init_interrupt() {
+    let ier: u16 = SERIAL_PORT + 1; // Interrupt Enable Register
+    let fcr: u16 = SERIAL_PORT + 2; // FIFO Control Register
+    let lcr: u16 = SERIAL_PORT + 3; // Line Control Register
+    let mcr: u16 = SERIAL_PORT + 4; // Modem Control Register
+
+    // 1. 先禁用所有串口中断
+    core::arch::asm!("out dx, al", in("dx") ier, in("al") 0x00u8, options(nostack, nomem));
+
+    // 2. 配置 LCR: 8N1 格式 (8 data bits, no parity, 1 stop bit)
+    //    确保 DLAB (bit 7) 为 0，这样访问的是 RBR/THR 而非 divisor
+    core::arch::asm!("out dx, al", in("dx") lcr, in("al") 0x03u8, options(nostack, nomem));
+
+    // 3. 配置 FCR: 启用 FIFO 并清空 RX/TX 缓冲区
+    //    0xC7 = 启用FIFO(1) + 清空RX FIFO(2) + 清空TX FIFO(4) + 14字节触发阈值(0xC0)
+    core::arch::asm!("out dx, al", in("dx") fcr, in("al") 0xC7u8, options(nostack, nomem));
+
+    // 4. 配置 MCR: 关键！OUT2 必须设置才能让中断信号到达 PIC
+    //    0x0B = DTR(1) + RTS(2) + OUT2(8)
+    //    OUT2 是 8250/16550 的中断使能位，控制 IRQ 线是否连接到 PIC
+    core::arch::asm!("out dx, al", in("dx") mcr, in("al") 0x0Bu8, options(nostack, nomem));
+
+    // 5. 清空可能残留的接收数据，确保 FIFO 为空
+    loop {
+        let lsr: u8;
+        core::arch::asm!("in al, dx", out("al") lsr, in("dx") (SERIAL_PORT + 5), options(nostack, nomem));
+        if lsr & 0x01 == 0 {
+            break;
+        }
+        // 读取并丢弃数据
+        let mut dummy: u8;
+        core::arch::asm!("in al, dx", out("al") dummy, in("dx") SERIAL_PORT, options(nostack, nomem));
+        let _ = dummy; // Suppress unused warning
+    }
+
+    // 6. 读取 IIR 清除可能挂起的中断标识
+    let mut iir: u8;
+    core::arch::asm!("in al, dx", out("al") iir, in("dx") (SERIAL_PORT + 2), options(nostack, nomem));
+    let _ = iir; // Suppress unused warning
+
+    // 注意：不在此处开启 IER，避免在全局中断未启用时积压数据
+    // 串口接收中断将由 enable_serial_interrupts() 在 sti 前启用
+}
+
+/// 启用串口接收中断
+///
+/// 应在 IDT 已加载、即将开启全局中断时调用。
+/// 这样可以最小化在禁用中断期间积压串口数据的窗口。
+pub fn enable_serial_interrupts() {
+    let ier: u16 = SERIAL_PORT + 1;
+    unsafe {
+        // 启用接收数据中断 (IER bit 0)
+        core::arch::asm!("out dx, al", in("dx") ier, in("al") 0x01u8, options(nostack, nomem));
+    }
 }
 
 /// 获取中断统计信息
@@ -291,14 +368,18 @@ extern "x86-interrupt" fn overflow_handler(_stack_frame: InterruptStackFrame) {
 /// #BR - Bound Range Exceeded (边界范围超出)
 extern "x86-interrupt" fn bound_range_exceeded_handler(_stack_frame: InterruptStackFrame) {
     clac_if_smap();
-    INTERRUPT_STATS.bound_range_exceeded.fetch_add(1, Ordering::Relaxed);
+    INTERRUPT_STATS
+        .bound_range_exceeded
+        .fetch_add(1, Ordering::Relaxed);
     panic!("Bound range exceeded");
 }
 
 /// #UD - Invalid Opcode (无效操作码)
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
     clac_if_smap();
-    INTERRUPT_STATS.invalid_opcode.fetch_add(1, Ordering::Relaxed);
+    INTERRUPT_STATS
+        .invalid_opcode
+        .fetch_add(1, Ordering::Relaxed);
     // Debug output for Ring 3 issues
     unsafe {
         serial_write_str("\n[#UD] Invalid opcode at RIP=");
@@ -346,10 +427,7 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 /// #TS - Invalid TSS (无效TSS)
-extern "x86-interrupt" fn invalid_tss_handler(
-    _stack_frame: InterruptStackFrame,
-    _error_code: u64,
-) {
+extern "x86-interrupt" fn invalid_tss_handler(_stack_frame: InterruptStackFrame, _error_code: u64) {
     clac_if_smap();
     INTERRUPT_STATS.invalid_tss.fetch_add(1, Ordering::Relaxed);
     panic!("Invalid Task State Segment");
@@ -361,7 +439,9 @@ extern "x86-interrupt" fn segment_not_present_handler(
     _error_code: u64,
 ) {
     clac_if_smap();
-    INTERRUPT_STATS.segment_not_present.fetch_add(1, Ordering::Relaxed);
+    INTERRUPT_STATS
+        .segment_not_present
+        .fetch_add(1, Ordering::Relaxed);
     panic!("Segment not present");
 }
 
@@ -371,7 +451,9 @@ extern "x86-interrupt" fn stack_segment_fault_handler(
     _error_code: u64,
 ) {
     clac_if_smap();
-    INTERRUPT_STATS.stack_segment_fault.fetch_add(1, Ordering::Relaxed);
+    INTERRUPT_STATS
+        .stack_segment_fault
+        .fetch_add(1, Ordering::Relaxed);
     panic!("Stack segment fault");
 }
 
@@ -391,7 +473,9 @@ extern "x86-interrupt" fn general_protection_fault_handler(
         serial_write_hex(stack_frame.instruction_pointer.as_u64());
         serial_write_str("\n");
     }
-    INTERRUPT_STATS.general_protection_fault.fetch_add(1, Ordering::Relaxed);
+    INTERRUPT_STATS
+        .general_protection_fault
+        .fetch_add(1, Ordering::Relaxed);
     panic!("General protection fault");
 }
 
@@ -418,8 +502,8 @@ extern "x86-interrupt" fn page_fault_handler(
     // We must clear AC before doing anything else to prevent SMAP bypass attacks.
     clac_if_smap();
 
-    use x86_64::registers::control::Cr2;
     use kernel_core::usercopy;
+    use x86_64::registers::control::Cr2;
 
     /// 用户空间地址上界
     const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
@@ -533,28 +617,36 @@ extern "x86-interrupt" fn alignment_check_handler(
     _error_code: u64,
 ) {
     clac_if_smap();
-    INTERRUPT_STATS.alignment_check.fetch_add(1, Ordering::Relaxed);
+    INTERRUPT_STATS
+        .alignment_check
+        .fetch_add(1, Ordering::Relaxed);
     panic!("Alignment check failed");
 }
 
 /// #MC - Machine Check (机器检查)
 extern "x86-interrupt" fn machine_check_handler(_stack_frame: InterruptStackFrame) -> ! {
     clac_if_smap();
-    INTERRUPT_STATS.machine_check.fetch_add(1, Ordering::Relaxed);
+    INTERRUPT_STATS
+        .machine_check
+        .fetch_add(1, Ordering::Relaxed);
     panic!("Machine check - hardware error");
 }
 
 /// #XM - SIMD Floating-Point Exception (SIMD浮点异常)
 extern "x86-interrupt" fn simd_floating_point_handler(_stack_frame: InterruptStackFrame) {
     clac_if_smap();
-    INTERRUPT_STATS.simd_floating_point.fetch_add(1, Ordering::Relaxed);
+    INTERRUPT_STATS
+        .simd_floating_point
+        .fetch_add(1, Ordering::Relaxed);
     panic!("SIMD floating-point exception");
 }
 
 /// #VE - Virtualization Exception (虚拟化异常)
 extern "x86-interrupt" fn virtualization_handler(_stack_frame: InterruptStackFrame) {
     clac_if_smap();
-    INTERRUPT_STATS.virtualization.fetch_add(1, Ordering::Relaxed);
+    INTERRUPT_STATS
+        .virtualization
+        .fetch_add(1, Ordering::Relaxed);
     panic!("Virtualization exception");
 }
 
@@ -613,10 +705,63 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 
     INTERRUPT_STATS.keyboard.fetch_add(1, Ordering::Relaxed);
 
-    // 读取并丢弃键盘扫描码（清除中断）
+    // 读取键盘扫描码
+    let scancode: u8;
     unsafe {
-        let _scancode: u8;
-        core::arch::asm!("in al, 0x60", out("al") _scancode, options(nostack, nomem));
+        core::arch::asm!("in al, 0x60", out("al") scancode, options(nostack, nomem));
+    }
+
+    // 将扫描码传递给键盘驱动进行处理
+    // 键盘驱动会解码扫描码并将字符放入输入缓冲区
+    drivers::push_scancode(scancode);
+
+    // 发送 EOI 到 PIC
+    unsafe {
+        core::arch::asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
+    }
+}
+
+/// IRQ 4 - Serial COM1 Interrupt (串口中断)
+///
+/// 处理串口接收数据，用于 `-nographic` 模式下的键盘输入
+///
+/// 注意：16550 UART 有16字节的 FIFO 缓冲区，必须循环读取所有可用数据，
+/// 否则如果 FIFO 未清空，可能不会触发新的中断。
+extern "x86-interrupt" fn serial_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // S-6 fix: Immediately restore SMAP protection
+    clac_if_smap();
+
+    let mut received_any = false;
+
+    // 循环读取所有可用数据（清空 FIFO）
+    loop {
+        // 检查是否有数据可读 (LSR bit 0 = Data Ready)
+        let lsr: u8;
+        unsafe {
+            core::arch::asm!("in al, dx", out("al") lsr, in("dx") (SERIAL_PORT + 5), options(nostack, nomem));
+        }
+
+        // 如果没有数据可读，退出循环
+        if lsr & 0x01 == 0 {
+            break;
+        }
+
+        // 读取数据
+        let data: u8;
+        unsafe {
+            core::arch::asm!("in al, dx", out("al") data, in("dx") SERIAL_PORT, options(nostack, nomem));
+        }
+
+        // 将串口数据放入键盘缓冲区（模拟键盘输入）
+        // 串口数据已经是 ASCII，不需要扫描码转换
+        if drivers::keyboard::push_char(data) {
+            received_any = true;
+        }
+    }
+
+    // 如果收到了输入，请求重调度以尽快唤醒等待输入的进程
+    if received_any {
+        kernel_core::request_resched_from_irq();
     }
 
     // 发送 EOI 到 PIC
@@ -643,14 +788,14 @@ pub fn trigger_page_fault() {
 // ============================================================================
 
 /// PIC 端口定义
-const PIC1_CMD: u16 = 0x20;   // 主 PIC 命令端口
-const PIC1_DATA: u16 = 0x21;  // 主 PIC 数据端口
-const PIC2_CMD: u16 = 0xA0;   // 从 PIC 命令端口
-const PIC2_DATA: u16 = 0xA1;  // 从 PIC 数据端口
+const PIC1_CMD: u16 = 0x20; // 主 PIC 命令端口
+const PIC1_DATA: u16 = 0x21; // 主 PIC 数据端口
+const PIC2_CMD: u16 = 0xA0; // 从 PIC 命令端口
+const PIC2_DATA: u16 = 0xA1; // 从 PIC 数据端口
 
 /// PIC 中断向量偏移
-pub const PIC1_OFFSET: u8 = 0x20;  // 主 PIC: IRQ 0-7 -> 向量 32-39
-pub const PIC2_OFFSET: u8 = 0x28;  // 从 PIC: IRQ 8-15 -> 向量 40-47
+pub const PIC1_OFFSET: u8 = 0x20; // 主 PIC: IRQ 0-7 -> 向量 32-39
+pub const PIC2_OFFSET: u8 = 0x28; // 从 PIC: IRQ 8-15 -> 向量 40-47
 
 /// 等待 I/O 完成（用于 PIC 初始化时的延迟）
 #[inline]
@@ -701,14 +846,19 @@ pub unsafe fn pic_init() {
     io_wait();
 
     // 恢复中断掩码（或设置新掩码）
-    // 默认只启用 IRQ0 (定时器) 和 IRQ1 (键盘)
-    let new_mask1: u8 = 0xFC;  // 11111100 - 启用 IRQ0 和 IRQ1
-    let new_mask2: u8 = 0xFF;  // 11111111 - 禁用所有从 PIC 中断
+    // 启用 IRQ0 (定时器), IRQ1 (键盘), IRQ4 (串口 COM1)
+    let new_mask1: u8 = 0xEC; // 11101100 - 启用 IRQ0, IRQ1, IRQ4
+    let new_mask2: u8 = 0xFF; // 11111111 - 禁用所有从 PIC 中断
     core::arch::asm!("out dx, al", in("dx") PIC1_DATA, in("al") new_mask1, options(nostack, nomem));
     core::arch::asm!("out dx, al", in("dx") PIC2_DATA, in("al") new_mask2, options(nostack, nomem));
 
-    println!("PIC initialized: IRQ0-7 -> vectors {}-{}, IRQ8-15 -> vectors {}-{}",
-             PIC1_OFFSET, PIC1_OFFSET + 7, PIC2_OFFSET, PIC2_OFFSET + 7);
+    println!(
+        "PIC initialized: IRQ0-7 -> vectors {}-{}, IRQ8-15 -> vectors {}-{}",
+        PIC1_OFFSET,
+        PIC1_OFFSET + 7,
+        PIC2_OFFSET,
+        PIC2_OFFSET + 7
+    );
 }
 
 /// 发送 EOI (End of Interrupt) 到 PIC

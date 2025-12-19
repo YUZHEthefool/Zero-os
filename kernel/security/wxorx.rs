@@ -138,12 +138,7 @@ pub fn validate_active(phys_offset: VirtAddr) -> Result<ValidationSummary, Wxorx
         let pdpt: &PageTable = unsafe { &*(pdpt_virt.as_u64() as *const PageTable) };
 
         // Walk PDPT entries
-        walk_pdpt(
-            pdpt,
-            virt_base,
-            phys_offset,
-            &mut summary,
-        )?;
+        walk_pdpt(pdpt, virt_base, phys_offset, &mut summary)?;
     }
 
     // If we found violations, return error with first violation
@@ -227,11 +222,7 @@ fn walk_pd(
 }
 
 /// Walk PT (Page Table) level - 4KB pages
-fn walk_pt(
-    pt: &PageTable,
-    base: u64,
-    summary: &mut ValidationSummary,
-) -> Result<(), WxorxError> {
+fn walk_pt(pt: &PageTable, base: u64, summary: &mut ValidationSummary) -> Result<(), WxorxError> {
     for (pt_idx, pt_entry) in pt.iter().enumerate() {
         if pt_entry.is_unused() {
             continue;
@@ -307,9 +298,7 @@ mod tests {
         assert!(!is_wxorx_violation(rx));
 
         // RW- (Read + Write + No-Execute) - OK
-        let rw = PageTableFlags::PRESENT
-            | PageTableFlags::WRITABLE
-            | PageTableFlags::NO_EXECUTE;
+        let rw = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
         assert!(!is_wxorx_violation(rw));
 
         // RWX (Read + Write + Execute) - VIOLATION
@@ -323,9 +312,6 @@ mod tests {
         assert_eq!(canonicalize(0x1234), 0x1234);
 
         // High half address - sign extend
-        assert_eq!(
-            canonicalize(0x0000_8000_0000_0000),
-            0xFFFF_8000_0000_0000
-        );
+        assert_eq!(canonicalize(0x0000_8000_0000_0000), 0xFFFF_8000_0000_0000);
     }
 }

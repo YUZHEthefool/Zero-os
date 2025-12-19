@@ -25,14 +25,19 @@ impl core::fmt::Debug for FxSaveArea {
         f.debug_struct("FxSaveArea")
             .field("fcw", &u16::from_le_bytes([self.data[0], self.data[1]]))
             .field("fsw", &u16::from_le_bytes([self.data[2], self.data[3]]))
-            .field("mxcsr", &u32::from_le_bytes([self.data[24], self.data[25], self.data[26], self.data[27]]))
+            .field(
+                "mxcsr",
+                &u32::from_le_bytes([self.data[24], self.data[25], self.data[26], self.data[27]]),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl Default for FxSaveArea {
     fn default() -> Self {
-        let mut area = FxSaveArea { data: [0; FXSAVE_SIZE] };
+        let mut area = FxSaveArea {
+            data: [0; FXSAVE_SIZE],
+        };
         // 设置默认的 FCW（FPU Control Word）：双精度、所有异常屏蔽
         area.data[0] = 0x7F;
         area.data[1] = 0x03;
@@ -108,7 +113,9 @@ impl Context {
             cs: 0x08,      // 内核代码段
             ss: 0x10,      // 内核数据段
             _padding: [0; 4],
-            fx: FxSaveArea { data: [0; FXSAVE_SIZE] },
+            fx: FxSaveArea {
+                data: [0; FXSAVE_SIZE],
+            },
         }
     }
 
@@ -138,9 +145,9 @@ impl Context {
         ctx.rip = entry_point;
         ctx.rsp = stack_top;
         ctx.rbp = stack_top;
-        ctx.rflags = 0x202;  // IF位使能
-        ctx.cs = 0x23;       // 用户代码段 (GDT索引4, RPL=3): 0x20 | 3
-        ctx.ss = 0x1B;       // 用户数据段 (GDT索引3, RPL=3): 0x18 | 3
+        ctx.rflags = 0x202; // IF位使能
+        ctx.cs = 0x23; // 用户代码段 (GDT索引4, RPL=3): 0x20 | 3
+        ctx.ss = 0x1B; // 用户数据段 (GDT索引3, RPL=3): 0x18 | 3
         ctx.fx = FxSaveArea::default(); // 使用默认的 FPU 状态
         ctx
     }
@@ -153,6 +160,12 @@ impl Default for Context {
 }
 
 /// 保存当前上下文并切换到新上下文
+///
+/// # Z-5 fix: rdi/rsi 按 SysV AMD64 caller-saved 处理
+///
+/// 按 SysV AMD64 约定，内核线程的 rdi/rsi 视为 caller-saved，
+/// 切换后不保证保留，默认被清零以避免误用函数参数指针。
+/// 用户态进程使用 save_context/enter_usermode 路径，不受影响。
 ///
 /// # Safety
 ///
@@ -170,17 +183,18 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         "mov [rdi + 0x10], rcx",   // 保存rcx
         "mov [rdi + 0x18], rdx",   // 保存rdx
 
-        // 将 rdi/rsi 移至 rdx/rcx 作为上下文指针
-        // 此时 rdi/rsi 仍保持原始任务值
+        // Z-5 fix: 将 rdi/rsi 移至 rdx/rcx 作为上下文指针
+        // 入口 rdi/rsi 是函数参数（old_ctx/new_ctx），按 SysV 属于 caller-saved
         "mov rdx, rdi",            // rdx = old_ctx 指针
         "mov rcx, rsi",            // rcx = new_ctx 指针
 
         // 保存当前上下文到 old_ctx (rdx)
-        // 注意：rsi/rdi 现在仍是原始任务的寄存器值！
         "mov [rdx + 0x00], rax",   // 保存rax
         "mov [rdx + 0x08], rbx",   // 保存rbx
-        "mov [rdx + 0x20], rsi",   // 保存rsi（原始任务值）
-        "mov [rdx + 0x28], rdi",   // 保存rdi（原始任务值）
+        // Z-5 fix: rdi/rsi 按 caller-saved 处理，不跨调度保留，设为 0
+        "xor rax, rax",
+        "mov [rdx + 0x20], rax",   // rsi = 0 (caller-saved)
+        "mov [rdx + 0x28], rax",   // rdi = 0 (caller-saved)
         "mov [rdx + 0x30], rbp",   // 保存rbp
         "mov [rdx + 0x38], rsp",   // 保存rsp
         "mov [rdx + 0x40], r8",    // 保存r8
@@ -232,9 +246,9 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         "push qword ptr [rcx + 0x88]",
         "popfq",
 
-        // 最后恢复 rdi/rsi/rcx（易失寄存器）
-        "mov rdi, [rcx + 0x28]",   // 恢复rdi
-        "mov rsi, [rcx + 0x20]",   // 恢复rsi
+        // Z-5 fix: 最后恢复 rdi/rsi/rcx（caller-saved，内核线程为 0）
+        "mov rdi, [rcx + 0x28]",   // 恢复rdi (内核线程: 0)
+        "mov rsi, [rcx + 0x20]",   // 恢复rsi (内核线程: 0)
         "mov rcx, [rcx + 0x10]",   // 恢复rcx（必须最后，因为 rcx 是基址）
 
         // 返回到新进程
@@ -346,14 +360,14 @@ pub fn init_fpu() {
 // ============================================================================
 
 /// 用户态段选择子
-pub const USER_CODE_SELECTOR: u64 = 0x23;  // GDT index 4 with RPL=3
-pub const USER_DATA_SELECTOR: u64 = 0x1B;  // GDT index 3 with RPL=3
+pub const USER_CODE_SELECTOR: u64 = 0x23; // GDT index 4 with RPL=3
+pub const USER_DATA_SELECTOR: u64 = 0x1B; // GDT index 3 with RPL=3
 
 /// RFLAGS 安全掩码常量
-const RFLAGS_IF: u64 = 1 << 9;             // 中断使能位
-const RFLAGS_IOPL: u64 = 0b11 << 12;       // I/O 特权级
-const RFLAGS_NT: u64 = 1 << 14;            // 嵌套任务标志
-const RFLAGS_RF: u64 = 1 << 16;            // 恢复标志
+const RFLAGS_IF: u64 = 1 << 9; // 中断使能位
+const RFLAGS_IOPL: u64 = 0b11 << 12; // I/O 特权级
+const RFLAGS_NT: u64 = 1 << 14; // 嵌套任务标志
+const RFLAGS_RF: u64 = 1 << 16; // 恢复标志
 
 /// 用户态 RFLAGS 安全掩码
 /// 清除 IOPL/NT/RF 等特权位，只保留用户可控位
@@ -508,4 +522,3 @@ pub unsafe fn jump_to_usermode(entry_point: u64, user_stack: u64) -> ! {
     let ctx = Context::init_for_user_process(entry_point, user_stack);
     enter_usermode(&ctx)
 }
-

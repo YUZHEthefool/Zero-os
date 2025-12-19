@@ -44,20 +44,18 @@ extern crate alloc;
 #[macro_use]
 extern crate drivers;
 
-pub mod types;
-pub mod traits;
 pub mod devfs;
-pub mod ramfs;
 pub mod manager;
+pub mod ramfs;
+pub mod traits;
+pub mod types;
 
 // Re-exports for convenience
-pub use types::{
-    DirEntry, FileMode, FileType, FsError, OpenFlags, SeekWhence, Stat, TimeSpec,
-};
-pub use traits::{FileHandle, FileSystem, Inode};
 pub use devfs::DevFs;
-pub use ramfs::{RamFs, RamFsInode};
 pub use manager::{init, mount, open, readdir, stat, umount, VFS};
+pub use ramfs::{RamFs, RamFsInode};
+pub use traits::{FileHandle, FileSystem, Inode};
+pub use types::{DirEntry, FileMode, FileType, FsError, OpenFlags, SeekWhence, Stat, TimeSpec};
 
 /// Initialize the VFS subsystem
 ///

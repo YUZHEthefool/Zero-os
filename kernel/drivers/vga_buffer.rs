@@ -162,7 +162,9 @@ pub fn _print(args: fmt::Arguments) {
     impl Write for SerialWriter {
         fn write_str(&mut self, s: &str) -> fmt::Result {
             for byte in s.bytes() {
-                unsafe { serial_outb(SERIAL_PORT, byte); }
+                unsafe {
+                    serial_outb(SERIAL_PORT, byte);
+                }
             }
             Ok(())
         }
@@ -182,13 +184,13 @@ pub fn clear_screen() {
 }
 
 pub fn write_str(s: &str) {
-   use core::fmt::Write;
-   let mut writer = WRITER.lock();
-   writer.write_str(s).unwrap();
+    use core::fmt::Write;
+    let mut writer = WRITER.lock();
+    writer.write_str(s).unwrap();
 }
 
 // 简单的测试函数
 pub fn print_something() {
-   println!("Kernel started!");
-   println!("VGA buffer initialized");
+    println!("Kernel started!");
+    println!("VGA buffer initialized");
 }

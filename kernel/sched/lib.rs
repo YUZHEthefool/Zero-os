@@ -12,8 +12,8 @@ extern crate spin;
 
 pub use kernel_core::process;
 
-pub mod scheduler;
 pub mod enhanced_scheduler;
+pub mod scheduler;
 
 pub fn init() {
     println!("Scheduler module initialized");

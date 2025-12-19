@@ -1,9 +1,9 @@
+use crate::buddy_allocator;
 use linked_list_allocator::LockedHeap;
 use x86_64::{
-    structures::paging::{PhysFrame, Size4KiB, FrameAllocator as X64FrameAllocator},
+    structures::paging::{FrameAllocator as X64FrameAllocator, PhysFrame, Size4KiB},
     PhysAddr,
 };
-use crate::buddy_allocator;
 
 // ============================================================================
 // BootInfo 结构定义（与 bootloader 保持一致）
@@ -53,7 +53,7 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 // 堆地址必须在 bootloader 映射的范围内
 // Bootloader 映射了物理地址 0x0-0x1000000 (16MB) 到虚拟地址 0xffffffff80000000
 // 内核代码占用了前面的部分，我们将堆放在 2MB 之后
-const HEAP_START: usize = 0xffffffff80200000;  // 虚拟地址 2MB 处
+const HEAP_START: usize = 0xffffffff80200000; // 虚拟地址 2MB 处
 const HEAP_SIZE: usize = 100 * 1024; // 100KB
 
 /// 物理内存管理起始地址（硬编码后备值，在256MB处）
@@ -84,17 +84,24 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
     unsafe {
         ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
     }
-    println!("Heap allocator initialized: {} KB at 0x{:x}", HEAP_SIZE / 1024, HEAP_START);
+    println!(
+        "Heap allocator initialized: {} KB at 0x{:x}",
+        HEAP_SIZE / 1024,
+        HEAP_START
+    );
 
     // 从 BootInfo 解析内存映射
-    let (pmm_base, pmm_size) = select_region_from_bootinfo(boot_info)
-        .unwrap_or_else(|| {
-            println!("  Warning: BootInfo memory map unavailable, using fallback region");
-            (FALLBACK_PHYS_MEM_START, FALLBACK_PHYS_MEM_SIZE)
-        });
+    let (pmm_base, pmm_size) = select_region_from_bootinfo(boot_info).unwrap_or_else(|| {
+        println!("  Warning: BootInfo memory map unavailable, using fallback region");
+        (FALLBACK_PHYS_MEM_START, FALLBACK_PHYS_MEM_SIZE)
+    });
 
-    println!("  Physical memory region: 0x{:x} - 0x{:x} ({} MB)",
-        pmm_base, pmm_base + pmm_size as u64, pmm_size / (1024 * 1024));
+    println!(
+        "  Physical memory region: 0x{:x} - 0x{:x} ({} MB)",
+        pmm_base,
+        pmm_base + pmm_size as u64,
+        pmm_size / (1024 * 1024)
+    );
 
     // 初始化 Buddy 物理页分配器
     buddy_allocator::init_buddy_allocator(PhysAddr::new(pmm_base), pmm_size);
@@ -112,13 +119,17 @@ pub fn init() {
     unsafe {
         ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
     }
-    println!("Heap allocator initialized: {} KB at 0x{:x}", HEAP_SIZE / 1024, HEAP_START);
+    println!(
+        "Heap allocator initialized: {} KB at 0x{:x}",
+        HEAP_SIZE / 1024,
+        HEAP_START
+    );
 
     // 使用硬编码区域
     println!("  Warning: No BootInfo, using hardcoded memory region");
     buddy_allocator::init_buddy_allocator(
         PhysAddr::new(FALLBACK_PHYS_MEM_START),
-        FALLBACK_PHYS_MEM_SIZE
+        FALLBACK_PHYS_MEM_SIZE,
     );
 
     // 运行自测（可选）
@@ -150,8 +161,10 @@ fn select_region_from_bootinfo(boot_info: &BootInfo) -> Option<(u64, usize)> {
         let desc = unsafe { &*(addr as *const EfiMemoryDescriptor) };
 
         // 只使用 Conventional Memory 和 Boot Services 区域（后者在 ExitBootServices 后可用）
-        let usable = matches!(desc.typ,
-            EFI_CONVENTIONAL_MEMORY | EFI_BOOT_SERVICES_CODE | EFI_BOOT_SERVICES_DATA);
+        let usable = matches!(
+            desc.typ,
+            EFI_CONVENTIONAL_MEMORY | EFI_BOOT_SERVICES_CODE | EFI_BOOT_SERVICES_DATA
+        );
 
         if !usable || desc.page_count == 0 {
             continue;
@@ -184,7 +197,10 @@ fn select_region_from_bootinfo(boot_info: &BootInfo) -> Option<(u64, usize)> {
         }
     }
 
-    println!("  Total usable memory: {} MB", total_conventional / (1024 * 1024));
+    println!(
+        "  Total usable memory: {} MB",
+        total_conventional / (1024 * 1024)
+    );
 
     best.map(|(base, size)| {
         // 限制最大使用量，避免占用太多内存
@@ -206,22 +222,22 @@ impl FrameAllocator {
     pub fn new() -> Self {
         FrameAllocator
     }
-    
+
     /// 分配单个物理帧
     pub fn allocate_frame(&mut self) -> Option<PhysFrame> {
         buddy_allocator::alloc_physical_pages(1)
     }
-    
+
     /// 分配连续的多个物理帧
     pub fn allocate_contiguous_frames(&mut self, count: usize) -> Option<PhysFrame> {
         buddy_allocator::alloc_physical_pages(count)
     }
-    
+
     /// 释放物理帧
     pub fn deallocate_frame(&mut self, frame: PhysFrame) {
         buddy_allocator::free_physical_pages(frame, 1);
     }
-    
+
     /// 释放连续的多个物理帧
     pub fn deallocate_contiguous_frames(&mut self, frame: PhysFrame, count: usize) {
         buddy_allocator::free_physical_pages(frame, count);
@@ -229,22 +245,20 @@ impl FrameAllocator {
 
     /// 获取内存统计信息
     pub fn stats(&self) -> MemoryStats {
-        let buddy_stats = buddy_allocator::get_allocator_stats()
-            .unwrap_or(buddy_allocator::AllocatorStats {
+        let buddy_stats =
+            buddy_allocator::get_allocator_stats().unwrap_or(buddy_allocator::AllocatorStats {
                 total_pages: 0,
                 free_pages: 0,
                 used_pages: 0,
                 fragmentation: 0.0,
             });
-            
+
         MemoryStats {
             total_physical_pages: buddy_stats.total_pages,
             free_physical_pages: buddy_stats.free_pages,
             used_physical_pages: buddy_stats.used_pages,
             fragmentation_percent: (buddy_stats.fragmentation * 100.0) as u32,
-            heap_used_bytes: HEAP_SIZE - unsafe {
-                ALLOCATOR.lock().free()
-            },
+            heap_used_bytes: HEAP_SIZE - unsafe { ALLOCATOR.lock().free() },
             heap_total_bytes: HEAP_SIZE,
         }
     }
@@ -273,19 +287,27 @@ impl MemoryStats {
     pub fn print(&self) {
         println!("=== Memory Statistics ===");
         println!("Physical Memory:");
-        println!("  Total: {} pages ({} MB)",
+        println!(
+            "  Total: {} pages ({} MB)",
             self.total_physical_pages,
-            self.total_physical_pages * 4 / 1024);
-        println!("  Free:  {} pages ({} MB)",
+            self.total_physical_pages * 4 / 1024
+        );
+        println!(
+            "  Free:  {} pages ({} MB)",
             self.free_physical_pages,
-            self.free_physical_pages * 4 / 1024);
-        println!("  Used:  {} pages ({} MB)",
+            self.free_physical_pages * 4 / 1024
+        );
+        println!(
+            "  Used:  {} pages ({} MB)",
             self.used_physical_pages,
-            self.used_physical_pages * 4 / 1024);
+            self.used_physical_pages * 4 / 1024
+        );
         println!("  Fragmentation: {}%", self.fragmentation_percent);
         println!("Kernel Heap:");
-        println!("  Used:  {} KB / {} KB",
+        println!(
+            "  Used:  {} KB / {} KB",
             self.heap_used_bytes / 1024,
-            self.heap_total_bytes / 1024);
+            self.heap_total_bytes / 1024
+        );
     }
 }

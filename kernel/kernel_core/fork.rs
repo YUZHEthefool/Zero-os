@@ -2,16 +2,22 @@
 //!
 //! 实现完整的进程复制功能，包含写时复制(COW)机制
 
-use crate::process::{ProcessId, ProcessState, current_pid, get_process, create_process, free_address_space, free_kernel_stack};
+use crate::process::{
+    create_process, current_pid, free_address_space, free_kernel_stack, get_process, ProcessId,
+    ProcessState,
+};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use mm::memory::FrameAllocator;
 use spin::RwLock;
 use x86_64::{
-    PhysAddr, VirtAddr,
     instructions::{interrupts, tlb},
     registers::control::Cr3,
-    structures::paging::{page_table::PageTableEntry, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB},
+    structures::paging::{
+        page_table::PageTableEntry, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+    },
+    PhysAddr, VirtAddr,
 };
 
 /// Fork系统调用的结果
@@ -65,7 +71,12 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
         } else {
             parent.memory_space
         };
-        (root, parent.pid, parent.priority, alloc::format!("{}-child", parent.name))
+        (
+            root,
+            parent.pid,
+            parent.priority,
+            alloc::format!("{}-child", parent.name),
+        )
     };
 
     // 创建子进程（此时未持有父进程锁，避免死锁）
@@ -101,7 +112,9 @@ fn fork_inner(
         let child_root_frame = frame_alloc
             .allocate_frame()
             .ok_or(ForkError::MemoryAllocationFailed)?;
-        unsafe { zero_table(child_root_frame); }
+        unsafe {
+            zero_table(child_root_frame);
+        }
 
         // 复制页表并设置 COW
         unsafe {
@@ -182,7 +195,10 @@ fn fork_inner(
         child.context.rax = 0; // 子进程返回值 0
         child.state = ProcessState::Ready;
 
-        println!("Fork: parent={}, child={}, COW enabled", parent.pid, child.pid);
+        println!(
+            "Fork: parent={}, child={}, COW enabled",
+            parent.pid, child.pid
+        );
         Ok(child_pid)
     } else {
         Err(ForkError::ProcessNotFound)
@@ -234,6 +250,13 @@ fn cleanup_partial_child(child_pid: ProcessId) {
 /// 3. 当任一进程尝试写入时，触发页错误
 /// 4. 页错误处理程序复制该页并更新页表
 ///
+/// # Z-8 fix: 两阶段 COW 实现
+///
+/// 为防止内存分配失败时父进程 PTE 残留 COW 修改，采用两阶段处理：
+/// 1. **规划阶段**：遍历页表收集叶子修改计划和所需中间页表帧数量
+/// 2. **预分配阶段**：预分配所有中间页表帧（若失败，父进程未被修改）
+/// 3. **应用阶段**：使用预分配帧应用所有 COW 修改（保证不会失败）
+///
 /// # Safety
 ///
 /// 此函数直接操作页表，必须确保：
@@ -244,8 +267,10 @@ pub unsafe fn copy_page_table_cow(
     child_page_table: usize,
 ) -> Result<(), ForkError> {
     let mut frame_alloc = FrameAllocator::new();
-    let parent_root: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(parent_page_table as u64));
-    let child_root: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(child_page_table as u64));
+    let parent_root: PhysFrame<Size4KiB> =
+        PhysFrame::containing_address(PhysAddr::new(parent_page_table as u64));
+    let child_root: PhysFrame<Size4KiB> =
+        PhysFrame::containing_address(PhysAddr::new(child_page_table as u64));
 
     let parent_pml4 = phys_to_virt_table(parent_root.start_address());
     let child_pml4 = phys_to_virt_table(child_root.start_address());
@@ -255,14 +280,38 @@ pub unsafe fn copy_page_table_cow(
         child_pml4[i] = parent_pml4[i].clone();
     }
 
-    // 克隆用户低半区 (索引 0-255) 并设置 COW
-    clone_level(parent_pml4, child_pml4, &mut frame_alloc, 4)?;
+    // Z-8 fix: 两阶段 COW
+    // 阶段 1: 规划 - 收集叶子修改计划和所需中间页表帧数量
+    let mut plan = CowClonePlan::new();
+    plan_clone_level(parent_pml4, 4, &mut plan)?;
+
+    // 阶段 2: 预分配所有中间页表帧
+    // 若分配失败，此时父进程未被修改，直接返回错误即可
+    let table_frames = preallocate_table_frames(plan.tables_needed, &mut frame_alloc)?;
+
+    // 阶段 3: 应用所有 COW 修改（使用预分配帧，保证不会失败）
+    let mut leaf_cursor = 0usize;
+    let mut frame_iter = table_frames.into_iter();
+    apply_clone_level(
+        parent_pml4,
+        child_pml4,
+        &mut frame_iter,
+        &plan,
+        &mut leaf_cursor,
+        4,
+    )?;
+    debug_assert_eq!(leaf_cursor, plan.leaf_updates.len());
 
     // 父进程页表被改成只读+BIT_9，需要刷新本地 TLB 才能生效
     tlb::flush_all();
 
-    println!("COW page table copy: parent=0x{:x}, child=0x{:x}",
-             parent_page_table, child_page_table);
+    println!(
+        "COW page table copy: parent=0x{:x}, child=0x{:x}, leaves={}, tables={}",
+        parent_page_table,
+        child_page_table,
+        plan.leaf_updates.len(),
+        plan.tables_needed
+    );
 
     Ok(())
 }
@@ -279,10 +328,7 @@ pub unsafe fn copy_page_table_cow(
 /// # Safety
 ///
 /// 此函数分配新的物理页并更新页表
-pub unsafe fn handle_cow_page_fault(
-    pid: ProcessId,
-    fault_addr: usize,
-) -> Result<(), ForkError> {
+pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result<(), ForkError> {
     use mm::page_table::with_current_manager;
 
     let virt = VirtAddr::new(fault_addr as u64);
@@ -315,11 +361,7 @@ pub unsafe fn handle_cow_page_fault(
         // 复制页内容（使用高半区直映访问物理内存）
         let old_virt = mm::phys_to_virt(old_frame.start_address());
         let new_virt = mm::phys_to_virt(new_frame.start_address());
-        core::ptr::copy_nonoverlapping(
-            old_virt.as_ptr::<u8>(),
-            new_virt.as_mut_ptr::<u8>(),
-            4096,
-        );
+        core::ptr::copy_nonoverlapping(old_virt.as_ptr::<u8>(), new_virt.as_mut_ptr::<u8>(), 4096);
 
         // H-35 fix: Check unmap result - if it fails, deallocate the new frame and return error
         if manager.unmap_page(page).is_err() {
@@ -352,7 +394,10 @@ pub unsafe fn handle_cow_page_fault(
             frame_alloc.deallocate_frame(old_frame);
         }
 
-        println!("COW page fault: pid={}, addr=0x{:x} resolved", pid, fault_addr);
+        println!(
+            "COW page fault: pid={}, addr=0x{:x} resolved",
+            pid, fault_addr
+        );
         Ok(())
     })
 }
@@ -390,9 +435,7 @@ impl PhysicalPageRefCount {
         interrupts::without_interrupts(|| {
             let mut counts = self.ref_counts.write();
             // Double-check：可能在等待写锁期间被其他 CPU 创建
-            let entry = counts
-                .entry(phys_addr)
-                .or_insert_with(|| AtomicU64::new(0));
+            let entry = counts.entry(phys_addr).or_insert_with(|| AtomicU64::new(0));
             entry.fetch_add(1, Ordering::SeqCst) + 1
         })
     }
@@ -412,12 +455,8 @@ impl PhysicalPageRefCount {
                     if prev == 0 {
                         break (false, 0); // 已经为0，不需要移除
                     }
-                    match count.compare_exchange(
-                        prev,
-                        prev - 1,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    ) {
+                    match count.compare_exchange(prev, prev - 1, Ordering::SeqCst, Ordering::SeqCst)
+                    {
                         Ok(_) => {
                             let new_val = prev - 1;
                             break (new_val == 0, new_val); // CAS成功，返回是否需要移除和新值
@@ -484,13 +523,116 @@ const fn cow_flag() -> PageTableFlags {
     PageTableFlags::BIT_9
 }
 
-/// 递归克隆页表层级
+// ============================================================================
+// Z-8 fix: 两阶段 COW 实现
+// ============================================================================
+
+/// 记录叶子节点需要应用的 COW 修改
 ///
-/// level: 4=PML4, 3=PDPT, 2=PD, 1=PT
-fn clone_level(
+/// 存储父 PTE 指针、原始标志和物理地址，用于应用阶段
+struct LeafUpdate {
+    /// 父进程页表项指针
+    entry_ptr: *mut PageTableEntry,
+    /// 原始标志
+    original_flags: PageTableFlags,
+    /// 物理地址
+    phys_addr: PhysAddr,
+}
+
+/// 记录 COW 复制计划
+///
+/// 包含所有叶子修改和需要的中间页表帧数量
+struct CowClonePlan {
+    /// 叶子节点修改列表
+    leaf_updates: Vec<LeafUpdate>,
+    /// 需要的中间页表帧数量
+    tables_needed: usize,
+}
+
+impl CowClonePlan {
+    fn new() -> Self {
+        CowClonePlan {
+            leaf_updates: Vec::new(),
+            tables_needed: 0,
+        }
+    }
+
+    fn record_leaf(&mut self, entry: &mut PageTableEntry) {
+        self.leaf_updates.push(LeafUpdate {
+            entry_ptr: entry as *mut PageTableEntry,
+            original_flags: entry.flags(),
+            phys_addr: entry.addr(),
+        });
+    }
+}
+
+/// 第一阶段：规划 - 遍历收集叶子修改计划并统计需要的新页表帧数量
+///
+/// 此阶段不修改任何页表项，仅收集信息
+fn plan_clone_level(
+    parent: &mut PageTable,
+    level: u8,
+    plan: &mut CowClonePlan,
+) -> Result<(), ForkError> {
+    // 只处理用户空间（PML4 的索引 0-255）
+    let idx_range = if level == 4 { 0..256 } else { 0..512 };
+
+    for idx in idx_range {
+        let entry = &mut parent[idx];
+        if entry.is_unused() || !entry.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+
+        if level == 1 || entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            // 叶子节点：记录到计划中
+            plan.record_leaf(entry);
+        } else {
+            // 中间节点：计数并递归
+            plan.tables_needed += 1;
+            let parent_next = unsafe { phys_to_virt_table(entry.addr()) };
+            plan_clone_level(parent_next, level - 1, plan)?;
+        }
+    }
+    Ok(())
+}
+
+/// 第二阶段：预分配所有需要的中间页表帧
+///
+/// 若分配失败，此时父进程未被修改，直接返回错误即可
+///
+/// # Z-8b fix: 部分分配失败时回收已分配的帧
+///
+/// 当分配第 N 个帧失败时，回收已分配的 0..N-1 个帧，
+/// 避免物理帧泄漏导致内存 DoS。
+fn preallocate_table_frames(
+    count: usize,
+    frame_alloc: &mut FrameAllocator,
+) -> Result<Vec<PhysFrame<Size4KiB>>, ForkError> {
+    let mut frames = Vec::with_capacity(count);
+    for _ in 0..count {
+        match frame_alloc.allocate_frame() {
+            Some(frame) => frames.push(frame),
+            None => {
+                // Z-8b fix: 回收已分配的帧，避免部分失败导致物理帧泄漏
+                for frame in frames.drain(..) {
+                    frame_alloc.deallocate_frame(frame);
+                }
+                return Err(ForkError::MemoryAllocationFailed);
+            }
+        }
+    }
+    Ok(frames)
+}
+
+/// 第三阶段：应用 - 使用预分配帧克隆页表并按计划应用 COW 修改
+///
+/// 此阶段使用预分配帧，保证不会因为内存分配失败而中途退出
+fn apply_clone_level(
     parent: &mut PageTable,
     child: &mut PageTable,
-    frame_alloc: &mut FrameAllocator,
+    frames: &mut impl Iterator<Item = PhysFrame<Size4KiB>>,
+    plan: &CowClonePlan,
+    leaf_cursor: &mut usize,
     level: u8,
 ) -> Result<(), ForkError> {
     // 只处理用户空间（PML4 的索引 0-255）
@@ -503,32 +645,53 @@ fn clone_level(
         }
 
         if level == 1 || entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            // 叶子节点：复制映射并设置 COW
-            clone_leaf(entry, &mut child[idx])?;
+            // 叶子节点：应用 COW 修改
+            let planned = plan
+                .leaf_updates
+                .get(*leaf_cursor)
+                .ok_or(ForkError::PageTableCopyFailed)?;
+            *leaf_cursor += 1;
+            apply_leaf(entry, &mut child[idx], planned)?;
         } else {
-            // 中间节点：分配新页表并递归
-            let frame = frame_alloc
-                .allocate_frame()
-                .ok_or(ForkError::MemoryAllocationFailed)?;
-            unsafe { zero_table(frame); }
+            // 中间节点：使用预分配帧
+            let frame = frames.next().ok_or(ForkError::MemoryAllocationFailed)?;
+            unsafe {
+                zero_table(frame);
+            }
 
             child[idx].set_addr(frame.start_address(), entry.flags());
 
             let parent_next = unsafe { phys_to_virt_table(entry.addr()) };
             let child_next = unsafe { phys_to_virt_table(frame.start_address()) };
-            clone_level(parent_next, child_next, frame_alloc, level - 1)?;
+            apply_clone_level(
+                parent_next,
+                child_next,
+                frames,
+                plan,
+                leaf_cursor,
+                level - 1,
+            )?;
         }
     }
     Ok(())
 }
 
-/// 克隆叶子页表项并设置 COW
-fn clone_leaf(
+/// 应用单个叶子的 COW 修改
+///
+/// 使用第一阶段记录的原始状态进行修改
+fn apply_leaf(
     parent_entry: &mut PageTableEntry,
     child_entry: &mut PageTableEntry,
+    planned: &LeafUpdate,
 ) -> Result<(), ForkError> {
-    let addr = parent_entry.addr();
-    let mut flags = parent_entry.flags();
+    // 验证计划匹配（调试断言）
+    debug_assert_eq!(
+        planned.entry_ptr, parent_entry as *mut PageTableEntry,
+        "COW plan mismatch: entry pointer doesn't match"
+    );
+
+    let addr = planned.phys_addr;
+    let mut flags = planned.original_flags;
     let addr_usize = addr.as_u64() as usize;
 
     // 处理已经是 COW 的页面（来自之前的 fork）
@@ -634,7 +797,9 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
         .ok_or(ForkError::MemoryAllocationFailed)?;
 
     // 清零新页表
-    unsafe { zero_table(new_pml4_frame); }
+    unsafe {
+        zero_table(new_pml4_frame);
+    }
 
     // 获取当前页表根（复制内核映射）
     let (current_frame, _) = Cr3::read();
@@ -653,11 +818,7 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
         // 1. 深拷贝 PML4[0] 路径上的页表（避免影响内核的恒等映射）
         // 2. 将用户空间区域（0x400000 附近）的 2MB 大页拆分为 4KB 页
         if !current_pml4[0].is_unused() {
-            deep_copy_identity_for_user(
-                current_pml4,
-                new_pml4,
-                &mut frame_alloc,
-            )?;
+            deep_copy_identity_for_user(current_pml4, new_pml4, &mut frame_alloc)?;
         }
 
         // 复制内核高半区映射（索引 256-511）
@@ -669,9 +830,8 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
         // 【关键修复】设置新页表的递归映射
         // PML4[510] 必须指向新的 PML4 帧自身，而不是从 boot 页表复制的旧值
         // 这样 recursive_pml4() 等函数才能正确访问新页表的条目
-        let recursive_flags = PageTableFlags::PRESENT
-            | PageTableFlags::WRITABLE
-            | PageTableFlags::NO_EXECUTE;
+        let recursive_flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
         new_pml4[RECURSIVE_INDEX].set_frame(new_pml4_frame, recursive_flags);
     }
 
@@ -699,8 +859,8 @@ unsafe fn deep_copy_identity_for_user(
 ) -> Result<(), ForkError> {
     // 用户空间起始地址对应的页表索引
     const USER_BASE: usize = 0x400000; // 4MB
-    const PDPT_IDX: usize = 0;         // 0-1GB 在 PDPT[0]
-    const PD_IDX: usize = 2;           // 4MB-6MB 在 PD[2] (4MB / 2MB = 2)
+    const PDPT_IDX: usize = 0; // 0-1GB 在 PDPT[0]
+    const PD_IDX: usize = 2; // 4MB-6MB 在 PD[2] (4MB / 2MB = 2)
 
     let current_pml4_0 = &current_pml4[0];
     if current_pml4_0.is_unused() {

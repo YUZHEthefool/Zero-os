@@ -1,16 +1,16 @@
-use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec, string::String, sync::Arc};
-use core::any::Any;
-use spin::Mutex;
-use x86_64::{
-    PhysAddr, VirtAddr,
-    registers::control::{Cr3, Cr3Flags},
-    structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB},
-};
 use crate::fork::PAGE_REF_COUNT;
 use crate::signal::PendingSignals;
 use crate::time;
+use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
+use core::any::Any;
 use mm::memory::FrameAllocator;
 use mm::page_table;
+use spin::Mutex;
+use x86_64::{
+    registers::control::{Cr3, Cr3Flags},
+    structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB},
+    PhysAddr, VirtAddr,
+};
 
 /// 进程ID类型
 pub type ProcessId = usize;
@@ -193,7 +193,9 @@ impl core::fmt::Debug for FxSaveArea {
 
 impl Default for FxSaveArea {
     fn default() -> Self {
-        let mut area = FxSaveArea { data: [0; FXSAVE_SIZE] };
+        let mut area = FxSaveArea {
+            data: [0; FXSAVE_SIZE],
+        };
         // 设置默认的 FCW（FPU Control Word）：双精度、所有异常屏蔽
         area.data[0] = 0x7F;
         area.data[1] = 0x03;
@@ -280,13 +282,13 @@ impl Default for Context {
 pub struct Process {
     /// 进程ID
     pub pid: ProcessId,
-    
+
     /// 父进程ID
     pub ppid: ProcessId,
-    
+
     /// 进程名称
     pub name: String,
-    
+
     /// 进程状态
     pub state: ProcessState,
 
@@ -295,16 +297,16 @@ pub struct Process {
 
     /// 进程优先级（静态优先级）
     pub priority: Priority,
-    
+
     /// 动态优先级（用于调度）
     pub dynamic_priority: Priority,
-    
+
     /// 时间片（剩余时间片，单位：毫秒）
     pub time_slice: u32,
-    
+
     /// CPU上下文
     pub context: Context,
-    
+
     /// 内核栈指针（栈底）
     pub kernel_stack: VirtAddr,
 
@@ -313,7 +315,7 @@ pub struct Process {
 
     /// 用户栈指针（如果是用户进程）
     pub user_stack: Option<VirtAddr>,
-    
+
     /// 内存空间（页表基址）
     pub memory_space: usize,
 
@@ -344,7 +346,6 @@ pub struct Process {
     pub created_at: u64,
 
     // ========== 进程凭证 (DAC支持) ==========
-
     /// 真实用户ID (uid)
     pub uid: u32,
 
@@ -451,7 +452,7 @@ impl Process {
     pub fn reset_time_slice(&mut self) {
         self.time_slice = calculate_time_slice(self.dynamic_priority);
     }
-    
+
     /// 更新动态优先级（用于公平调度）
     pub fn update_dynamic_priority(&mut self) {
         // 简单的优先级提升策略
@@ -459,14 +460,14 @@ impl Process {
             self.dynamic_priority -= 1;
         }
     }
-    
+
     /// 降低动态优先级（惩罚CPU密集型进程）
     pub fn decrease_dynamic_priority(&mut self) {
         if self.dynamic_priority < 139 {
             self.dynamic_priority += 1;
         }
     }
-    
+
     /// 恢复静态优先级
     pub fn restore_static_priority(&mut self) {
         self.dynamic_priority = self.priority;
@@ -524,7 +525,11 @@ pub fn init() {
 ///
 /// # Security Fix Z-7
 /// 内核栈分配失败时必须返回错误终止进程创建，绝不能共享内核栈
-pub fn create_process(name: String, ppid: ProcessId, priority: Priority) -> Result<ProcessId, ProcessCreateError> {
+pub fn create_process(
+    name: String,
+    ppid: ProcessId,
+    priority: Priority,
+) -> Result<ProcessId, ProcessCreateError> {
     // 先尝试分配内核栈，失败则直接返回错误（不分配 PID）
     let mut next_pid_guard = NEXT_PID.lock();
     let pid = *next_pid_guard;
@@ -533,7 +538,10 @@ pub fn create_process(name: String, ppid: ProcessId, priority: Priority) -> Resu
     let (stack_base, stack_top) = match allocate_kernel_stack(pid) {
         Ok((base, top)) => (base, top),
         Err(e) => {
-            println!("Error: Failed to allocate kernel stack for PID {}: {:?}", pid, e);
+            println!(
+                "Error: Failed to allocate kernel stack for PID {}: {:?}",
+                pid, e
+            );
             return Err(ProcessCreateError::KernelStackAllocFailed(e));
         }
     };
@@ -569,7 +577,10 @@ pub fn create_process(name: String, ppid: ProcessId, priority: Priority) -> Resu
         }
     }
 
-    println!("Created process: PID={}, Name={}, Priority={}", pid, name, priority);
+    println!(
+        "Created process: PID={}, Name={}, Priority={}",
+        pid, name, priority
+    );
 
     Ok(pid)
 }
@@ -669,7 +680,8 @@ pub fn set_current_supplementary_groups(groups: &[u32]) -> Option<()> {
     proc.supplementary_groups.clear();
     // Take only up to NGROUPS_MAX groups to prevent DoS
     let limit = groups.len().min(NGROUPS_MAX);
-    proc.supplementary_groups.extend(groups[..limit].iter().copied());
+    proc.supplementary_groups
+        .extend(groups[..limit].iter().copied());
     proc.supplementary_groups.sort_unstable();
     proc.supplementary_groups.dedup();
     Some(())
@@ -899,7 +911,10 @@ fn reparent_orphans(orphans: &[ProcessId]) {
         }
 
         if !orphans.is_empty() {
-            println!("Reparented {} orphan process(es) to init (PID 1)", orphans.len());
+            println!(
+                "Reparented {} orphan process(es) to init (PID 1)",
+                orphans.len()
+            );
         }
     } else {
         // init 进程不存在（早期启动阶段），静默忽略
@@ -987,14 +1002,19 @@ fn free_process_resources(proc: &mut Process) {
     let fd_count = proc.fd_table.len();
     proc.fd_table.clear();
     if fd_count > 0 {
-        println!("  Closed {} file descriptors for process {}", fd_count, proc.pid);
+        println!(
+            "  Closed {} file descriptors for process {}",
+            fd_count, proc.pid
+        );
     }
 
     // 如果进程拥有独立的页表（memory_space != 0），释放页表及其管理的物理帧
     if proc.memory_space != 0 {
         free_address_space(proc.memory_space);
-        println!("  Released page table hierarchy for process {} (root=0x{:x})",
-            proc.pid, proc.memory_space);
+        println!(
+            "  Released page table hierarchy for process {} (root=0x{:x})",
+            proc.pid, proc.memory_space
+        );
         proc.memory_space = 0;
     }
 
@@ -1002,8 +1022,12 @@ fn free_process_resources(proc: &mut Process) {
     notify_ipc_process_cleanup(proc.pid);
 
     if region_count > 0 {
-        println!("  Cleared {} mmap regions ({} KB) for process {}",
-            region_count, total_size / 1024, proc.pid);
+        println!(
+            "  Cleared {} mmap regions ({} KB) for process {}",
+            region_count,
+            total_size / 1024,
+            proc.pid
+        );
     }
 }
 
@@ -1025,7 +1049,9 @@ pub fn free_kernel_stack(pid: ProcessId, stack_base: VirtAddr) {
 
     // 【关键修复】检查当前 CPU 是否正在使用该栈
     let current_rsp: u64;
-    unsafe { asm!("mov {}, rsp", out(reg) current_rsp, options(nomem, preserves_flags)); }
+    unsafe {
+        asm!("mov {}, rsp", out(reg) current_rsp, options(nomem, preserves_flags));
+    }
 
     let stack_bottom = stack_base.as_u64();
     let stack_top = stack_bottom + (KSTACK_PAGES as u64 * PAGE_SIZE);
@@ -1033,8 +1059,10 @@ pub fn free_kernel_stack(pid: ProcessId, stack_base: VirtAddr) {
     if current_rsp >= stack_bottom && current_rsp < stack_top {
         // 当前 CPU 正在使用此栈，不能释放（会导致自踩栈崩溃）
         // 这种情况不应该发生（进程应在不同栈上清理自己的栈），但防御性编程
-        println!("  WARNING: Skip releasing kernel stack for PID {} (in use by current CPU, RSP=0x{:x})",
-            pid, current_rsp);
+        println!(
+            "  WARNING: Skip releasing kernel stack for PID {} (in use by current CPU, RSP=0x{:x})",
+            pid, current_rsp
+        );
         return;
     }
 
@@ -1053,7 +1081,11 @@ pub fn free_kernel_stack(pid: ProcessId, stack_base: VirtAddr) {
         });
     }
 
-    println!("  Released kernel stack for PID {} at 0x{:x}", pid, stack_base.as_u64());
+    println!(
+        "  Released kernel stack for PID {} at 0x{:x}",
+        pid,
+        stack_base.as_u64()
+    );
 }
 
 /// 释放独立用户地址空间（PML4 物理地址）
@@ -1124,8 +1156,7 @@ unsafe fn free_page_table_level(
             free_page_table_level(next_table, level - 1, frame_alloc);
 
             // 释放子页表帧本身
-            let next_frame: PhysFrame<Size4KiB> =
-                PhysFrame::containing_address(entry_phys);
+            let next_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(entry_phys);
             frame_alloc.deallocate_frame(next_frame);
         }
     }

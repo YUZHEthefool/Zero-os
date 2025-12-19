@@ -33,28 +33,25 @@ extern crate alloc;
 #[macro_use]
 extern crate drivers;
 
-pub mod wxorx;
+pub mod kptr;
 pub mod memory_hardening;
 pub mod rng;
-pub mod kptr;
 pub mod spectre;
 pub mod tests;
+pub mod wxorx;
 
 use mm::memory::FrameAllocator;
 use x86_64::VirtAddr;
 
 // Re-export public types
-pub use memory_hardening::{
-    CleanupOutcome,
-    HardeningError,
-    IdentityCleanupStrategy,
-    NxEnforcementSummary
-};
-pub use wxorx::{ValidationSummary, WxorxError, Violation, PageLevel};
-pub use rng::{RngError, fill_random, random_u64, random_u32};
 pub use kptr::KptrGuard;
+pub use memory_hardening::{
+    CleanupOutcome, HardeningError, IdentityCleanupStrategy, NxEnforcementSummary,
+};
+pub use rng::{fill_random, random_u32, random_u64, RngError};
 pub use spectre::{MitigationStatus, SpectreError, VulnerabilityInfo};
-pub use tests::{SecurityTest, TestContext, TestReport, TestResult, run_security_tests};
+pub use tests::{run_security_tests, SecurityTest, TestContext, TestReport, TestResult};
+pub use wxorx::{PageLevel, ValidationSummary, Violation, WxorxError};
 
 /// Security subsystem error types
 #[derive(Debug)]
@@ -194,7 +191,11 @@ impl SecurityReport {
 
     /// Check if the system is in a secure state
     pub fn is_secure(&self) -> bool {
-        let tests_ok = self.test_report.as_ref().map(|t| t.failed == 0).unwrap_or(true);
+        let tests_ok = self
+            .test_report
+            .as_ref()
+            .map(|t| t.failed == 0)
+            .unwrap_or(true);
         self.total_violations == 0 && self.rng_ready && tests_ok
     }
 
@@ -216,29 +217,60 @@ impl SecurityReport {
             println!("  Violations: {}", wx.violations);
         }
 
-        println!("CSPRNG: {}", if self.rng_ready { "Ready" } else { "Not Ready" });
-        println!("kptr Guard: {}", if self.kptr_guard_active { "Active" } else { "Disabled" });
+        println!(
+            "CSPRNG: {}",
+            if self.rng_ready { "Ready" } else { "Not Ready" }
+        );
+        println!(
+            "kptr Guard: {}",
+            if self.kptr_guard_active {
+                "Active"
+            } else {
+                "Disabled"
+            }
+        );
 
         if let Some(ref spectre) = self.spectre_status {
             println!("Spectre/Meltdown Mitigations:");
-            println!("  IBRS: {} (supported: {})",
-                if spectre.ibrs_enabled { "enabled" } else { "disabled" },
-                spectre.ibrs_supported);
-            println!("  STIBP: {} (supported: {})",
-                if spectre.stibp_enabled { "enabled" } else { "disabled" },
-                spectre.stibp_supported);
+            println!(
+                "  IBRS: {} (supported: {})",
+                if spectre.ibrs_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                spectre.ibrs_supported
+            );
+            println!(
+                "  STIBP: {} (supported: {})",
+                if spectre.stibp_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                spectre.stibp_supported
+            );
             println!("  IBPB: supported: {}", spectre.ibpb_supported);
             println!("  Status: {}", spectre.summary());
         }
 
         if let Some(ref tests) = self.test_report {
             println!("Security Self-Tests:");
-            println!("  Passed: {}, Failed: {}, Warnings: {}",
-                tests.passed, tests.failed, tests.warnings);
+            println!(
+                "  Passed: {}, Failed: {}, Warnings: {}",
+                tests.passed, tests.failed, tests.warnings
+            );
         }
 
         println!("Total Violations: {}", self.total_violations);
-        println!("Overall Status: {}", if self.is_secure() { "SECURE" } else { "WARNINGS" });
+        println!(
+            "Overall Status: {}",
+            if self.is_secure() {
+                "SECURE"
+            } else {
+                "WARNINGS"
+            }
+        );
     }
 }
 
@@ -286,20 +318,19 @@ pub fn init(
     }
 
     // Step 2: Clean up identity mapping
-    println!("    [2/7] Cleaning identity map ({:?})...", config.cleanup_strategy);
-    let cleanup = memory_hardening::cleanup_identity_map(
-        config.phys_offset,
+    println!(
+        "    [2/7] Cleaning identity map ({:?})...",
         config.cleanup_strategy
-    )?;
+    );
+    let cleanup =
+        memory_hardening::cleanup_identity_map(config.phys_offset, config.cleanup_strategy)?;
     report.identity_cleanup = cleanup;
 
     // Step 3: Enforce NX on kernel data sections
     if config.enforce_nx {
         println!("    [3/7] Enforcing NX bit on data pages...");
-        let nx_summary = memory_hardening::enforce_nx_for_kernel(
-            config.phys_offset,
-            frame_allocator
-        )?;
+        let nx_summary =
+            memory_hardening::enforce_nx_for_kernel(config.phys_offset, frame_allocator)?;
         report.nx_summary = Some(nx_summary);
     } else {
         println!("    [3/7] NX enforcement: SKIPPED (disabled)");
@@ -314,10 +345,13 @@ pub fn init(
                 report.total_violations += summary.violations;
 
                 if summary.violations > 0 {
-                    println!("      WARNING: {} W^X violation(s) detected", summary.violations);
+                    println!(
+                        "      WARNING: {} W^X violation(s) detected",
+                        summary.violations
+                    );
                     if config.strict_wxorx {
                         return Err(SecurityError::Wxorx(WxorxError::PolicyViolation(
-                            summary.violations
+                            summary.violations,
                         )));
                     }
                 }
@@ -403,11 +437,16 @@ pub fn init(
     // Step 7: Run security self-tests (optional)
     if config.run_security_tests {
         println!("    [7/7] Running security self-tests...");
-        let ctx = TestContext { phys_offset: config.phys_offset };
+        let ctx = TestContext {
+            phys_offset: config.phys_offset,
+        };
         let test_report = tests::run_security_tests(&ctx);
 
         if test_report.failed > 0 {
-            println!("      WARNING: {} security tests failed", test_report.failed);
+            println!(
+                "      WARNING: {} security tests failed",
+                test_report.failed
+            );
             report.total_violations += test_report.failed;
         } else {
             println!("      All {} tests passed", test_report.passed);

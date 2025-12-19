@@ -2,6 +2,11 @@
 //!
 //! Provides system call wrappers and runtime support for user-space programs.
 //!
+//! ## Modules
+//!
+//! - `syscall`: Raw system call wrappers
+//! - `libc`: Minimal C library functions (string, memory, I/O)
+//!
 //! ## Usage
 //!
 //! ```rust
@@ -9,11 +14,14 @@
 //! #![no_main]
 //!
 //! use userspace::syscall::{sys_write, sys_exit};
+//! use userspace::libc::{puts, gets_s};
 //!
 //! #[no_mangle]
 //! pub extern "C" fn _start() -> ! {
 //!     unsafe {
-//!         sys_write(1, b"Hello!\n".as_ptr(), 7);
+//!         let mut buf = [0u8; 64];
+//!         puts(b"Enter your name:\0".as_ptr());
+//!         gets_s(buf.as_mut_ptr(), buf.len());
 //!         sys_exit(0);
 //!     }
 //! }
@@ -21,6 +29,7 @@
 
 #![no_std]
 
+pub mod libc;
 pub mod syscall;
 
 /// Panic handler for user-space programs.
