@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell clean
+.PHONY: all build build-shell run run-shell run-shell-gui clean
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -89,13 +89,20 @@ run-serial: build
 	$(QEMU) $(QEMU_COMMON) \
 		-nographic
 
-# Shell模式 - 运行交互式Shell
+# Shell模式 - 运行交互式Shell（串口输出）
 run-shell: build-shell
-	@echo "=== 启动内核（Shell模式）==="
+	@echo "=== 启动内核（Shell串口模式）==="
 	@echo "提示：这是一个交互式Shell，输入 help 查看可用命令"
 	@echo "提示：按Ctrl+A然后按X退出QEMU"
 	$(QEMU) $(QEMU_COMMON) \
 		-nographic
+
+# Shell图形模式 - 运行交互式Shell（VGA窗口 + PS/2键盘）
+run-shell-gui: build-shell
+	@echo "=== 启动内核（Shell图形模式）==="
+	@echo "提示：这是一个交互式Shell，输入 help 查看可用命令"
+	@echo "提示：使用Ctrl+Alt+G释放鼠标，Ctrl+Alt+2切换到QEMU监视器"
+	$(QEMU) $(QEMU_COMMON)
 
 # 调试模式 - 显示详细的CPU状态和中断信息
 run-debug: build
@@ -160,7 +167,8 @@ help:
 	@echo "运行模式:"
 	@echo "  make run          - 图形窗口模式（推荐，可看到VGA输出）"
 	@echo "  make run-serial   - 串口输出模式（终端显示）"
-	@echo "  make run-shell    - 运行交互式Shell（支持键盘输入）"
+	@echo "  make run-shell    - 串口模式运行交互式Shell（终端输入输出）"
+	@echo "  make run-shell-gui - 图形模式运行交互式Shell（VGA+键盘）"
 	@echo "  make run-debug    - 调试模式（显示中断和CPU状态）"
 	@echo "  make run-verbose  - 详细调试（记录到文件）"
 	@echo "  make run-both     - 图形+串口组合模式"
@@ -173,6 +181,7 @@ help:
 	@echo "提示:"
 	@echo "  - 图形模式可以看到完整的VGA输出和集成测试结果"
 	@echo "  - 串口模式适合通过脚本自动化测试"
-	@echo "  - Shell模式支持键盘输入，可运行交互式命令"
+	@echo "  - Shell串口模式：使用终端输入输出，按Ctrl+A X退出"
+	@echo "  - Shell图形模式：使用PS/2键盘和VGA显示，Ctrl+Alt+G释放鼠标"
 	@echo "  - 调试模式会在qemu-debug.log中记录详细信息"
 	@echo "  - 按Ctrl+C可以随时停止QEMU"

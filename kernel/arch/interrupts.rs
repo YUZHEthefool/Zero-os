@@ -718,6 +718,9 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     // R23-5 fix: 唤醒等待 stdin 输入的进程
     kernel_core::wake_stdin_waiters();
 
+    // 输入到来后请求调度器检查待运行进程，确保shell能及时响应键盘输入
+    kernel_core::request_resched_from_irq();
+
     // 发送 EOI 到 PIC
     unsafe {
         core::arch::asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));

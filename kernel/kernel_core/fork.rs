@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use mm::memory::FrameAllocator;
 use spin::RwLock;
 use x86_64::{
-    instructions::{interrupts, tlb},
+    instructions::interrupts,
     registers::control::Cr3,
     structures::paging::{
         page_table::PageTableEntry, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
@@ -302,8 +302,10 @@ pub unsafe fn copy_page_table_cow(
     )?;
     debug_assert_eq!(leaf_cursor, plan.leaf_updates.len());
 
-    // 父进程页表被改成只读+BIT_9，需要刷新本地 TLB 才能生效
-    tlb::flush_all();
+    // R23-1 fix: 父进程页表被改成只读+BIT_9，需要刷新 TLB 才能生效
+    // 使用 TLB shootdown 机制，为 SMP 支持做准备
+    // 当前单核模式下，只做本地 flush
+    mm::flush_current_as_all();
 
     println!(
         "COW page table copy: parent=0x{:x}, child=0x{:x}, leaves={}, tables={}",

@@ -101,20 +101,53 @@ const OFF_R14: usize = 112; // callee-saved
 const OFF_R15: usize = 120; // callee-saved
 
 /// 对齐的栈存储（确保 16 字节对齐满足 ABI 要求）
+#[derive(Clone, Copy)]
 #[repr(C, align(16))]
 struct AlignedStack<const N: usize>([u8; N]);
 
-/// 临时栈（单核模式下使用，用于栈切换前的临时保存）
+// ============================================================================
+// R23-2 fix: Per-CPU syscall 临时数据
+// ============================================================================
+// 将原来的全局变量改为 per-CPU 数组，为 SMP 支持做准备。
+// 当前 current_cpu_id() 总是返回 0，所以实际行为与单核相同。
+// 未来启用 SMP 时，只需实现真正的 CPU ID 获取逻辑即可。
+//
+// **SMP 升级路径**：
+// 1. 实现 current_cpu_id() 读取 APIC ID
+// 2. 在汇编中通过 GS 段或 APIC ID 计算 per-CPU 偏移
+// 3. 将 `lea rsp, [{scratch_stacks}]` 改为 `lea rsp, [{scratch_stacks} + cpu_id * SCRATCH_SIZE]`
+
+/// 最大支持的 CPU 数量（必须与 cpu_local crate 保持一致）
+const SYSCALL_MAX_CPUS: usize = 64;
+
+// 编译时断言：确保 SYSCALL_MAX_CPUS 与 cpu_local::max_cpus() 一致
+const _: () = {
+    assert!(SYSCALL_MAX_CPUS == 64, "SYSCALL_MAX_CPUS must match cpu_local::max_cpus()");
+    // 注意：cpu_local::max_cpus() 是 const fn，但由于跨 crate 常量引用限制，
+    // 这里硬编码为 64。如果 cpu_local 修改了 MAX_CPUS，需要同步更新此处。
+};
+
+/// Per-CPU scratch 栈数组
+///
+/// 每个 CPU 有独立的 4KB 临时栈，用于 syscall 入口时保存用户寄存器。
+/// 使用 `#[no_mangle]` 以便汇编代码可以直接引用符号地址。
 ///
 /// # Safety
 ///
-/// 此栈只在中断禁用状态下使用（SFMASK 清除 IF），确保不会重入。
-/// SMP 支持时需要改为 per-CPU 变量。
-static mut SYSCALL_SCRATCH_STACK: AlignedStack<SYSCALL_SCRATCH_SIZE> =
-    AlignedStack([0; SYSCALL_SCRATCH_SIZE]);
+/// - 在中断禁用状态下使用（SFMASK 清除 IF），不会重入
+/// - 每个 CPU 只访问自己的 slot，通过 CPU ID 索引
+/// - 当前实现中 CPU ID = 0，总是使用 slot 0
+/// - 数组元素继承 AlignedStack 的 16 字节对齐属性
+#[no_mangle]
+static mut SYSCALL_SCRATCH_STACKS: [AlignedStack<SYSCALL_SCRATCH_SIZE>; SYSCALL_MAX_CPUS] =
+    [AlignedStack([0; SYSCALL_SCRATCH_SIZE]); SYSCALL_MAX_CPUS];
 
-/// 用户 RSP 暂存（避免泄露到用户栈）
-static mut USER_RSP_SHADOW: u64 = 0;
+/// Per-CPU 用户 RSP 暂存数组
+///
+/// 每个 CPU 有独立的 u64 槽位，用于暂存用户态 RSP。
+/// 避免泄露用户栈指针或覆盖其他 CPU 的数据。
+#[no_mangle]
+static mut SYSCALL_USER_RSP_SHADOWS: [u64; SYSCALL_MAX_CPUS] = [0; SYSCALL_MAX_CPUS];
 
 // ============================================================================
 // MSR 操作
@@ -305,9 +338,10 @@ extern "C" fn syscall_dispatcher_bridge(
 ///
 /// ## 已知限制
 ///
-/// 1. **单核限制**：SYSCALL_SCRATCH_STACK 和 USER_RSP_SHADOW 是全局变量，
-///    SMP 环境下需要改为 per-CPU 变量。当前由于 SFMASK 清除 IF 位，
-///    在单核环境下不会重入。
+/// 1. **Per-CPU 数据**：SYSCALL_SCRATCH_STACKS 和 SYSCALL_USER_RSP_SHADOWS
+///    已改为 per-CPU 数组（R23-2 fix）。当前 current_cpu_id() 总是返回 0，
+///    所以实际使用 slot 0。未来启用 SMP 时需要实现真正的 CPU ID 获取，
+///    并在汇编中根据 APIC ID 计算偏移。
 ///
 /// 2. **FPU/SIMD 状态**：在分发器调用前后使用 FXSAVE64/FXRSTOR64 保存并
 ///    恢复用户态 FPU/SIMD 状态。当前仍为单核实现，SMP 场景需要改为 per-CPU
@@ -326,12 +360,14 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         // CLAC is undefined and causes #UD. Using NOP instead for compatibility.
         // TODO: Check SMAP support at runtime and conditionally use CLAC.
         "nop", "nop", "nop",                        // 替代 clac (需要 SMAP 支持)
-        "mov [{user_rsp}], rsp",                    // 保存用户 RSP 到暂存区
+        // R23-2 fix: 使用 per-CPU 数组 slot 0（当前 CPU ID = 0）
+        "mov [{user_rsp_arr}], rsp",                // 保存用户 RSP 到 per-CPU 暂存区
 
         // ========================================
         // 阶段 2: 切换到临时栈
         // ========================================
-        "lea rsp, [{scratch_stack} + {scratch_size}]",  // 使用临时栈
+        // R23-2 fix: 使用 per-CPU scratch 栈数组 slot 0
+        "lea rsp, [{scratch_stacks} + {scratch_size}]",  // 使用 per-CPU 临时栈
         "cld",                                      // 清除方向标志
 
         // ========================================
@@ -344,8 +380,8 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "mov [rsp + {off_rdx}], rdx",               // arg2
         "mov [rsp + {off_rbx}], rbx",               // callee-saved
 
-        // 获取保存的用户 RSP
-        "mov rax, [{user_rsp}]",
+        // R23-2 fix: 从 per-CPU 数组获取保存的用户 RSP
+        "mov rax, [{user_rsp_arr}]",
         "mov [rsp + {off_rsp}], rax",               // 用户 RSP
 
         "mov [rsp + {off_rbp}], rbp",               // callee-saved
@@ -503,8 +539,10 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "iretq",                                    // 通过 IRETQ 返回用户态
 
         // 符号绑定
-        user_rsp = sym USER_RSP_SHADOW,
-        scratch_stack = sym SYSCALL_SCRATCH_STACK,
+        // R23-2 fix: 符号绑定 - 使用 per-CPU 数组（当前 CPU ID = 0，使用 slot 0）
+        // 未来 SMP 支持时，需要在汇编中根据 APIC ID 计算偏移
+        user_rsp_arr = sym SYSCALL_USER_RSP_SHADOWS,
+        scratch_stacks = sym SYSCALL_SCRATCH_STACKS,
         scratch_size = const SYSCALL_SCRATCH_SIZE,
         frame_size = const SYSCALL_FRAME_SIZE,
         frame_qwords = const SYSCALL_FRAME_QWORDS,

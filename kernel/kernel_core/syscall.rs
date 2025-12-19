@@ -1861,11 +1861,16 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     }
 
     // 使用基于当前 CR3 的页表管理器进行取消映射
+    // R23-3 fix: 使用两阶段方法 - 先收集帧、做 TLB shootdown、再释放
     let unmap_result: Result<(), SyscallError> = unsafe {
         with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
-            let mut frame_alloc = FrameAllocator::new();
+            use alloc::vec::Vec;
+            use x86_64::structures::paging::PhysFrame;
 
-            // 取消映射并根据引用计数决定是否释放物理帧
+            let mut frame_alloc = FrameAllocator::new();
+            let mut frames_to_free: Vec<PhysFrame> = Vec::new();
+
+            // 阶段 1: 取消映射并收集需要释放的帧
             for offset in (0..length_aligned).step_by(0x1000) {
                 let page = Page::containing_address(VirtAddr::new((addr + offset) as u64));
                 if let Ok(frame) = manager.unmap_page(page) {
@@ -1881,9 +1886,19 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
                     };
 
                     if should_free {
-                        frame_alloc.deallocate_frame(frame);
+                        frames_to_free.push(frame);
                     }
                 }
+            }
+
+            // 阶段 2: R23-3 fix - TLB shootdown
+            // 在释放物理帧之前，确保所有 CPU 都已清除 stale TLB 条目
+            // 当前单核模式下，只做本地 flush；SMP 时需要 IPI
+            mm::flush_current_as_range(VirtAddr::new(addr as u64), length_aligned);
+
+            // 阶段 3: 释放物理帧（此时 TLB 已清除，安全释放）
+            for frame in frames_to_free {
+                frame_alloc.deallocate_frame(frame);
             }
 
             Ok(())
