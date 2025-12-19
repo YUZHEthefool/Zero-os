@@ -116,7 +116,8 @@ impl FramebufferWriter {
 
         self.width = info.width;
         self.height = info.height;
-        self.stride = info.stride;
+        // IMPORTANT: UEFI GOP stride is in PIXELS, convert to BYTES (4 bytes per pixel)
+        self.stride = info.stride * 4;
         self.pixel_format = info.pixel_format;
         self.max_col = (info.width as usize) / CHAR_WIDTH;
         self.max_row = (info.height as usize) / CHAR_HEIGHT;
