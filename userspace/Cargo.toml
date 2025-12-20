@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "shell"
 path = "src/shell.rs"
 
+[[bin]]
+name = "syscall_test"
+path = "src/syscall_test.rs"
+
 [profile.dev]
 panic = "abort"
 opt-level = "z"

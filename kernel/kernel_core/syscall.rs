@@ -153,21 +153,27 @@ const MAX_RW_SIZE: usize = 1 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyscallNumber {
     // 进程管理
-    Exit = 60,     // 退出进程
-    Fork = 57,     // 创建子进程
-    Exec = 59,     // 执行程序
-    Wait = 61,     // 等待子进程
-    GetPid = 39,   // 获取进程ID
-    GetPPid = 110, // 获取父进程ID
-    Kill = 62,     // 发送信号
+    Exit = 60,           // 退出进程
+    ExitGroup = 231,     // 退出进程组
+    Fork = 57,           // 创建子进程
+    Exec = 59,           // 执行程序
+    Wait = 61,           // 等待子进程
+    GetPid = 39,         // 获取进程ID
+    GetTid = 186,        // 获取线程ID
+    GetPPid = 110,       // 获取父进程ID
+    SetTidAddress = 218, // 设置 clear_child_tid
+    SetRobustList = 273, // 设置 robust_list
+    Kill = 62,           // 发送信号
 
     // 文件I/O
-    Read = 0,  // 读取文件
-    Write = 1, // 写入文件
-    Open = 2,  // 打开文件
-    Close = 3, // 关闭文件
-    Stat = 4,  // 获取文件状态
-    Lseek = 8, // 移动文件指针
+    Read = 0,   // 读取文件
+    Write = 1,  // 写入文件
+    Open = 2,   // 打开文件
+    Close = 3,  // 关闭文件
+    Stat = 4,   // 获取文件状态
+    Fstat = 5,  // 获取文件描述符状态
+    Lseek = 8,  // 移动文件指针
+    Ioctl = 16, // I/O 控制
 
     // 内存管理
     Brk = 12,      // 改变数据段大小
@@ -186,9 +192,10 @@ pub enum SyscallNumber {
     Futex = 202, // 快速用户空间互斥锁
 
     // 其他
-    Yield = 24,  // 主动让出CPU
-    GetCwd = 79, // 获取当前工作目录
-    Chdir = 80,  // 改变当前工作目录
+    Yield = 24,      // 主动让出CPU
+    GetCwd = 79,     // 获取当前工作目录
+    Chdir = 80,      // 改变当前工作目录
+    GetRandom = 318, // 获取随机字节
 }
 
 /// 系统调用错误码
@@ -217,6 +224,7 @@ pub enum SyscallError {
     EINVAL = -22,  // 无效参数
     ENFILE = -23,  // 系统打开文件过多
     EMFILE = -24,  // 进程打开文件过多
+    ENOTTY = -25,  // 不是终端设备
     EPIPE = -32,   // 管道破裂
     ENOSYS = -38,  // 功能未实现
 }
@@ -668,6 +676,7 @@ pub fn syscall_dispatcher(
     let result = match syscall_num {
         // 进程管理
         60 => sys_exit(arg0 as i32),
+        231 => sys_exit_group(arg0 as i32),
         57 => sys_fork(),
         59 => sys_exec(
             arg0 as *const u8,
@@ -677,7 +686,10 @@ pub fn syscall_dispatcher(
         ),
         61 => sys_wait(arg0 as *mut i32),
         39 => sys_getpid(),
+        186 => sys_gettid(),
         110 => sys_getppid(),
+        218 => sys_set_tid_address(arg0 as *mut i32),
+        273 => sys_set_robust_list(arg0 as *const u8, arg1 as usize),
         62 => sys_kill(arg0 as ProcessId, arg1 as i32),
 
         // 文件I/O
@@ -686,7 +698,10 @@ pub fn syscall_dispatcher(
         2 => sys_open(arg0 as *const u8, arg1 as i32, arg2 as u32),
         3 => sys_close(arg0 as i32),
         4 => sys_stat(arg0 as *const u8, arg1 as *mut VfsStat),
+        5 => sys_fstat(arg0 as i32, arg1 as *mut VfsStat),
         8 => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32),
+        16 => sys_ioctl(arg0 as i32, arg1, arg2),
+        20 => sys_writev(arg0 as i32, arg1 as *const Iovec, arg2 as usize),
         22 => sys_pipe(arg0 as *mut i32),
 
         // 内存管理
@@ -699,13 +714,18 @@ pub fn syscall_dispatcher(
             arg4 as i32,
             arg5 as i64,
         ),
+        10 => sys_mprotect(arg0 as usize, arg1 as usize, arg2 as i32),
         11 => sys_munmap(arg0 as usize, arg1 as usize),
+
+        // 架构相关
+        158 => sys_arch_prctl(arg0 as i32, arg1 as u64),
 
         // Futex
         202 => sys_futex(arg0 as usize, arg1 as i32, arg2 as u32),
 
         // 其他
         24 => sys_yield(),
+        318 => sys_getrandom(arg0 as *mut u8, arg1 as usize, arg2 as u32),
 
         _ => Err(SyscallError::ENOSYS),
     };
@@ -764,6 +784,15 @@ fn sys_exit(exit_code: i32) -> SyscallResult {
     } else {
         Err(SyscallError::ESRCH)
     }
+}
+
+/// sys_exit_group - 终止进程组
+///
+/// 在当前单进程实现中，语义等同于 sys_exit。
+/// 完整实现应终止同一进程组内的所有线程。
+fn sys_exit_group(exit_code: i32) -> SyscallResult {
+    // 当前为单进程模型，直接委托给 sys_exit
+    sys_exit(exit_code)
 }
 
 /// sys_fork - 创建子进程
@@ -1060,6 +1089,17 @@ fn sys_exec(
 
         proc.mmap_regions.clear();
         proc.next_mmap_addr = 0x4000_0000;
+
+        // 初始化堆管理（brk）
+        // brk_start 和 brk 初始化为 ELF 最高段末尾（页对齐）
+        // 这确保 brk(0) 返回正确的初始值，malloc 才能正常工作
+        proc.brk_start = load_result.brk_start;
+        proc.brk = load_result.brk_start;
+
+        // 重置 TLS 状态（新程序需要重新设置）
+        proc.fs_base = 0;
+        proc.gs_base = 0;
+
         proc.state = ProcessState::Ready;
 
         old_space
@@ -1203,6 +1243,101 @@ fn sys_getppid() -> SyscallResult {
     } else {
         Err(SyscallError::ESRCH)
     }
+}
+
+/// sys_gettid - 获取当前线程ID
+///
+/// 在单线程进程模型中，TID 等于 PID。
+/// 当实现完整线程支持后，应返回独立的线程 ID。
+fn sys_gettid() -> SyscallResult {
+    // 当前单线程模型：TID == PID
+    if let Some(pid) = current_pid() {
+        Ok(pid)
+    } else {
+        Err(SyscallError::ESRCH)
+    }
+}
+
+/// sys_set_tid_address - 设置 clear_child_tid 指针
+///
+/// musl libc 在启动时调用此函数来注册 TID 清理指针。
+/// 当线程退出时，内核应将 0 写入此地址并执行 futex_wake。
+///
+/// # Arguments
+///
+/// * `tidptr` - 指向用户空间 i32 的指针，可为 NULL
+///
+/// # Returns
+///
+/// 返回调用进程的 TID（当前等于 PID）
+fn sys_set_tid_address(tidptr: *mut i32) -> SyscallResult {
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // 验证用户指针（如果非空）
+    if !tidptr.is_null() {
+        validate_user_ptr_mut(tidptr as *mut u8, mem::size_of::<i32>())?;
+        verify_user_memory(tidptr as *const u8, mem::size_of::<i32>(), true)?;
+    }
+
+    // 保存指针到进程控制块
+    {
+        let mut proc = process.lock();
+        proc.clear_child_tid = tidptr as u64;
+    }
+
+    // 返回当前 TID
+    Ok(pid)
+}
+
+/// sys_set_robust_list - 注册 robust_list 头指针
+///
+/// robust_list 用于跟踪进程持有的 robust futex，以便在进程异常退出时
+/// 内核能够自动释放这些锁，防止死锁。
+///
+/// # Arguments
+///
+/// * `head` - 指向 robust_list_head 结构的用户空间指针
+/// * `len` - robust_list_head 结构的大小（必须为 24）
+///
+/// # Returns
+///
+/// 成功返回 0
+fn sys_set_robust_list(head: *const u8, len: usize) -> SyscallResult {
+    /// Linux robust_list_head 结构大小
+    /// struct robust_list_head {
+    ///     struct robust_list *list;         // 8 bytes
+    ///     long futex_offset;                // 8 bytes
+    ///     struct robust_list *list_op_pending; // 8 bytes
+    /// }
+    const ROBUST_LIST_HEAD_SIZE: usize = 24;
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // 允许 NULL 指针（用于清除）
+    if head.is_null() {
+        let mut proc = process.lock();
+        proc.robust_list_head = 0;
+        proc.robust_list_len = 0;
+        return Ok(0);
+    }
+
+    // Linux 要求 len 必须等于 sizeof(struct robust_list_head) == 24
+    if len != ROBUST_LIST_HEAD_SIZE {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // 验证用户内存
+    validate_user_ptr(head, len)?;
+    verify_user_memory(head, len, false)?;
+
+    // 保存到进程控制块
+    let mut proc = process.lock();
+    proc.robust_list_head = head as u64;
+    proc.robust_list_len = len;
+
+    Ok(0)
 }
 
 /// sys_kill - 发送信号给进程
@@ -1476,6 +1611,78 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
     }
 }
 
+/// iovec 结构，用于 writev/readv 分散-聚集 I/O
+#[repr(C)]
+struct Iovec {
+    /// 缓冲区起始地址
+    iov_base: *const u8,
+    /// 缓冲区长度
+    iov_len: usize,
+}
+
+/// writev 最大 iovec 数量
+const IOV_MAX: usize = 1024;
+
+/// sys_writev - 分散写入多个缓冲区
+///
+/// # Arguments
+/// * `fd` - 文件描述符
+/// * `iov` - iovec 数组指针
+/// * `iovcnt` - iovec 数组元素个数
+///
+/// # Returns
+/// 成功返回写入的总字节数，失败返回错误码
+fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
+    // 验证 iovcnt
+    if iovcnt == 0 {
+        return Ok(0);
+    }
+    if iovcnt > IOV_MAX {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // 验证 iov 指针
+    if iov.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let iov_size = iovcnt * mem::size_of::<Iovec>();
+    validate_user_ptr(iov as *const u8, iov_size)?;
+
+    // 复制 iovec 数组到内核
+    let mut iov_array: Vec<Iovec> = Vec::with_capacity(iovcnt);
+    unsafe {
+        for i in 0..iovcnt {
+            let iov_ptr = iov.add(i);
+            let iov_entry = core::ptr::read_volatile(iov_ptr);
+            iov_array.push(iov_entry);
+        }
+    }
+
+    // 逐个写入每个缓冲区
+    let mut total_written: usize = 0;
+    for entry in iov_array.iter() {
+        if entry.iov_len == 0 {
+            continue;
+        }
+
+        // 验证并写入单个缓冲区
+        match sys_write(fd, entry.iov_base, entry.iov_len) {
+            Ok(written) => {
+                total_written += written;
+            }
+            Err(e) => {
+                // 如果已写入部分数据，返回已写入的字节数
+                if total_written > 0 {
+                    return Ok(total_written);
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(total_written)
+}
+
 /// sys_open - 打开文件
 ///
 /// # Arguments
@@ -1585,6 +1792,81 @@ fn sys_stat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
     Ok(0)
 }
 
+/// sys_fstat - 获取文件描述符状态
+///
+/// 为 musl libc 提供最小化实现，返回基本文件状态信息。
+/// 标准流 (0/1/2) 返回字符设备模式，其他 fd 返回普通文件模式。
+///
+/// # Arguments
+/// * `fd` - 文件描述符
+/// * `statbuf` - 指向用户空间 VfsStat 结构体的指针
+///
+/// # Returns
+/// 成功返回 0，失败返回错误码
+fn sys_fstat(fd: i32, statbuf: *mut VfsStat) -> SyscallResult {
+    // 验证 statbuf 指针
+    if statbuf.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    validate_user_ptr(statbuf as *const u8, mem::size_of::<VfsStat>())?;
+    verify_user_memory(statbuf as *const u8, mem::size_of::<VfsStat>(), true)?;
+
+    // 负数 fd 无效
+    if fd < 0 {
+        return Err(SyscallError::EBADF);
+    }
+
+    // 标准流始终有效，其他 fd 需要检查 fd_table
+    if fd > 2 {
+        let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+        let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+        let proc = process.lock();
+        if proc.get_fd(fd).is_none() {
+            return Err(SyscallError::EBADF);
+        }
+    }
+
+    // 构造 stat 结构
+    // 标准流返回字符设备模式 (S_IFCHR | 0666)
+    // 其他文件返回普通文件模式 (S_IFREG | 0644)
+    let mode: u32 = if fd <= 2 {
+        0o020000 | 0o666 // S_IFCHR | rw-rw-rw-
+    } else {
+        0o100000 | 0o644 // S_IFREG | rw-r--r--
+    };
+
+    let stat = VfsStat {
+        dev: 0,
+        ino: fd as u64,
+        mode,
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        size: 0,
+        blksize: 4096,
+        blocks: 0,
+        atime_sec: 0,
+        atime_nsec: 0,
+        mtime_sec: 0,
+        mtime_nsec: 0,
+        ctime_sec: 0,
+        ctime_nsec: 0,
+    };
+
+    // 将结果写入用户空间
+    let stat_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &stat as *const VfsStat as *const u8,
+            mem::size_of::<VfsStat>(),
+        )
+    };
+    copy_to_user(statbuf as *mut u8, stat_bytes)?;
+
+    Ok(0)
+}
+
 /// sys_lseek - 移动文件读写偏移
 ///
 /// # Arguments
@@ -1648,15 +1930,199 @@ fn sys_close(fd: i32) -> SyscallResult {
     Ok(0)
 }
 
+/// sys_ioctl - I/O 控制
+///
+/// 为 musl libc 提供最小化 stub 实现。
+/// musl 会在终端检测时调用 TCGETS 等 ioctl，返回 ENOTTY 表明不是终端。
+///
+/// # Arguments
+/// * `fd` - 文件描述符
+/// * `cmd` - ioctl 命令码
+/// * `arg` - 命令参数
+///
+/// # Returns
+/// 当前始终返回 ENOTTY（不是终端设备）
+fn sys_ioctl(fd: i32, cmd: u64, arg: u64) -> SyscallResult {
+    // 标记参数为已使用，避免编译器警告
+    let _ = (cmd, arg);
+
+    // 验证 fd 有效性
+    if fd < 0 {
+        return Err(SyscallError::EBADF);
+    }
+
+    // 标准流始终有效，其他 fd 需要检查
+    if fd > 2 {
+        let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+        let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+        let proc = process.lock();
+        if proc.get_fd(fd).is_none() {
+            return Err(SyscallError::EBADF);
+        }
+    }
+
+    // 当前不实现任何 ioctl 命令
+    // 常见命令：
+    // - TCGETS (0x5401): 获取终端属性
+    // - TIOCGWINSZ (0x5413): 获取终端窗口大小
+    // 返回 ENOTTY 告知 musl 这不是终端设备
+    Err(SyscallError::ENOTTY)
+}
+
 // ============================================================================
 // 内存管理系统调用
 // ============================================================================
 
-/// sys_brk - 改变数据段大小
-fn sys_brk(_addr: usize) -> SyscallResult {
-    // TODO: 实现堆管理
-    println!("sys_brk: not implemented yet");
-    Err(SyscallError::ENOSYS)
+/// 页大小
+const PAGE_SIZE: usize = 0x1000;
+
+/// 页对齐向上取整
+#[inline]
+fn page_align_up(addr: usize) -> usize {
+    (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
+
+/// sys_brk - 改变数据段大小（堆管理）
+///
+/// # Arguments
+///
+/// * `addr` - 新的 program break 地址，0 表示查询当前值
+///
+/// # Returns
+///
+/// 成功返回新的 brk 值，失败返回旧的 brk 值（符合 Linux 语义）
+///
+/// # Behavior
+///
+/// - brk(0) 返回当前 program break
+/// - brk(addr < brk_start) 返回当前 brk（拒绝缩小到起始点以下）
+/// - brk(addr > current) 扩展堆，分配匿名页
+/// - brk(addr < current) 收缩堆，释放页面
+fn sys_brk(addr: usize) -> SyscallResult {
+    use mm::memory::FrameAllocator;
+    use mm::page_table::with_current_manager;
+    use x86_64::structures::paging::{Page, PageTableFlags};
+    use x86_64::VirtAddr;
+
+    // 获取当前进程
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    let mut proc = process.lock();
+
+    // 查询模式：返回当前 brk
+    if addr == 0 {
+        return Ok(proc.brk);
+    }
+
+    // 拒绝缩小到 brk_start 以下
+    if addr < proc.brk_start {
+        return Ok(proc.brk);
+    }
+
+    // 检查用户空间边界
+    if addr >= USER_SPACE_TOP {
+        return Ok(proc.brk);
+    }
+
+    let old_brk = proc.brk;
+    let old_top = page_align_up(old_brk);
+    let new_top = page_align_up(addr);
+
+    // 堆扩展
+    if new_top > old_top {
+        let grow_size = new_top - old_top;
+
+        // 检查与 mmap 区域冲突
+        for (&region_base, &region_len) in proc.mmap_regions.iter() {
+            let region_end = region_base.saturating_add(region_len);
+            if old_top < region_end && new_top > region_base {
+                // 有重叠，返回旧值
+                return Ok(old_brk);
+            }
+        }
+
+        // 释放锁后进行映射操作
+        drop(proc);
+
+        // 分配并映射新的堆页
+        let map_result: Result<(), SyscallError> = unsafe {
+            with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
+                let mut frame_alloc = FrameAllocator::new();
+                let flags = PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::NO_EXECUTE;
+
+                for offset in (0..grow_size).step_by(PAGE_SIZE) {
+                    let vaddr = VirtAddr::new((old_top + offset) as u64);
+                    let page = Page::containing_address(vaddr);
+
+                    // 检查页面是否已映射
+                    if manager.translate_addr(vaddr).is_some() {
+                        continue;
+                    }
+
+                    // 分配物理帧
+                    let frame = frame_alloc
+                        .allocate_frame()
+                        .ok_or(SyscallError::ENOMEM)?;
+
+                    // 清零新分配的帧
+                    let virt = mm::phys_to_virt(frame.start_address());
+                    core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
+
+                    // 映射页
+                    manager
+                        .map_page(page, frame, flags, &mut frame_alloc)
+                        .map_err(|_| SyscallError::ENOMEM)?;
+                }
+                Ok(())
+            })
+        };
+
+        if map_result.is_err() {
+            // 分配失败，返回旧值
+            return Ok(old_brk);
+        }
+
+        // 更新进程 brk
+        let mut proc = process.lock();
+        proc.brk = addr;
+        Ok(addr)
+    }
+    // 堆收缩
+    else if new_top < old_top {
+        // 释放锁后进行解映射操作
+        drop(proc);
+
+        // 解映射页面
+        unsafe {
+            with_current_manager(VirtAddr::new(0), |manager| {
+                let mut frame_alloc = FrameAllocator::new();
+
+                for offset in (0..(old_top - new_top)).step_by(PAGE_SIZE) {
+                    let vaddr = VirtAddr::new((new_top + offset) as u64);
+                    let page = Page::containing_address(vaddr);
+
+                    // 解映射并释放帧
+                    if let Ok(frame) = manager.unmap_page(page) {
+                        frame_alloc.deallocate_frame(frame);
+                    }
+                }
+            });
+        }
+
+        // 更新进程 brk
+        let mut proc = process.lock();
+        proc.brk = addr;
+        Ok(addr)
+    }
+    // 同一页内调整，只更新 brk 值
+    else {
+        proc.brk = addr;
+        Ok(addr)
+    }
 }
 
 /// sys_mmap - 内存映射
@@ -1921,6 +2387,220 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     Ok(0)
 }
 
+/// mprotect 保护标志
+const PROT_READ: i32 = 0x1;
+const PROT_WRITE: i32 = 0x2;
+const PROT_EXEC: i32 = 0x4;
+const PROT_NONE: i32 = 0x0;
+
+/// sys_mprotect - 设置内存区域保护属性
+///
+/// # Arguments
+/// * `addr` - 起始地址（必须页对齐）
+/// * `len` - 区域长度
+/// * `prot` - 保护标志 (PROT_READ, PROT_WRITE, PROT_EXEC)
+///
+/// # Returns
+/// 成功返回 0，失败返回错误码
+fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
+    use mm::page_table::with_current_manager;
+    use x86_64::structures::paging::Page;
+    use x86_64::VirtAddr;
+
+    // 验证地址页对齐
+    if addr & 0xfff != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // 长度为 0 时直接返回成功
+    if len == 0 {
+        return Ok(0);
+    }
+
+    // 对齐长度到页边界
+    let len_aligned = (len + 0xfff) & !0xfff;
+
+    // W^X 安全检查：禁止同时可写可执行
+    if (prot & PROT_WRITE != 0) && (prot & PROT_EXEC != 0) {
+        return Err(SyscallError::EPERM);
+    }
+
+    // 构建页表标志
+    let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if prot & PROT_WRITE != 0 {
+        flags |= PageTableFlags::WRITABLE;
+    }
+    if prot & PROT_EXEC == 0 {
+        // 如果没有 EXEC 权限，设置 NX 位
+        flags |= PageTableFlags::NO_EXECUTE;
+    }
+    // PROT_NONE 意味着不可访问，但页仍然存在
+    // 我们通过移除 PRESENT 标志来实现（简化实现）
+
+    // 更新页表项
+    let result: Result<(), SyscallError> = unsafe {
+        with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
+            for offset in (0..len_aligned).step_by(0x1000) {
+                let page_addr = addr + offset;
+                let page = Page::containing_address(VirtAddr::new(page_addr as u64));
+
+                // 尝试更新页的保护属性
+                // 如果页不存在，跳过（mprotect 只修改已存在的映射）
+                if let Err(e) = manager.update_flags(page, flags) {
+                    // 忽略页不存在的错误，这是正常的
+                    // 其他错误则返回
+                    if !matches!(e, mm::page_table::UpdateFlagsError::PageNotMapped) {
+                        return Err(SyscallError::EFAULT);
+                    }
+                }
+            }
+            Ok(())
+        })
+    };
+
+    result?;
+
+    // 刷新 TLB
+    mm::flush_current_as_range(VirtAddr::new(addr as u64), len_aligned);
+
+    Ok(0)
+}
+
+// ============================================================================
+// 架构相关系统调用
+// ============================================================================
+
+/// arch_prctl 操作码
+const ARCH_SET_GS: i32 = 0x1001;
+const ARCH_SET_FS: i32 = 0x1002;
+const ARCH_GET_FS: i32 = 0x1003;
+const ARCH_GET_GS: i32 = 0x1004;
+
+/// 检查地址是否为 canonical 形式（x86_64）
+///
+/// 在 x86_64 中，虚拟地址必须是 48 位有效，高 16 位必须等于第 47 位的符号扩展。
+/// 即：地址的高 17 位要么全为 0，要么全为 1。
+#[inline]
+fn is_canonical(addr: u64) -> bool {
+    // 有效用户空间：0x0000_0000_0000_0000 - 0x0000_7FFF_FFFF_FFFF
+    // 有效内核空间：0xFFFF_8000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF
+    // 非 canonical 区域：0x0000_8000_0000_0000 - 0xFFFF_7FFF_FFFF_FFFF
+    let sign_extended = ((addr as i64) >> 47) as u64;
+    sign_extended == 0 || sign_extended == 0x1FFFF
+}
+
+/// sys_arch_prctl - 设置/获取架构相关的线程状态
+///
+/// 主要用于 TLS (Thread Local Storage) 支持，设置 FS/GS segment base。
+///
+/// # Arguments
+///
+/// * `code` - 操作码 (ARCH_SET_FS, ARCH_GET_FS, ARCH_SET_GS, ARCH_GET_GS)
+/// * `addr` - SET: 要设置的 base 地址；GET: 存储结果的用户空间指针
+///
+/// # Returns
+///
+/// 成功返回 0，失败返回错误码
+fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
+    use x86_64::registers::model_specific::Msr;
+
+    // MSR 寄存器常量
+    const MSR_FS_BASE: u32 = 0xC000_0100;
+    const MSR_GS_BASE: u32 = 0xC000_0101;
+
+    // 获取当前进程
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    match code {
+        ARCH_SET_FS => {
+            // 验证地址是 canonical
+            if !is_canonical(addr) {
+                return Err(SyscallError::EINVAL);
+            }
+
+            // 更新进程 PCB 中的 fs_base
+            {
+                let mut proc = process.lock();
+                proc.fs_base = addr;
+            }
+
+            // 立即更新 MSR（当前进程正在运行）
+            unsafe {
+                let mut msr = Msr::new(MSR_FS_BASE);
+                msr.write(addr);
+            }
+
+            Ok(0)
+        }
+
+        ARCH_GET_FS => {
+            // 验证用户空间指针
+            if addr == 0 || addr >= USER_SPACE_TOP as u64 {
+                return Err(SyscallError::EFAULT);
+            }
+
+            // 从 PCB 获取 fs_base
+            let fs_base = {
+                let proc = process.lock();
+                proc.fs_base
+            };
+
+            // 写回用户空间
+            let result = copy_to_user(addr as *mut u8, &fs_base.to_ne_bytes());
+            if result.is_err() {
+                return Err(SyscallError::EFAULT);
+            }
+
+            Ok(0)
+        }
+
+        ARCH_SET_GS => {
+            // 验证地址是 canonical
+            if !is_canonical(addr) {
+                return Err(SyscallError::EINVAL);
+            }
+
+            // 更新进程 PCB 中的 gs_base
+            {
+                let mut proc = process.lock();
+                proc.gs_base = addr;
+            }
+
+            // 立即更新 MSR
+            unsafe {
+                let mut msr = Msr::new(MSR_GS_BASE);
+                msr.write(addr);
+            }
+
+            Ok(0)
+        }
+
+        ARCH_GET_GS => {
+            // 验证用户空间指针
+            if addr == 0 || addr >= USER_SPACE_TOP as u64 {
+                return Err(SyscallError::EFAULT);
+            }
+
+            // 从 PCB 获取 gs_base
+            let gs_base = {
+                let proc = process.lock();
+                proc.gs_base
+            };
+
+            // 写回用户空间
+            let result = copy_to_user(addr as *mut u8, &gs_base.to_ne_bytes());
+            if result.is_err() {
+                return Err(SyscallError::EFAULT);
+            }
+
+            Ok(0)
+        }
+
+        _ => Err(SyscallError::EINVAL),
+    }
+}
+
 // ============================================================================
 // Futex 系统调用
 // ============================================================================
@@ -2000,6 +2680,103 @@ fn sys_yield() -> SyscallResult {
     crate::force_reschedule();
 
     Ok(0)
+}
+
+/// sys_getrandom - 获取随机字节
+///
+/// 为 musl libc 提供随机数生成支持。
+/// 使用 RDRAND 指令（如果 CPU 支持）混合时间戳生成随机数。
+///
+/// # Arguments
+/// * `buf` - 用户空间缓冲区指针
+/// * `len` - 请求的字节数
+/// * `flags` - 标志位 (GRND_NONBLOCK=0x1, GRND_RANDOM=0x2)
+///
+/// # Returns
+/// 成功返回写入的字节数，失败返回错误码
+fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> SyscallResult {
+    /// GRND_NONBLOCK - 非阻塞模式
+    const GRND_NONBLOCK: u32 = 0x1;
+    /// GRND_RANDOM - 使用 /dev/random 语义（当前忽略）
+    const GRND_RANDOM: u32 = 0x2;
+
+    // 验证 flags 有效性
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM) != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // 处理边界情况
+    let count = match len {
+        0 => return Ok(0),
+        c if c > MAX_RW_SIZE => return Err(SyscallError::E2BIG),
+        c => c,
+    };
+
+    // 验证用户缓冲区
+    validate_user_ptr_mut(buf, count)?;
+    verify_user_memory(buf as *const u8, count, true)?;
+
+    // 生成随机数据到临时缓冲区
+    let mut tmp = vec![0u8; count];
+    let mut offset = 0usize;
+
+    while offset < count {
+        // 混合时间戳和 RDRAND（如果可用）
+        let mut word = crate::time::get_ticks() as u64;
+
+        // 尝试使用 RDRAND 指令（需要 CPUID 检查）
+        #[cfg(target_arch = "x86_64")]
+        {
+            // 检查 CPU 是否支持 RDRAND (CPUID.01H:ECX.RDRAND[bit 30])
+            // 注意：RBX 被 LLVM 保留，需要手动保存/恢复
+            let rdrand_supported: bool = {
+                let ecx: u32;
+                unsafe {
+                    core::arch::asm!(
+                        "push rbx",      // 保存 RBX
+                        "mov eax, 1",
+                        "cpuid",
+                        "mov {0:e}, ecx",
+                        "pop rbx",       // 恢复 RBX
+                        out(reg) ecx,
+                        out("eax") _,
+                        out("ecx") _,
+                        out("edx") _,
+                        options(nostack),
+                    );
+                }
+                (ecx & (1 << 30)) != 0
+            };
+
+            if rdrand_supported {
+                let rand_result: u64;
+                let success: u8;
+                unsafe {
+                    core::arch::asm!(
+                        "rdrand {0}",
+                        "setc {1}",
+                        out(reg) rand_result,
+                        out(reg_byte) success,
+                        options(nostack, nomem),
+                    );
+                }
+                if success != 0 {
+                    word ^= rand_result;
+                }
+            }
+        }
+
+        // 将 word 拆分为字节并填充缓冲区
+        let bytes = word.to_ne_bytes();
+        let chunk = core::cmp::min(bytes.len(), count - offset);
+        tmp[offset..offset + chunk].copy_from_slice(&bytes[..chunk]);
+        offset += chunk;
+    }
+
+    // 复制到用户空间
+    copy_to_user(buf, &tmp)?;
+
+    Ok(count)
 }
 
 /// 系统调用统计

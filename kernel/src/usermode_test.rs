@@ -157,6 +157,24 @@ struct AlignedElfData<const N: usize>([u8; N]);
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("shell.elf").len() }> =
     AlignedElfData(*include_bytes!("shell.elf"));
 
+/// Embedded syscall test program with proper alignment
+///
+/// Tests new musl-required syscalls:
+/// - gettid, set_tid_address, set_robust_list, getrandom
+#[cfg(feature = "syscall_test")]
+static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("syscall_test.elf").len() }> =
+    AlignedElfData(*include_bytes!("syscall_test.elf"));
+
+/// Embedded musl libc test program with proper alignment
+///
+/// Tests musl libc initialization and basic I/O:
+/// - Full musl libc startup sequence
+/// - stdio (printf, puts)
+/// - syscalls (write, getpid, exit)
+#[cfg(feature = "musl_test")]
+static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("musl_test.elf").len() }> =
+    AlignedElfData(*include_bytes!("musl_test.elf"));
+
 /// Embedded Ring 3 test program (hello.elf) with proper alignment
 ///
 /// This is a minimal user-space program that tests:
@@ -164,7 +182,7 @@ static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("shell.elf").len() }> =
 /// - sys_write (fd 1, stdout)
 /// - sys_getpid
 /// - sys_exit
-#[cfg(not(feature = "shell"))]
+#[cfg(not(any(feature = "shell", feature = "syscall_test", feature = "musl_test")))]
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("hello.elf").len() }> =
     AlignedElfData(*include_bytes!("hello.elf"));
 
@@ -175,7 +193,11 @@ fn user_elf() -> &'static [u8] {
 
 #[cfg(feature = "shell")]
 const PROCESS_NAME: &str = "shell";
-#[cfg(not(feature = "shell"))]
+#[cfg(feature = "syscall_test")]
+const PROCESS_NAME: &str = "syscall_test";
+#[cfg(feature = "musl_test")]
+const PROCESS_NAME: &str = "musl_test";
+#[cfg(not(any(feature = "shell", feature = "syscall_test", feature = "musl_test")))]
 const PROCESS_NAME: &str = "hello";
 
 /// Run the Ring 3 test

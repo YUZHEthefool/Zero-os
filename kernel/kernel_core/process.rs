@@ -365,6 +365,32 @@ pub struct Process {
     /// 文件创建掩码 (umask)
     /// 新建文件的权限 = mode & !umask
     pub umask: u16,
+
+    // ========== 堆管理 (brk) ==========
+    /// 堆起始地址（ELF bss 段末尾，页对齐）
+    pub brk_start: usize,
+
+    /// 当前 program break（可能未页对齐）
+    pub brk: usize,
+
+    // ========== TLS 支持 ==========
+    /// FS segment base (用于 TLS)
+    pub fs_base: u64,
+
+    /// GS segment base (保留)
+    pub gs_base: u64,
+
+    // ========== 线程支持 (musl 初始化需要) ==========
+    /// clear_child_tid 指针 (set_tid_address)
+    /// 进程退出时内核会将此地址处的值设为 0 并执行 futex_wake
+    pub clear_child_tid: u64,
+
+    /// robust_list 头指针 (set_robust_list)
+    /// 用于 robust futex 机制，进程退出时内核会清理持有的 robust mutex
+    pub robust_list_head: u64,
+
+    /// robust_list 长度
+    pub robust_list_len: usize,
 }
 
 impl Process {
@@ -401,6 +427,16 @@ impl Process {
             egid: 0,
             supplementary_groups: Vec::new(),
             umask: 0o022,
+            // 堆管理 - ELF 加载时设置实际值
+            brk_start: 0,
+            brk: 0,
+            // TLS 支持
+            fs_base: 0,
+            gs_base: 0,
+            // 线程支持 (musl 初始化)
+            clear_child_tid: 0,
+            robust_list_head: 0,
+            robust_list_len: 0,
         }
     }
 

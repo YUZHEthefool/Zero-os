@@ -74,6 +74,11 @@ pub struct ElfLoadResult {
     pub entry: u64,
     /// 用户栈顶地址
     pub user_stack_top: u64,
+    /// 堆起始地址（BSS 末尾，页对齐）
+    ///
+    /// 这是 brk(0) 的初始返回值，也是 brk_start 的初始值。
+    /// 计算为所有 PT_LOAD 段中 (vaddr + memsz) 的最大值，向上对齐到页边界。
+    pub brk_start: usize,
 }
 
 /// 为当前进程地址空间加载 ELF 映像
@@ -105,9 +110,22 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
     // 使用 1024 作为合理上限，避免堆碎片化
     let mut all_mappings: Vec<MappedEntry> = Vec::with_capacity(1024);
 
+    // 追踪所有段的最高地址，用于计算 brk_start
+    let mut highest_segment_end: usize = 0;
+
     // 加载所有 PT_LOAD 段
     for ph in elf.program_iter() {
         if ph.get_type() == Ok(PhType::Load) {
+            // 计算段结束地址
+            let vaddr = ph.virtual_addr() as usize;
+            let memsz = ph.mem_size() as usize;
+            if memsz > 0 {
+                let segment_end = vaddr.saturating_add(memsz);
+                if segment_end > highest_segment_end {
+                    highest_segment_end = segment_end;
+                }
+            }
+
             if let Err(e) = load_segment_tracked(&elf, &ph, &mut all_mappings) {
                 // 回滚所有已成功映射的段
                 rollback_all_mappings(&mut all_mappings);
@@ -123,9 +141,37 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
         return Err(e);
     }
 
+    // 计算 brk_start：段末尾向上对齐到页边界
+    let brk_start = (highest_segment_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    // 验证 brk_start 不与栈区域重叠
+    // 栈区域：[USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_TOP)
+    let stack_base = USER_STACK_TOP as usize - USER_STACK_SIZE;
+    if brk_start >= stack_base {
+        println!(
+            "ELF loader: brk_start 0x{:x} overlaps with stack at 0x{:x}",
+            brk_start, stack_base
+        );
+        rollback_all_mappings(&mut all_mappings);
+        return Err(ElfLoadError::OverlapWithStack);
+    }
+
+    println!(
+        "ELF loaded: entry=0x{:x}, brk_start=0x{:x}",
+        elf.header.pt2.entry_point(),
+        brk_start
+    );
+
+    // 【修复】初始 RSP 必须在已映射的栈页内
+    // 栈分配从 (USER_STACK_TOP - USER_STACK_SIZE) 到 USER_STACK_TOP
+    // 但 USER_STACK_TOP 所在的页边界不在映射范围内
+    // 设置 RSP 为最后一个映射页的顶部，减去 16 字节确保 ABI 16字节对齐
+    let initial_rsp = USER_STACK_TOP - 16;
+
     Ok(ElfLoadResult {
         entry: elf.header.pt2.entry_point(),
-        user_stack_top: USER_STACK_TOP,
+        user_stack_top: initial_rsp,
+        brk_start,
     })
 }
 
@@ -319,7 +365,9 @@ fn load_segment_tracked(
 /// 成功返回 Ok(())，失败时调用方负责使用 tracked 进行全局回滚
 fn allocate_user_stack_tracked(tracked: &mut Vec<MappedEntry>) -> Result<(), ElfLoadError> {
     let stack_base = USER_STACK_TOP as usize - USER_STACK_SIZE;
-    let page_count = USER_STACK_SIZE / PAGE_SIZE;
+    // 【修复】多分配一页，确保 USER_STACK_TOP 所在的页也被映射
+    // musl libc 启动时会向上扫描栈查找 auxv 等数据结构
+    let page_count = USER_STACK_SIZE / PAGE_SIZE + 1;
 
     let flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE

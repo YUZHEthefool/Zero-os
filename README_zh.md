@@ -18,7 +18,7 @@ Zero-OS 是一个企业级微内核，灵感来自 Linux 的模块化设计，�
 - **基于能力的 IPC**：进程间通信的细粒度访问控制
 - **安全加固**：W^X 强制执行、恒等映射清理、CSPRNG（ChaCha20）
 
-### 当前状态 (v0.3.1)
+### 当前状态 (v0.6.0)
 
 | 组件 | 状态 | 描述 |
 |------|------|------|
@@ -26,17 +26,17 @@ Zero-OS 是一个企业级微内核，灵感来自 Linux 的模块化设计，�
 | 进程管理 | 完成 | 每进程地址空间、fork/exec/wait |
 | 调度器 | 完成 | IRQ 安全的 MLFQ、抢占式调度 |
 | IPC | 完成 | 管道、消息队列、futex、信号 |
-| 安全 | Phase 0 | W^X 验证、RNG、恒等映射加固 |
-| VFS | 未开始 | - |
-| 用户模式 (Ring 3) | 未开始 | - |
+| 安全 | Phase 6 | W^X、RNG、23 轮审计（全部修复）|
+| VFS | 完成 | 基础 VFS，stdin/stdout，阻塞 I/O |
+| 用户模式 (Ring 3) | 完成 | SYSCALL/SYSRET、50+ 系统调用、Shell |
 | 网络 | 未开始 | - |
-| SMP | 未开始 | - |
+| SMP | 基础设施 | Per-CPU 数据、TLB shootdown 占位符 |
 
 ---
 
 ## 2. 项目结构
 
-```
+```text
 Zero-OS/
 ├── bootloader/             # UEFI 引导加载程序
 │   └── src/main.rs         # ELF 加载器、页表设置
@@ -44,11 +44,13 @@ Zero-OS/
 │   ├── arch/               # x86_64 架构代码
 │   │   ├── interrupts.rs   # IDT、异常处理、PIC
 │   │   ├── context_switch.rs # 完整上下文保存/恢复
+│   │   ├── syscall.rs      # SYSCALL/SYSRET 入口（per-CPU）
 │   │   └── gdt.rs          # 用户-内核转换的 GDT/TSS
 │   ├── mm/                 # 内存管理
 │   │   ├── memory.rs       # 堆分配器、帧分配器
 │   │   ├── buddy_allocator.rs # 物理页分配器
-│   │   └── page_table.rs   # 页表管理器
+│   │   ├── page_table.rs   # 页表管理器
+│   │   └── tlb_shootdown.rs # TLB 失效（SMP 就绪）
 │   ├── sched/              # 调度器
 │   │   ├── scheduler.rs    # 基础轮转调度
 │   │   └── enhanced_scheduler.rs # 带优先级的 MLFQ
@@ -58,20 +60,26 @@ Zero-OS/
 │   │   ├── futex.rs        # 用户空间快速互斥锁
 │   │   └── sync.rs         # WaitQueue、KMutex、Semaphore
 │   ├── drivers/            # 设备驱动
-│   │   ├── vga_buffer.rs   # VGA 文本模式
-│   │   └── serial.rs       # UART 16550
+│   │   ├── vga_buffer.rs   # VGA 文本模式 / GOP 帧缓冲
+│   │   ├── serial.rs       # UART 16550
+│   │   └── keyboard.rs     # PS/2 键盘（带等待队列）
 │   ├── kernel_core/        # 核心内核
 │   │   ├── process.rs      # PCB、进程表
-│   │   ├── fork.rs         # 带 COW 的 Fork
+│   │   ├── fork.rs         # 带 COW + TLB shootdown 的 Fork
 │   │   ├── syscall.rs      # 50+ 系统调用
 │   │   ├── signal.rs       # POSIX 信号
 │   │   └── elf_loader.rs   # ELF 二进制加载
-│   ├── security/           # 安全加固（新增）
+│   ├── security/           # 安全加固
 │   │   ├── wxorx.rs        # W^X 策略验证
 │   │   ├── memory_hardening.rs # 恒等映射清理、NX
 │   │   └── rng.rs          # RDRAND/RDSEED、ChaCha20 CSPRNG
+│   ├── cpu_local/          # Per-CPU 数据结构
 │   ├── src/main.rs         # 内核入口点
 │   └── kernel.ld           # 链接脚本
+├── userspace/              # 用户空间程序
+│   └── src/
+│       ├── shell.rs        # 交互式 Shell
+│       └── syscall.rs      # 系统调用封装
 └── Makefile                # 构建系统
 ```
 
@@ -117,12 +125,22 @@ Zero-OS/
 - **Futex**：用户空间快速互斥锁
 - **信号**：类 POSIX 信号处理（SIGKILL、SIGSTOP、SIGCONT 等）
 
-### 3.6 安全（Phase 0）
+### 3.6 安全（Phase 6）
 
 - **W^X 强制执行**：验证没有页面同时可写和可执行
 - **恒等映射加固**：启动后移除可写标志
 - **NX 强制执行**：数据页设置不可执行位
 - **CSPRNG**：基于 ChaCha20 的 RNG，由 RDRAND/RDSEED 提供种子
+- **TLB Shootdown**：跨 CPU TLB 失效基础设施（SMP 就绪）
+- **Per-CPU 数据**：每 CPU 独立的系统调用临时栈
+
+### 3.7 用户模式（Ring 3）
+
+- **SYSCALL/SYSRET**：通过 MSR 配置的快速系统调用入口
+- **50+ 系统调用**：fork、exec、read、write、mmap、munmap 等
+- **用户-内核隔离**：独立地址空间，SMAP 就绪的安全检查
+- **交互式 Shell**：带阻塞 I/O 的命令行界面
+- **FPU/SIMD 支持**：FXSAVE64/FXRSTOR64 状态保存
 
 ---
 
@@ -167,37 +185,49 @@ qemu-system-x86_64 -cpu Haswell ...
 
 ## 5. 安全审计状态
 
-项目已经过 13 轮安全审计：
+项目已经过 **23 轮安全审计**：
 
 | 指标 | 数值 |
 |------|------|
-| 发现的问题总数 | 70 |
-| 已修复问题 | 62 (89%) |
-| 未解决问题 | 8 (延迟到未来阶段) |
+| 发现的问题总数 | 82+ |
+| 已修复问题 | 100% |
+| 最新审计 | 第 23 轮 (2025-12-19) |
 
-详见 [qa-2025-12-11.md](qa-2025-12-11.md) 获取详细审计报告。
+### 第 23 轮重点
+
+- **R23-1**：COW TLB shootdown 基础设施（SMP 就绪）
+- **R23-2**：Per-CPU 系统调用临时栈
+- **R23-3**：两阶段 munmap 与 TLB 失效
+- **R23-4/R23-5**：阻塞式 stdin 实现
+
 
 ---
 
 ## 6. 路线图
 
-### 已完成 (Phase 0-3)
+### 已完成 (Phase 0-6)
+
 - UEFI 启动与 ELF 加载
 - 内存管理（堆、伙伴分配器、COW）
 - 进程管理（fork、exec、wait、exit）
 - 抢占式调度器（MLFQ）
 - IPC（管道、消息队列、futex、信号）
-- 安全加固基础
+- 安全加固（W^X、NX、CSPRNG）
+- 用户模式（Ring 3）与 SYSCALL/SYSRET
+- VFS 与阻塞式 stdin/stdout
+- 23 轮安全审计全部完成
 
-### 进行中 (Phase 4+)
-- VFS（虚拟文件系统）
-- 用户模式（Ring 3）与系统调用入口
+### 进行中
+
+- SMP 基础（per-CPU 数据、TLB shootdown 基础设施）
+- 基于 IPI 的 TLB 失效
 - 能力框架
 - MAC/LSM 安全钩子
 
 ### 未来计划
+
 - 带防火墙的网络栈
-- SMP（多核支持）
+- 完整 SMP（多核调度）
 - 容器/命名空间隔离
 
 完整的企业安全路线图请参见 [roadmap-enterprise.md](roadmap-enterprise.md)。

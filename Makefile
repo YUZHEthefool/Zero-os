@@ -68,6 +68,79 @@ build-shell:
 	@readelf -h esp/kernel.elf | grep "Entry\|Type"
 	@echo "=== 构建完成（Shell模式）==="
 
+# Build with syscall test program
+build-syscall-test:
+	@echo "=== 构建 Syscall Test 用户程序 ==="
+	cd userspace && \
+	cargo build --release --bin syscall_test --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins
+	cp userspace/target/x86_64-unknown-none/release/syscall_test kernel/src/syscall_test.elf
+
+	@echo "=== 构建 Bootloader (UEFI) ==="
+	cd bootloader && \
+	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi
+
+	@echo "=== 构建 Kernel (Bare Metal) with Syscall Test ==="
+	cd kernel && \
+	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C relocation-model=static -C code-model=kernel -C panic=abort" \
+	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features syscall_test
+
+	@echo "=== 准备 EFI ESP 目录 ==="
+	mkdir -p $(ESP_DIR)
+
+	@echo "复制 Bootloader 到 ESP/BOOTX64.EFI"
+	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi $(ESP_DIR)/BOOTX64.EFI
+
+	@echo "复制 Kernel 到 ESP/kernel.elf"
+	cp kernel-target/x86_64-unknown-none/release/kernel esp/kernel.elf
+
+	@echo "=== 内核信息 ==="
+	@readelf -h esp/kernel.elf | grep "Entry\|Type"
+	@echo "=== 构建完成（Syscall Test模式）==="
+
+# Run syscall test (serial output)
+run-syscall-test: build-syscall-test
+	@echo "=== 启动内核（Syscall Test模式）==="
+	@echo "提示：按Ctrl+A然后按X退出QEMU"
+	$(QEMU) $(QEMU_COMMON) \
+		-nographic
+
+# Build with musl test program
+build-musl-test:
+	@echo "=== 编译 musl 测试程序 ==="
+	cd userspace && musl-gcc -static -o hello_musl.elf hello_musl.c
+	cp userspace/hello_musl.elf kernel/src/musl_test.elf
+
+	@echo "=== 构建 Bootloader (UEFI) ==="
+	cd bootloader && \
+	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi
+
+	@echo "=== 构建 Kernel (Bare Metal) with Musl Test ==="
+	cd kernel && \
+	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C relocation-model=static -C code-model=kernel -C panic=abort" \
+	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features musl_test
+
+	@echo "=== 准备 EFI ESP 目录 ==="
+	mkdir -p $(ESP_DIR)
+
+	@echo "复制 Bootloader 到 ESP/BOOTX64.EFI"
+	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi $(ESP_DIR)/BOOTX64.EFI
+
+	@echo "复制 Kernel 到 ESP/kernel.elf"
+	cp kernel-target/x86_64-unknown-none/release/kernel esp/kernel.elf
+
+	@echo "=== 内核信息 ==="
+	@readelf -h esp/kernel.elf | grep "Entry\|Type"
+	@echo "=== musl ELF 信息 ==="
+	@readelf -h kernel/src/musl_test.elf | grep "Entry\|Type"
+	@echo "=== 构建完成（Musl Test模式）==="
+
+# Run musl test (serial output)
+run-musl-test: build-musl-test
+	@echo "=== 启动内核（Musl Test模式）==="
+	@echo "提示：按Ctrl+A然后按X退出QEMU"
+	$(QEMU) $(QEMU_COMMON) \
+		-nographic
+
 # 通用QEMU参数
 # -vga std: 强制使用标准VGA模式，确保0xB8000文本缓冲区可用
 QEMU_COMMON = -bios $(OVMF_PATH) \

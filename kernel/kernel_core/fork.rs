@@ -192,6 +192,24 @@ fn fork_inner(
         child.supplementary_groups = parent.supplementary_groups.clone();
         child.umask = parent.umask;
 
+        // 复制堆管理状态
+        child.brk_start = parent.brk_start;
+        child.brk = parent.brk;
+
+        // 复制 TLS 状态（FS/GS base）
+        child.fs_base = parent.fs_base;
+        child.gs_base = parent.gs_base;
+
+        // 复制线程支持状态
+        // 注意：clear_child_tid 应该为 0（子进程需要自己设置）
+        child.clear_child_tid = 0;
+        child.robust_list_head = 0;
+        child.robust_list_len = 0;
+
+        // 复制 mmap 区域记录
+        child.mmap_regions = parent.mmap_regions.clone();
+        child.next_mmap_addr = parent.next_mmap_addr;
+
         child.context.rax = 0; // 子进程返回值 0
         child.state = ProcessState::Ready;
 

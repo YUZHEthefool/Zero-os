@@ -442,13 +442,15 @@ impl Scheduler {
                 }
             };
 
-            // 获取新进程的上下文指针、内核栈顶和 CS（用于判断 Ring 3）
-            let (new_ctx_ptr, next_kstack_top, next_cs): (*const ArchContext, u64, u64) = {
+            // 获取新进程的上下文指针、内核栈顶、CS（用于判断 Ring 3）和 FS/GS base（TLS）
+            let (new_ctx_ptr, next_kstack_top, next_cs, next_fs_base, next_gs_base): (*const ArchContext, u64, u64, u64, u64) = {
                 let guard = next_pcb.lock();
                 let ctx = &guard.context as *const _ as *const ArchContext;
                 let kstack_top = guard.kernel_stack_top.as_u64();
                 let cs = guard.context.cs;
-                (ctx, kstack_top, cs)
+                let fs_base = guard.fs_base;
+                let gs_base = guard.gs_base;
+                (ctx, kstack_top, cs, fs_base, gs_base)
             };
 
             // 判断下一个进程是否为用户态进程（Ring 3）
@@ -499,6 +501,22 @@ impl Scheduler {
                     // enter_usermode 会验证 RIP/RSP 的规范性和用户空间边界，
                     // 清理 RFLAGS 中的特权位（IOPL/NT/RF），强制使用用户段选择子
                     save_context(old_ctx_ptr);
+
+                    // 恢复用户进程的 FS/GS base (TLS 支持)
+                    // 必须无条件写入 MSR，即使值为 0，以防止 TLS 状态在进程间泄漏
+                    // 如果只在非 0 时写入，新进程会继承上一个进程的 TLS 数据
+                    {
+                        use x86_64::registers::model_specific::Msr;
+                        const MSR_FS_BASE: u32 = 0xC000_0100;
+                        const MSR_GS_BASE: u32 = 0xC000_0101;
+
+                        let mut fs_msr = Msr::new(MSR_FS_BASE);
+                        fs_msr.write(next_fs_base);
+
+                        let mut gs_msr = Msr::new(MSR_GS_BASE);
+                        gs_msr.write(next_gs_base);
+                    }
+
                     enter_usermode(new_ctx_ptr);
                     // 不会到达这里
                 } else {

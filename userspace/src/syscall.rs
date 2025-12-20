@@ -65,6 +65,21 @@ pub const SYS_KILL: u64 = 62;
 /// Get parent process ID
 pub const SYS_GETPPID: u64 = 110;
 
+/// Get thread ID
+pub const SYS_GETTID: u64 = 186;
+
+/// Set TID address for clear_child_tid
+pub const SYS_SET_TID_ADDRESS: u64 = 218;
+
+/// Terminate process group
+pub const SYS_EXIT_GROUP: u64 = 231;
+
+/// Set robust list head
+pub const SYS_SET_ROBUST_LIST: u64 = 273;
+
+/// Get random bytes
+pub const SYS_GETRANDOM: u64 = 318;
+
 // ============================================================================
 // Raw Syscall Primitives
 // ============================================================================
@@ -336,6 +351,71 @@ pub unsafe fn sys_yield() -> u64 {
 #[inline(always)]
 pub unsafe fn sys_kill(pid: u64, sig: u64) -> u64 {
     syscall2(SYS_KILL, pid, sig)
+}
+
+/// Get current thread ID
+///
+/// # Returns
+/// Current thread ID (equals PID in single-threaded processes)
+#[inline(always)]
+pub unsafe fn sys_gettid() -> u64 {
+    syscall0(SYS_GETTID)
+}
+
+/// Set the address for clear_child_tid
+///
+/// # Arguments
+/// - `tidptr`: Pointer to store TID (cleared on thread exit)
+///
+/// # Returns
+/// Current TID on success, negative error code on failure
+#[inline(always)]
+pub unsafe fn sys_set_tid_address(tidptr: *mut i32) -> u64 {
+    syscall1(SYS_SET_TID_ADDRESS, tidptr as u64)
+}
+
+/// Set robust list head pointer
+///
+/// # Arguments
+/// - `head`: Pointer to robust_list_head structure
+/// - `len`: Size of the structure (must be 24)
+///
+/// # Returns
+/// 0 on success, negative error code on failure
+#[inline(always)]
+pub unsafe fn sys_set_robust_list(head: *const u8, len: usize) -> u64 {
+    syscall2(SYS_SET_ROBUST_LIST, head as u64, len as u64)
+}
+
+/// Terminate process group
+///
+/// # Arguments
+/// - `code`: Exit status code
+///
+/// # Safety
+/// This function never returns.
+#[inline(always)]
+pub unsafe fn sys_exit_group(code: u64) -> ! {
+    core::arch::asm!(
+        "syscall",
+        in("rax") SYS_EXIT_GROUP,
+        in("rdi") code,
+        options(noreturn, nostack),
+    );
+}
+
+/// Get random bytes
+///
+/// # Arguments
+/// - `buf`: Buffer to fill with random bytes
+/// - `len`: Number of bytes to generate
+/// - `flags`: Flags (GRND_NONBLOCK=1, GRND_RANDOM=2)
+///
+/// # Returns
+/// Number of bytes written, or negative error code
+#[inline(always)]
+pub unsafe fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> u64 {
+    syscall3(SYS_GETRANDOM, buf as u64, len as u64, flags as u64)
 }
 
 // ============================================================================
