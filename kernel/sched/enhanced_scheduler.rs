@@ -93,15 +93,44 @@ impl Scheduler {
     }
 
     /// 选择优先级最高的就绪进程（内部实现，需要队列锁）
-    fn select_next_locked(queue: &ReadyQueues) -> Option<Pid> {
+    ///
+    /// # Arguments
+    /// * `queue` - 就绪队列引用
+    /// * `skip_pid` - 要跳过的进程 PID（用于 yield 时避免选中自己）
+    fn select_next_locked(queue: &ReadyQueues, skip_pid: Option<Pid>) -> Option<Pid> {
+        // Debug: print all processes in queue
+        for (priority, bucket) in queue.iter() {
+            for (&pid, pcb) in bucket.iter() {
+                let state = pcb.lock().state;
+                println!("[SCHED] queue: pid={}, priority={}, state={:?}", pid, priority, state);
+            }
+        }
+
         // BTreeMap 按 key 升序排列，所以优先级数值最小（最高优先级）的在前面
         for (_priority, bucket) in queue.iter() {
             for (&pid, pcb) in bucket.iter() {
+                // 跳过指定的进程（用于 yield 场景）
+                if Some(pid) == skip_pid {
+                    continue;
+                }
                 if pcb.lock().state == ProcessState::Ready {
+                    println!("[SCHED] selected pid={}", pid);
                     return Some(pid);
                 }
             }
         }
+
+        // 如果没有其他就绪进程，回退到被跳过的进程（如果它是就绪的）
+        if let Some(skip) = skip_pid {
+            if let Some(pcb) = Self::find_pcb(queue, skip) {
+                if pcb.lock().state == ProcessState::Ready {
+                    println!("[SCHED] fallback to skipped pid={}", skip);
+                    return Some(skip);
+                }
+            }
+        }
+
+        println!("[SCHED] no ready process found");
         None
     }
 
@@ -121,6 +150,7 @@ impl Scheduler {
                 proc.state = ProcessState::Ready;
                 (proc.pid, proc.dynamic_priority)
             };
+            println!("[SCHED] add_process: pid={}, priority={}", pid, priority);
             {
                 let mut queue = READY_QUEUE.lock();
                 // 先从所有桶中移除（防止重复）
@@ -211,7 +241,7 @@ impl Scheduler {
     pub fn select_next() -> Option<Pid> {
         interrupts::without_interrupts(|| {
             let queue = READY_QUEUE.lock();
-            Self::select_next_locked(&queue)
+            Self::select_next_locked(&queue, None)
         })
     }
 
@@ -297,19 +327,25 @@ impl Scheduler {
 
             // 获取当前运行的进程
             let current_pid = *CURRENT_PROCESS.lock();
+            println!("[SCHED] schedule: current_pid={:?}", current_pid);
 
             // 在单次锁定中获取所需的所有引用
+            // 注意：传递 current_pid 给 select_next_locked，使其优先选择其他进程
+            // 这确保 yield 后不会立即再次选中自己，给其他进程运行机会
             let (next_pid, current_proc, next_proc) = {
                 let queue = READY_QUEUE.lock();
-                let next = Self::select_next_locked(&queue);
+                let next = Self::select_next_locked(&queue, current_pid);
                 let current_proc = current_pid.and_then(|pid| Self::find_pcb(&queue, pid));
                 let next_proc = next.and_then(|pid| Self::find_pcb(&queue, pid));
                 (next, current_proc, next_proc)
             };
 
+            println!("[SCHED] schedule: next_pid={:?}", next_pid);
+
             // 选择下一个要运行的进程
             if let Some(next_pid) = next_pid {
                 if Some(next_pid) != current_pid {
+                    println!("[SCHED] switching from {:?} to {}", current_pid, next_pid);
                     // 保存当前进程状态
                     if let Some(proc) = current_proc {
                         let mut pcb = proc.lock();
@@ -502,9 +538,18 @@ impl Scheduler {
                     // 清理 RFLAGS 中的特权位（IOPL/NT/RF），强制使用用户段选择子
                     save_context(old_ctx_ptr);
 
+                    // Debug: 打印进入用户态前的上下文（必须在 MSR 写入之前）
+                    {
+                        let ctx = &*new_ctx_ptr;
+                        println!(
+                            "[SCHED] enter_usermode PID={}: rax=0x{:x}, rip=0x{:x}, rsp=0x{:x}, fs_base=0x{:x}",
+                            next_pid, ctx.rax, ctx.rip, ctx.rsp, next_fs_base
+                        );
+                    }
+
                     // 恢复用户进程的 FS/GS base (TLS 支持)
-                    // 必须无条件写入 MSR，即使值为 0，以防止 TLS 状态在进程间泄漏
-                    // 如果只在非 0 时写入，新进程会继承上一个进程的 TLS 数据
+                    // 必须在 enter_usermode 之前的最后一步写入 MSR
+                    // 因为 println! 等内核代码可能会覆盖 FS_BASE MSR
                     {
                         use x86_64::registers::model_specific::Msr;
                         const MSR_FS_BASE: u32 = 0xC000_0100;
@@ -533,6 +578,9 @@ impl Scheduler {
 pub fn init() {
     // 注册进程清理回调，确保进程终止时调度器同步更新
     process::register_cleanup_notifier(Scheduler::remove_process);
+
+    // 注册调度器添加进程回调，用于 clone/fork 时添加新进程
+    process::register_scheduler_add(Scheduler::add_process);
 
     // 注册定时器回调，让 arch 模块的定时器中断能调用调度器
     kernel_core::register_timer_callback(Scheduler::on_clock_tick);

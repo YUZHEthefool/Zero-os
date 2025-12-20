@@ -1,7 +1,7 @@
 # Zero-OS Enterprise Security Kernel Roadmap
 
 **Version:** 2.0
-**Last Updated:** 2025-12-11
+**Last Updated:** 2025-12-20
 **Design Principle:** Security > Efficiency > Speed
 
 This document extends the Zero-OS development roadmap toward an **enterprise-grade secure server kernel**, comparable to Linux and Windows Server in capability while prioritizing security-first design.
@@ -19,7 +19,7 @@ Zero-OS aims to be an enterprise-grade server kernel with:
 - **Secure IPC**: Capability-based access control for all kernel objects
 - **Compliance Ready**: Comprehensive audit logging with tamper evidence
 
-### Current Status (as of 2025-12-16)
+### Current Status (as of 2025-12-20)
 
 | Component | Status | Security Level |
 |-----------|--------|----------------|
@@ -30,17 +30,18 @@ Zero-OS aims to be an enterprise-grade server kernel with:
 | Signals | Complete | Basic |
 | VFS | Complete | DAC permissions (owner/group/other/umask) |
 | Audit | Complete | Hash-chained syscall logging |
-| User Mode (Ring 3) | Not started | - |
+| User Mode (Ring 3) | In Progress | SYSCALL/SYSRET, IRETQ entry |
+| Thread Support | In Progress | Clone syscall, TLS inheritance |
 | Network | Not started | - |
 | SMP | Not started | - |
 | Security Framework | In progress | Audit only (no MAC/LSM/Capabilities) |
 
 ### Issue Resolution Summary
 
-- **Total Audits**: 19 rounds
-- **Issues Identified**: 79
-- **Issues Fixed**: 68 (86%)
-- **Open Issues**: 11 (deferred to future phases)
+- **Total Audits**: 23 rounds
+- **Issues Identified**: 120
+- **Issues Fixed**: 96 (80%)
+- **Open Issues**: 24 (deferred to future phases)
 
 ---
 
@@ -861,12 +862,12 @@ fn tlb_shootdown(range: VirtRange, asid: Option<Asid>) {
 
 | Metric | Value |
 |--------|-------|
-| Total Rust LOC | ~12,000 |
+| Total Rust LOC | ~13,000 |
 | Kernel modules | 9 (arch, mm, sched, ipc, vfs, cpu_local, security, drivers, kernel_core, bootloader) |
 | Syscalls defined | 50+ |
-| Syscalls implemented | ~30 |
-| Security audits | 17 |
-| Issues fixed | 68/79 (86%) |
+| Syscalls implemented | ~35 |
+| Security audits | 23 |
+| Issues fixed | 96/120 (80%) |
 
 ## Appendix B: Existing Security Features Detail
 
@@ -883,6 +884,8 @@ fn tlb_shootdown(range: VirtRange, asid: Option<Asid>) {
 - CR3 switching on context switch
 - Per-process kernel stacks
 - Resource cleanup on exit
+- **Clone syscall with CLONE_VM | CLONE_THREAD (2025-12-20)**
+- **TLS (FS_BASE) inheritance for child threads (T-1, 2025-12-20)**
 
 ### VFS Security (2025-12-15/16)
 

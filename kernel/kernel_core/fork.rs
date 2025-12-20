@@ -201,8 +201,12 @@ fn fork_inner(
         child.gs_base = parent.gs_base;
 
         // 复制线程支持状态
-        // 注意：clear_child_tid 应该为 0（子进程需要自己设置）
+        // 【注意】fork 创建的是新进程，不是线程
+        // - tid/tgid 设为子进程 pid（Process::new 已处理）
+        // - is_thread = false（Process::new 已处理）
+        // - clear_child_tid/set_child_tid 清零（子进程需要自己设置）
         child.clear_child_tid = 0;
+        child.set_child_tid = 0;
         child.robust_list_head = 0;
         child.robust_list_len = 0;
 

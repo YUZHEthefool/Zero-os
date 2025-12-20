@@ -175,6 +175,16 @@ static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("syscall_test.elf").len
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("musl_test.elf").len() }> =
     AlignedElfData(*include_bytes!("musl_test.elf"));
 
+/// Embedded clone syscall test program with proper alignment
+///
+/// Tests thread creation via clone syscall:
+/// - CLONE_VM | CLONE_THREAD flags
+/// - Shared address space between parent and child
+/// - Thread-like execution
+#[cfg(feature = "clone_test")]
+static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("clone_test.elf").len() }> =
+    AlignedElfData(*include_bytes!("clone_test.elf"));
+
 /// Embedded Ring 3 test program (hello.elf) with proper alignment
 ///
 /// This is a minimal user-space program that tests:
@@ -182,7 +192,7 @@ static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("musl_test.elf").len() 
 /// - sys_write (fd 1, stdout)
 /// - sys_getpid
 /// - sys_exit
-#[cfg(not(any(feature = "shell", feature = "syscall_test", feature = "musl_test")))]
+#[cfg(not(any(feature = "shell", feature = "syscall_test", feature = "musl_test", feature = "clone_test")))]
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("hello.elf").len() }> =
     AlignedElfData(*include_bytes!("hello.elf"));
 
@@ -197,7 +207,9 @@ const PROCESS_NAME: &str = "shell";
 const PROCESS_NAME: &str = "syscall_test";
 #[cfg(feature = "musl_test")]
 const PROCESS_NAME: &str = "musl_test";
-#[cfg(not(any(feature = "shell", feature = "syscall_test", feature = "musl_test")))]
+#[cfg(feature = "clone_test")]
+const PROCESS_NAME: &str = "clone_test";
+#[cfg(not(any(feature = "shell", feature = "syscall_test", feature = "musl_test", feature = "clone_test")))]
 const PROCESS_NAME: &str = "hello";
 
 /// Run the Ring 3 test

@@ -13,6 +13,8 @@ shell = []
 syscall_test = []
 # Enable musl libc test program
 musl_test = []
+# Enable clone syscall test program
+clone_test = []
 
 [dependencies]
 spin = "0.9"

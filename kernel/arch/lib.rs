@@ -22,7 +22,10 @@ pub use gdt::{
     set_kernel_stack, Selectors, DOUBLE_FAULT_IST_INDEX, DOUBLE_FAULT_STACK_SIZE,
     KERNEL_STACK_SIZE,
 };
-pub use syscall::{init_syscall_msr, is_initialized as syscall_initialized};
+pub use syscall::{
+    get_current_syscall_frame, init_syscall_msr, is_initialized as syscall_initialized,
+    register_frame_callback, SyscallFrame,
+};
 
 // Re-export cpu_local from the cpu_local crate for backwards compatibility
 pub use cpu_local::{current_cpu_id, max_cpus, CpuLocal};
@@ -30,5 +33,6 @@ pub use cpu_local::{current_cpu_id, max_cpus, CpuLocal};
 pub fn init() {
     gdt::init();
     context_switch::init_fpu();
+    syscall::register_frame_callback(); // 注册 syscall 帧回调
     println!("Arch module initialized (FPU/SIMD enabled)");
 }

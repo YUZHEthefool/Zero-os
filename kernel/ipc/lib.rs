@@ -246,6 +246,24 @@ fn ipc_cleanup(pid: process::ProcessId) {
     cleanup_process_futexes(pid);
 }
 
+/// Futex 唤醒回调（用于线程退出时的 clear_child_tid 机制）
+///
+/// 唤醒等待在指定地址上的进程
+///
+/// # Arguments
+///
+/// * `tgid` - 线程组ID（用于定位 futex 表）
+/// * `uaddr` - 用户空间 futex 地址
+/// * `max_wake` - 最大唤醒数量
+///
+/// # Returns
+///
+/// 实际唤醒的进程数量
+fn futex_wake_callback(tgid: process::ProcessId, uaddr: usize, max_wake: usize) -> usize {
+    // 使用 tgid 作为键唤醒等待者
+    futex_wake(tgid, uaddr, max_wake)
+}
+
 /// 初始化IPC子系统
 ///
 /// 注册进程清理回调，确保进程退出时自动清理其IPC端点。
@@ -254,6 +272,9 @@ fn ipc_cleanup(pid: process::ProcessId) {
 pub fn init() {
     // 注册IPC清理回调到进程管理子系统（包括端点和 futex 清理）
     kernel_core::register_ipc_cleanup(ipc_cleanup);
+
+    // 注册 futex 唤醒回调，用于线程退出时的 clear_child_tid 机制
+    process::register_futex_wake(futex_wake_callback);
 
     // 注册系统调用回调
     kernel_core::register_pipe_callback(pipe_create_callback);

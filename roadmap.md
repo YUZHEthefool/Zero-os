@@ -1,12 +1,12 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2025-12-17
+**Last Updated:** 2025-12-20
 
 This document outlines the development roadmap for Zero-OS, a microkernel operating system written in Rust for x86_64 architecture.
 
 ---
 
-## Current Status: Phase 6.1 Complete, Ready for Phase 6.2
+## Current Status: Phase 6.2 In Progress (Thread Support)
 
 ### Completed Features
 
@@ -37,6 +37,17 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 - **Security Audit subsystem (hash-chained events)**
 - **SYSCALL/SYSRET MSR configuration (Ring 3 transition)**
 - **IRETQ-based user mode entry**
+- **Clone syscall with thread support (CLONE_VM | CLONE_THREAD)**
+- **TLS (Thread Local Storage) inheritance for child threads**
+
+### Fixed Issues (2025-12-20 Thread TLS)
+
+- [x] T-1: Child thread crash at CR2=0x38 (CRITICAL - FIXED)
+  - Child thread page fault on TLS access (fs:0x38) due to FS_BASE=0
+  - Root cause: PCB fs_base not synced when parent uses wrfsbase instruction
+  - Fix 1: Clone syscall now reads FS_BASE from MSR and syncs to PCB
+  - Fix 2: Scheduler MSR write moved to last step before enter_usermode
+  - Files: kernel/kernel_core/syscall.rs, kernel/sched/enhanced_scheduler.rs
 
 ### Fixed Issues (2025-12-10 Seventh Audit)
 
@@ -526,11 +537,12 @@ All critical issues have been resolved:
 | 2025-12-17 | Claude + Codex (20th) | 8 new | 4 fixed (X-2: DoS, X-4: mount perms, X-6: IPC, X-7: TLB), 4 deferred |
 | 2025-12-17 | Claude + Codex (21st) | 10 new | 4 fixed (Y-1: SFMASK, Y-2: SYSRET, Y-3: DR6/DR7, Y-6: enter_usermode), 6 open |
 | 2025-12-18 | Claude + Codex (22nd) | 11 new | **ALL 11 FIXED** (Z-1 to Z-11) |
+| 2025-12-20 | Claude + Codex (23rd) | 1 new | 1 fixed (T-1: Thread TLS inheritance) |
 
 ### Current Status
 
-- Total issues tracked: 119
-- Fixed: 95 (80%)
+- Total issues tracked: 120
+- Fixed: 96 (80%)
 - Open: 24 (20%)
   - **Round 22: ALL 11 issues FIXED**
     - 2 CRITICAL: Z-6 (RNG entropy), Z-7 (kernel stack)
@@ -569,6 +581,7 @@ See [qa-2025-12-10.md](qa-2025-12-10.md), [qa-2025-12-10-v2.md](qa-2025-12-10-v2
 | 0.5.2 | 2025-12-18 | Critical security fixes - RNG entropy (Z-6), kernel stack allocation (Z-7) |
 | 0.5.3 | 2025-12-18 | HIGH priority fixes - usercopy (Z-3), callback validation (Z-4), signal perms (Z-9), pipe wakeup (Z-11) |
 | 0.5.4 | 2025-12-18 | Complete Round 22 - FPU/SIMD (Z-1), stack align (Z-2), context switch (Z-5), fork COW (Z-8), ELF rollback (Z-10) |
+| 0.6.0 | 2025-12-20 | Phase 6.2 Thread support - Clone syscall with CLONE_VM/CLONE_THREAD, TLS inheritance fix (T-1) |
 | 1.0.0 | TBD | First stable release |
 
 ---

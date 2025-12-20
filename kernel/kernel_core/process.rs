@@ -42,6 +42,17 @@ type SchedulerCleanupCallback = fn(ProcessId);
 /// IPC清理回调类型
 type IpcCleanupCallback = fn(ProcessId);
 
+/// 调度器添加进程回调类型
+///
+/// clone/fork 创建新进程后调用，将进程添加到调度队列
+pub type SchedulerAddCallback = fn(Arc<Mutex<Process>>);
+
+/// Futex 唤醒回调类型
+///
+/// 线程退出时调用，唤醒等待在 clear_child_tid 地址上的进程
+/// 参数: (tgid, uaddr, max_wake_count) -> 实际唤醒数量
+pub type FutexWakeCallback = fn(ProcessId, usize, usize) -> usize;
+
 /// 最大文件描述符数量（每进程）
 pub const MAX_FD: i32 = 256;
 
@@ -278,13 +289,30 @@ impl Default for Context {
 ///
 /// 注意：Process 不实现 Clone，因为 fd_table 包含不可克隆的 Box<dyn FileOps>。
 /// 进程复制（fork）通过手动字段复制和 clone_box() 实现。
+///
+/// # 线程模型
+///
+/// 在 CLONE_THREAD 模式下，多个 Process 结构体共享同一个 tgid（线程组ID）。
+/// - pid: 唯一标识符（Linux 中称为 task）
+/// - tid: 等于 pid（Linux 语义）
+/// - tgid: 线程组ID（主线程的 pid，所有线程共享）
+/// - is_thread: true 表示由 CLONE_THREAD 创建
 #[derive(Debug)]
 pub struct Process {
-    /// 进程ID
+    /// 进程ID（唯一标识，也是 Linux 语义中的 tid）
     pub pid: ProcessId,
+
+    /// 线程ID（等于 pid，保持 Linux 兼容性）
+    pub tid: ProcessId,
+
+    /// 线程组ID（主线程时等于 pid，子线程时等于主线程的 pid）
+    pub tgid: ProcessId,
 
     /// 父进程ID
     pub ppid: ProcessId,
+
+    /// 是否为线程（由 CLONE_THREAD 创建）
+    pub is_thread: bool,
 
     /// 进程名称
     pub name: String,
@@ -381,9 +409,13 @@ pub struct Process {
     pub gs_base: u64,
 
     // ========== 线程支持 (musl 初始化需要) ==========
-    /// clear_child_tid 指针 (set_tid_address)
+    /// clear_child_tid 指针 (set_tid_address / CLONE_CHILD_CLEARTID)
     /// 进程退出时内核会将此地址处的值设为 0 并执行 futex_wake
     pub clear_child_tid: u64,
+
+    /// set_child_tid 指针 (CLONE_CHILD_SETTID)
+    /// clone 时内核会将子线程 tid 写入此地址
+    pub set_child_tid: u64,
 
     /// robust_list 头指针 (set_robust_list)
     /// 用于 robust futex 机制，进程退出时内核会清理持有的 robust mutex
@@ -400,7 +432,10 @@ impl Process {
     pub fn new(pid: ProcessId, ppid: ProcessId, name: String, priority: Priority) -> Self {
         Process {
             pid,
+            tid: pid,   // tid == pid (Linux 语义)
+            tgid: pid,  // 主线程时 tgid == pid
             ppid,
+            is_thread: false,
             name,
             state: ProcessState::Ready,
             pending_signals: PendingSignals::new(),
@@ -435,6 +470,7 @@ impl Process {
             gs_base: 0,
             // 线程支持 (musl 初始化)
             clear_child_tid: 0,
+            set_child_tid: 0,
             robust_list_head: 0,
             robust_list_len: 0,
         }
@@ -530,6 +566,10 @@ lazy_static::lazy_static! {
     pub static ref PROCESS_TABLE: Mutex<Vec<Option<Arc<Mutex<Process>>>>> = Mutex::new(vec![None]); // 索引0预留
     static ref SCHEDULER_CLEANUP: Mutex<Option<SchedulerCleanupCallback>> = Mutex::new(None);
     static ref IPC_CLEANUP: Mutex<Option<IpcCleanupCallback>> = Mutex::new(None);
+    /// 调度器添加进程回调
+    static ref SCHEDULER_ADD: Mutex<Option<SchedulerAddCallback>> = Mutex::new(None);
+    /// Futex 唤醒回调（用于 clear_child_tid）
+    static ref FUTEX_WAKE: Mutex<Option<FutexWakeCallback>> = Mutex::new(None);
     /// 缓存引导时的 CR3 值，用于内核进程或 memory_space == 0 的情况
     static ref BOOT_CR3: (PhysFrame<Size4KiB>, Cr3Flags) = Cr3::read();
 }
@@ -862,6 +902,16 @@ pub fn register_ipc_cleanup(callback: IpcCleanupCallback) {
     *IPC_CLEANUP.lock() = Some(callback);
 }
 
+/// 注册调度器添加进程回调，用于 clone/fork 时将新进程添加到调度队列
+pub fn register_scheduler_add(callback: SchedulerAddCallback) {
+    *SCHEDULER_ADD.lock() = Some(callback);
+}
+
+/// 注册 futex 唤醒回调，用于线程退出时唤醒等待者
+pub fn register_futex_wake(callback: FutexWakeCallback) {
+    *FUTEX_WAKE.lock() = Some(callback);
+}
+
 /// 通知调度器进程已被移除
 fn notify_scheduler_process_removed(pid: ProcessId) {
     let callback = *SCHEDULER_CLEANUP.lock();
@@ -878,11 +928,36 @@ fn notify_ipc_process_cleanup(pid: ProcessId) {
     }
 }
 
+/// 通知调度器添加新进程到调度队列
+///
+/// 由 clone/fork 在创建新进程后调用
+pub fn notify_scheduler_add_process(process: Arc<Mutex<Process>>) {
+    let callback = *SCHEDULER_ADD.lock();
+    if let Some(cb) = callback {
+        cb(process);
+    }
+}
+
+/// 通知 futex 唤醒等待者
+///
+/// 由线程退出时调用，用于 clear_child_tid 机制
+fn notify_futex_wake(tgid: ProcessId, uaddr: usize, max_wake: usize) -> usize {
+    let callback = *FUTEX_WAKE.lock();
+    if let Some(cb) = callback {
+        cb(tgid, uaddr, max_wake)
+    } else {
+        0
+    }
+}
+
 /// 终止进程
 pub fn terminate_process(pid: ProcessId, exit_code: i32) {
     if let Some(process) = get_process(pid) {
         let children_to_reparent: Vec<ProcessId>;
         let parent_pid: ProcessId;
+        let clear_child_tid: u64;
+        let tgid: ProcessId;
+        let memory_space: usize;
 
         {
             let mut proc = process.lock();
@@ -891,9 +966,50 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             parent_pid = proc.ppid;
             children_to_reparent = proc.children.clone();
             proc.children.clear();
+            // 获取 clear_child_tid 信息用于线程退出通知
+            clear_child_tid = proc.clear_child_tid;
+            tgid = proc.tgid;
+            memory_space = proc.memory_space;
+            // 清除 clear_child_tid 避免重复处理
+            proc.clear_child_tid = 0;
         }
 
         println!("Process {} terminated with exit code {}", pid, exit_code);
+
+        // 处理 clear_child_tid (CLONE_CHILD_CLEARTID)
+        // 线程退出时将 clear_child_tid 地址处的值设为 0 并唤醒 futex
+        if clear_child_tid != 0 && memory_space != 0 {
+            // 写入 0 到 clear_child_tid 地址
+            // 注意：需要在正确的地址空间中执行
+            unsafe {
+                use x86_64::registers::control::Cr3;
+                use x86_64::structures::paging::PhysFrame;
+                use x86_64::PhysAddr;
+
+                // 切换到目标进程的地址空间
+                let current_cr3 = Cr3::read();
+                let target_frame = PhysFrame::containing_address(PhysAddr::new(memory_space as u64));
+                Cr3::write(target_frame, current_cr3.1);
+
+                // 将 0 写入 clear_child_tid 地址
+                let tid_ptr = clear_child_tid as *mut i32;
+                if tid_ptr as usize >= 0x1000 && (tid_ptr as usize) < 0x8000_0000_0000 {
+                    core::ptr::write_volatile(tid_ptr, 0);
+                }
+
+                // 恢复原来的地址空间
+                Cr3::write(current_cr3.0, current_cr3.1);
+            }
+
+            // 唤醒等待在 clear_child_tid 地址上的 futex
+            let woken = notify_futex_wake(tgid, clear_child_tid as usize, 1);
+            if woken > 0 {
+                println!(
+                    "  Woke {} waiters on clear_child_tid=0x{:x}",
+                    woken, clear_child_tid
+                );
+            }
+        }
 
         // 将孤儿进程重新分配给 init 进程 (PID 1)
         if !children_to_reparent.is_empty() {
@@ -1045,12 +1161,16 @@ fn free_process_resources(proc: &mut Process) {
     }
 
     // 如果进程拥有独立的页表（memory_space != 0），释放页表及其管理的物理帧
-    if proc.memory_space != 0 {
+    // 【线程修复】线程共享地址空间，只有主进程（is_thread == false）才释放
+    if proc.memory_space != 0 && !proc.is_thread {
         free_address_space(proc.memory_space);
         println!(
             "  Released page table hierarchy for process {} (root=0x{:x})",
             proc.pid, proc.memory_space
         );
+        proc.memory_space = 0;
+    } else if proc.is_thread {
+        // 线程不释放地址空间，只清零引用
         proc.memory_space = 0;
     }
 

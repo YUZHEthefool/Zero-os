@@ -55,9 +55,9 @@ pub use signal::{
 };
 pub use syscall::{
     register_fd_close_callback, register_fd_read_callback, register_fd_write_callback,
-    register_futex_callback, register_pipe_callback, register_vfs_lseek_callback,
-    register_vfs_open_callback, register_vfs_stat_callback, wake_stdin_waiters, SyscallError,
-    VfsStat,
+    register_futex_callback, register_pipe_callback, register_syscall_frame_callback,
+    register_vfs_lseek_callback, register_vfs_open_callback, register_vfs_stat_callback,
+    wake_stdin_waiters, SyscallError, SyscallFrame, VfsStat,
 };
 pub use time::{current_timestamp_ms, get_ticks, on_timer_tick};
 

@@ -149,6 +149,13 @@ static mut SYSCALL_SCRATCH_STACKS: [AlignedStack<SYSCALL_SCRATCH_SIZE>; SYSCALL_
 #[no_mangle]
 static mut SYSCALL_USER_RSP_SHADOWS: [u64; SYSCALL_MAX_CPUS] = [0; SYSCALL_MAX_CPUS];
 
+/// Per-CPU syscall 帧指针数组
+///
+/// 在调用 syscall_dispatcher 前设置，指向内核栈上的 syscall frame。
+/// 用于 clone/fork 等需要访问调用者寄存器状态的系统调用。
+#[no_mangle]
+static mut SYSCALL_FRAME_PTRS: [u64; SYSCALL_MAX_CPUS] = [0; SYSCALL_MAX_CPUS];
+
 // ============================================================================
 // MSR 操作
 // ============================================================================
@@ -267,6 +274,67 @@ pub fn get_star() -> u64 {
 /// 获取当前 LSTAR MSR 值（调试用）
 pub fn get_lstar() -> u64 {
     unsafe { rdmsr(IA32_LSTAR) }
+}
+
+// ============================================================================
+// Syscall 帧访问（供 clone/fork 使用）
+// ============================================================================
+
+/// Syscall 帧结构（与汇编保存布局一致）
+///
+/// 这个结构体表示 syscall_entry_stub 保存到内核栈上的寄存器帧。
+/// 布局必须与汇编中的偏移量完全匹配。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SyscallFrame {
+    pub rax: u64,  // 0x00: 系统调用号 / 返回值
+    pub rcx: u64,  // 0x08: 用户 RIP (syscall 保存)
+    pub rdx: u64,  // 0x10: arg2
+    pub rbx: u64,  // 0x18: callee-saved
+    pub rsp: u64,  // 0x20: 用户 RSP
+    pub rbp: u64,  // 0x28: callee-saved
+    pub rsi: u64,  // 0x30: arg1
+    pub rdi: u64,  // 0x38: arg0
+    pub r8: u64,   // 0x40: arg4
+    pub r9: u64,   // 0x48: arg5
+    pub r10: u64,  // 0x50: arg3
+    pub r11: u64,  // 0x58: 用户 RFLAGS (syscall 保存)
+    pub r12: u64,  // 0x60: callee-saved
+    pub r13: u64,  // 0x68: callee-saved
+    pub r14: u64,  // 0x70: callee-saved
+    pub r15: u64,  // 0x78: callee-saved
+}
+
+/// 获取当前 CPU 的 syscall 帧指针
+///
+/// 在 syscall 处理期间调用，返回指向当前 syscall 帧的指针。
+/// 用于 clone/fork 读取调用者的寄存器状态。
+///
+/// # Safety
+///
+/// 只能在 syscall 处理器内部调用（即 syscall_dispatcher 执行期间）。
+/// 在 syscall 处理结束后，返回的指针将无效。
+///
+/// # Returns
+///
+/// 返回 Some(&SyscallFrame) 如果在 syscall 上下文中，否则返回 None
+pub fn get_current_syscall_frame() -> Option<&'static kernel_core::SyscallFrame> {
+    unsafe {
+        let ptr = SYSCALL_FRAME_PTRS[0]; // 当前只支持单核，使用 CPU 0
+        if ptr == 0 {
+            None
+        } else {
+            // 类型转换安全：arch::SyscallFrame 和 kernel_core::SyscallFrame 布局完全相同
+            Some(&*(ptr as *const kernel_core::SyscallFrame))
+        }
+    }
+}
+
+/// 注册 syscall 帧回调到 kernel_core
+///
+/// 在 syscall 初始化时调用，让 kernel_core 能访问当前 syscall 帧
+pub fn register_frame_callback() {
+    kernel_core::register_syscall_frame_callback(get_current_syscall_frame);
 }
 
 // ============================================================================
@@ -428,6 +496,9 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         // Z-1 fix: 保存用户 FPU/SIMD 状态
         "fxsave64 [r13]",
 
+        // 保存 syscall 帧指针供 clone/fork 使用
+        "mov [{frame_ptr_arr}], r12",
+
         // ========================================
         // 阶段 5: 调用系统调用分发器
         // ========================================
@@ -453,6 +524,9 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "call {dispatcher}",                        // 调用分发器
 
         "add rsp, 16",                              // 清理栈参数 + 对齐填充
+
+        // 清除 syscall 帧指针（syscall 处理完成）
+        "mov qword ptr [{frame_ptr_arr}], 0",
 
         // ========================================
         // 阶段 6: 恢复寄存器
@@ -543,6 +617,7 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         // 未来 SMP 支持时，需要在汇编中根据 APIC ID 计算偏移
         user_rsp_arr = sym SYSCALL_USER_RSP_SHADOWS,
         scratch_stacks = sym SYSCALL_SCRATCH_STACKS,
+        frame_ptr_arr = sym SYSCALL_FRAME_PTRS,
         scratch_size = const SYSCALL_SCRATCH_SIZE,
         frame_size = const SYSCALL_FRAME_SIZE,
         frame_qwords = const SYSCALL_FRAME_QWORDS,

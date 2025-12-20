@@ -141,6 +141,43 @@ run-musl-test: build-musl-test
 	$(QEMU) $(QEMU_COMMON) \
 		-nographic
 
+# Build with clone test program
+build-clone-test:
+	@echo "=== 编译 clone 测试程序 ==="
+	cd userspace && musl-gcc -static -o clone_test.elf clone_test.c
+	cp userspace/clone_test.elf kernel/src/clone_test.elf
+
+	@echo "=== 构建 Bootloader (UEFI) ==="
+	cd bootloader && \
+	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi
+
+	@echo "=== 构建 Kernel (Bare Metal) with Clone Test ==="
+	cd kernel && \
+	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C relocation-model=static -C code-model=kernel -C panic=abort" \
+	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features clone_test
+
+	@echo "=== 准备 EFI ESP 目录 ==="
+	mkdir -p $(ESP_DIR)
+
+	@echo "复制 Bootloader 到 ESP/BOOTX64.EFI"
+	cp bootloader-target/x86_64-unknown-uefi/release/bootloader.efi $(ESP_DIR)/BOOTX64.EFI
+
+	@echo "复制 Kernel 到 ESP/kernel.elf"
+	cp kernel-target/x86_64-unknown-none/release/kernel esp/kernel.elf
+
+	@echo "=== 内核信息 ==="
+	@readelf -h esp/kernel.elf | grep "Entry\|Type"
+	@echo "=== clone ELF 信息 ==="
+	@readelf -h kernel/src/clone_test.elf | grep "Entry\|Type"
+	@echo "=== 构建完成（Clone Test模式）==="
+
+# Run clone test (serial output)
+run-clone-test: build-clone-test
+	@echo "=== 启动内核（Clone Test模式）==="
+	@echo "提示：按Ctrl+A然后按X退出QEMU"
+	$(QEMU) $(QEMU_COMMON) \
+		-nographic
+
 # 通用QEMU参数
 # -vga std: 强制使用标准VGA模式，确保0xB8000文本缓冲区可用
 QEMU_COMMON = -bios $(OVMF_PATH) \

@@ -238,6 +238,61 @@ impl SyscallError {
 /// 系统调用结果类型
 pub type SyscallResult = Result<usize, SyscallError>;
 
+// ============================================================================
+// Syscall 帧访问（供 clone/fork 使用）
+// ============================================================================
+
+/// Syscall 帧结构（与 arch::syscall 中的布局一致）
+///
+/// 表示 syscall_entry_stub 保存到内核栈上的寄存器帧。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SyscallFrame {
+    pub rax: u64,  // 0x00: 系统调用号 / 返回值
+    pub rcx: u64,  // 0x08: 用户 RIP (syscall 保存)
+    pub rdx: u64,  // 0x10: arg2
+    pub rbx: u64,  // 0x18: callee-saved
+    pub rsp: u64,  // 0x20: 用户 RSP
+    pub rbp: u64,  // 0x28: callee-saved
+    pub rsi: u64,  // 0x30: arg1
+    pub rdi: u64,  // 0x38: arg0
+    pub r8: u64,   // 0x40: arg4
+    pub r9: u64,   // 0x48: arg5
+    pub r10: u64,  // 0x50: arg3
+    pub r11: u64,  // 0x58: 用户 RFLAGS (syscall 保存)
+    pub r12: u64,  // 0x60: callee-saved
+    pub r13: u64,  // 0x68: callee-saved
+    pub r14: u64,  // 0x70: callee-saved
+    pub r15: u64,  // 0x78: callee-saved
+}
+
+/// 获取当前 syscall 帧的回调类型
+///
+/// 由 arch 模块注册，用于 clone/fork 读取调用者的寄存器状态
+pub type GetSyscallFrameCallback = fn() -> Option<&'static SyscallFrame>;
+
+/// 全局 syscall 帧回调
+static SYSCALL_FRAME_CALLBACK: spin::Mutex<Option<GetSyscallFrameCallback>> =
+    spin::Mutex::new(None);
+
+/// 注册获取 syscall 帧的回调
+///
+/// 由 arch 模块在初始化时调用
+pub fn register_syscall_frame_callback(cb: GetSyscallFrameCallback) {
+    *SYSCALL_FRAME_CALLBACK.lock() = Some(cb);
+}
+
+/// 获取当前 syscall 帧
+///
+/// 仅在 syscall 处理期间有效，用于 clone/fork
+fn get_current_syscall_frame() -> Option<&'static SyscallFrame> {
+    if let Some(cb) = *SYSCALL_FRAME_CALLBACK.lock() {
+        cb()
+    } else {
+        None
+    }
+}
+
 /// 管道创建回调类型
 ///
 /// 由 ipc 模块注册，返回 (read_fd, write_fd) 或错误
@@ -675,6 +730,7 @@ pub fn syscall_dispatcher(
 
     let result = match syscall_num {
         // 进程管理
+        56 => sys_clone(arg0, arg1 as *mut u8, arg2 as *mut i32, arg3 as *mut i32, arg4),
         60 => sys_exit(arg0 as i32),
         231 => sys_exit_group(arg0 as i32),
         57 => sys_fork(),
@@ -805,6 +861,353 @@ fn sys_fork() -> SyscallResult {
         Ok(child_pid) => Ok(child_pid),
         Err(_) => Err(SyscallError::ENOMEM),
     }
+}
+
+// ============================================================================
+// Clone Flags (Linux x86_64 ABI)
+// ============================================================================
+
+/// 共享虚拟内存空间
+const CLONE_VM: u64 = 0x0000_0100;
+/// 共享文件系统信息
+const CLONE_FS: u64 = 0x0000_0200;
+/// 共享文件描述符表
+const CLONE_FILES: u64 = 0x0000_0400;
+/// 共享信号处理器
+const CLONE_SIGHAND: u64 = 0x0000_0800;
+/// 加入同一线程组
+const CLONE_THREAD: u64 = 0x0001_0000;
+/// 设置 TLS
+const CLONE_SETTLS: u64 = 0x0008_0000;
+/// 在父进程写入子 TID
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+/// 子进程退出时清除 TID 并唤醒 futex
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+/// 在子进程写入 TID
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+/// sys_clone - 创建线程/轻量级进程
+///
+/// 根据 flags 创建新的执行上下文，支持共享地址空间（线程）或独立地址空间（进程）。
+///
+/// # Arguments (Linux x86_64 ABI)
+///
+/// * `flags` - clone 标志位组合
+/// * `stack` - 子进程/线程的用户栈指针（可为 NULL 使用父栈）
+/// * `parent_tid` - CLONE_PARENT_SETTID 时写入子 TID 的地址
+/// * `child_tid` - CLONE_CHILD_SETTID/CLONE_CHILD_CLEARTID 时使用的地址
+/// * `tls` - CLONE_SETTLS 时设置的 TLS base 地址
+///
+/// # Returns
+///
+/// * 父进程：返回子进程/线程的 TID
+/// * 子进程/线程：返回 0（通过设置 context.rax = 0）
+fn sys_clone(
+    flags: u64,
+    stack: *mut u8,
+    parent_tid: *mut i32,
+    child_tid: *mut i32,
+    tls: u64,
+) -> SyscallResult {
+    println!(
+        "[sys_clone] entry: flags=0x{:x}, stack=0x{:x}, tls=0x{:x}",
+        flags, stack as u64, tls
+    );
+
+    let parent_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let parent_arc = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
+
+    // 支持的 flags
+    let supported_flags = CLONE_VM
+        | CLONE_FS
+        | CLONE_FILES
+        | CLONE_SIGHAND
+        | CLONE_THREAD
+        | CLONE_SETTLS
+        | CLONE_PARENT_SETTID
+        | CLONE_CHILD_CLEARTID
+        | CLONE_CHILD_SETTID;
+
+    // 检查不支持的 flags
+    if flags & !supported_flags != 0 {
+        println!(
+            "sys_clone: unsupported flags 0x{:x}",
+            flags & !supported_flags
+        );
+        return Err(SyscallError::ENOSYS);
+    }
+
+    // CLONE_THREAD 要求必须同时设置 CLONE_VM 和 CLONE_SIGHAND
+    if flags & CLONE_THREAD != 0 {
+        if flags & CLONE_VM == 0 || flags & CLONE_SIGHAND == 0 {
+            return Err(SyscallError::EINVAL);
+        }
+    }
+
+    // 验证 parent_tid 指针
+    if flags & CLONE_PARENT_SETTID != 0 {
+        if parent_tid.is_null() {
+            return Err(SyscallError::EINVAL);
+        }
+        validate_user_ptr_mut(parent_tid as *mut u8, mem::size_of::<i32>())?;
+        verify_user_memory(parent_tid as *const u8, mem::size_of::<i32>(), true)?;
+    }
+
+    // 验证 child_tid 指针
+    if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 {
+        if child_tid.is_null() {
+            return Err(SyscallError::EINVAL);
+        }
+        validate_user_ptr_mut(child_tid as *mut u8, mem::size_of::<i32>())?;
+        verify_user_memory(child_tid as *const u8, mem::size_of::<i32>(), true)?;
+    }
+
+    // 验证栈指针（如果提供）
+    if !stack.is_null() {
+        validate_user_ptr(stack as *const u8, 1)?;
+    }
+
+    // 从 MSR 读取当前 FS_BASE（TLS 基址）
+    // musl 可能通过 wrfsbase 指令直接设置 FS base，绕过 arch_prctl
+    // 因此 PCB 中的 fs_base 可能是 0，需要从硬件同步
+    let current_fs_base = {
+        use x86_64::registers::model_specific::Msr;
+        const MSR_FS_BASE: u32 = 0xC000_0100;
+        unsafe { Msr::new(MSR_FS_BASE).read() }
+    };
+
+    // 从父进程收集必要信息
+    let (
+        parent_space,
+        parent_tgid,
+        parent_mmap,
+        parent_next_mmap,
+        parent_brk_start,
+        parent_brk,
+        parent_name,
+        parent_priority,
+        parent_context,
+        parent_user_stack,
+        parent_fs_base,
+        parent_gs_base,
+        parent_uid,
+        parent_gid,
+        parent_euid,
+        parent_egid,
+        parent_umask,
+    ) = {
+        let mut parent = parent_arc.lock();
+        // 始终从 MSR 同步 fs_base 到 PCB
+        // 这确保即使进程通过 wrfsbase 指令修改了 TLS（绕过 arch_prctl），
+        // 子进程也能继承正确的 TLS 基址
+        if current_fs_base != 0 {
+            parent.fs_base = current_fs_base;
+        }
+        (
+            parent.memory_space,
+            parent.tgid,
+            parent.mmap_regions.clone(),
+            parent.next_mmap_addr,
+            parent.brk_start,
+            parent.brk,
+            parent.name.clone(),
+            parent.priority,
+            parent.context,
+            parent.user_stack,
+            parent.fs_base,
+            parent.gs_base,
+            parent.uid,
+            parent.gid,
+            parent.euid,
+            parent.egid,
+            parent.umask,
+        )
+    };
+
+    // 决定使用的地址空间
+    let (child_space, is_shared_space) = if flags & CLONE_VM != 0 {
+        // CLONE_VM: 共享父进程的地址空间
+        (parent_space, true)
+    } else {
+        // 不共享地址空间：使用 COW fork
+        match crate::fork::sys_fork() {
+            Ok(child_pid) => {
+                // fork 成功，直接返回（fork 已处理所有复制）
+                // 但我们需要应用其他 clone flags
+                // 这种情况很少见（clone 不带 CLONE_VM 通常就是 fork）
+                return Ok(child_pid);
+            }
+            Err(_) => return Err(SyscallError::ENOMEM),
+        }
+    };
+
+    // 创建子任务名称
+    let child_name = if flags & CLONE_THREAD != 0 {
+        alloc::format!("{}-thread", parent_name)
+    } else {
+        alloc::format!("{}-clone", parent_name)
+    };
+
+    // 创建新进程/线程
+    let child_pid = create_process(child_name, parent_pid, parent_priority)
+        .map_err(|_| SyscallError::ENOMEM)?;
+
+    let child_arc = get_process(child_pid).ok_or(SyscallError::ESRCH)?;
+
+    {
+        let mut child = child_arc.lock();
+
+        // 设置线程标识
+        child.tid = child_pid; // tid == pid (Linux 语义)
+        if flags & CLONE_THREAD != 0 {
+            child.tgid = parent_tgid; // 加入父进程的线程组
+            child.is_thread = true;
+        } else {
+            child.tgid = child_pid; // 新线程组
+            child.is_thread = false;
+        }
+
+        // 设置地址空间
+        child.memory_space = child_space;
+        if is_shared_space {
+            // 共享地址空间时复制相关元数据
+            child.mmap_regions = parent_mmap;
+            child.next_mmap_addr = parent_next_mmap;
+            child.brk_start = parent_brk_start;
+            child.brk = parent_brk;
+        }
+
+        // 从当前 syscall 帧构建子进程上下文
+        // 使用 syscall 帧而非 parent.context，因为后者是上次调度时的状态
+        if let Some(frame) = get_current_syscall_frame() {
+            // Debug: 打印 SyscallFrame 原始值
+            println!(
+                "[sys_clone] SyscallFrame: rcx(rip)=0x{:x}, rsp=0x{:x}, r9=0x{:x}",
+                frame.rcx, frame.rsp, frame.r9
+            );
+
+            // 从 syscall 帧复制寄存器状态
+            child.context.rax = 0; // 子进程 clone 返回值 = 0
+            child.context.rbx = frame.rbx;
+            child.context.rcx = frame.rcx; // 用户 RIP (SYSCALL 保存)
+            child.context.rdx = frame.rdx;
+            child.context.rsi = frame.rsi;
+            child.context.rdi = frame.rdi;
+            child.context.rbp = frame.rbp;
+            child.context.r8 = frame.r8;
+            child.context.r9 = frame.r9;
+            child.context.r10 = frame.r10;
+            child.context.r11 = frame.r11; // 用户 RFLAGS
+            child.context.r12 = frame.r12;
+            child.context.r13 = frame.r13;
+            child.context.r14 = frame.r14;
+            child.context.r15 = frame.r15;
+            // RIP = RCX (syscall 保存的用户返回地址)
+            child.context.rip = frame.rcx;
+            // RFLAGS = R11 (syscall 保存的用户 RFLAGS)
+            child.context.rflags = frame.r11;
+            // 用户态段选择子
+            child.context.cs = 0x23; // USER_CODE_SELECTOR
+            child.context.ss = 0x1b; // USER_DATA_SELECTOR
+
+            // 设置栈指针
+            if !stack.is_null() {
+                let sp = stack as u64;
+                child.context.rsp = sp;
+                child.context.rbp = sp; // 子线程清空 frame pointer
+                child.user_stack = Some(VirtAddr::new(sp));
+            } else {
+                child.context.rsp = frame.rsp;
+                child.user_stack = parent_user_stack;
+            }
+        } else {
+            // 回退：使用 parent.context（不应该发生）
+            println!("sys_clone: WARNING - syscall frame not available, using stale context");
+            child.context = parent_context;
+            child.context.rax = 0;
+            if !stack.is_null() {
+                let sp = stack as u64;
+                child.context.rsp = sp;
+                child.context.rbp = sp;
+                child.user_stack = Some(VirtAddr::new(sp));
+            } else {
+                child.user_stack = parent_user_stack;
+            }
+        }
+
+        // Debug: 打印子进程上下文关键寄存器
+        println!(
+            "[sys_clone] Child {} ctx: rax=0x{:x}, rip=0x{:x}, rsp=0x{:x}, r9=0x{:x}, rcx=0x{:x}",
+            child_pid, child.context.rax, child.context.rip, child.context.rsp, child.context.r9, child.context.rcx
+        );
+
+        // 设置 TLS
+        if flags & CLONE_SETTLS != 0 {
+            child.fs_base = tls;
+        } else {
+            child.fs_base = parent_fs_base;
+        }
+        child.gs_base = parent_gs_base;
+
+        // Debug: 打印 TLS 信息
+        println!(
+            "[sys_clone] TLS: msr_fs=0x{:x}, parent_fs=0x{:x}, child_fs=0x{:x}",
+            current_fs_base, parent_fs_base, child.fs_base
+        );
+
+        // 设置 tid 指针
+        if flags & CLONE_CHILD_SETTID != 0 {
+            child.set_child_tid = child_tid as u64;
+        }
+        if flags & CLONE_CHILD_CLEARTID != 0 {
+            child.clear_child_tid = child_tid as u64;
+        }
+
+        // 复制凭证
+        child.uid = parent_uid;
+        child.gid = parent_gid;
+        child.euid = parent_euid;
+        child.egid = parent_egid;
+        child.umask = parent_umask;
+
+        // 复制文件描述符表（CLONE_FILES 时理论上应共享，但当前架构暂用克隆）
+        if flags & CLONE_FILES != 0 {
+            let parent = parent_arc.lock();
+            for (&fd, desc) in parent.fd_table.iter() {
+                child.fd_table.insert(fd, desc.clone_box());
+            }
+        }
+
+        // 设置进程状态为就绪
+        child.state = ProcessState::Ready;
+    }
+
+    // 写入 parent_tid
+    if flags & CLONE_PARENT_SETTID != 0 {
+        let tid_bytes = (child_pid as i32).to_ne_bytes();
+        copy_to_user(parent_tid as *mut u8, &tid_bytes)?;
+    }
+
+    // 写入 child_tid（在父进程的地址空间中，因为共享）
+    if flags & CLONE_CHILD_SETTID != 0 {
+        let tid_bytes = (child_pid as i32).to_ne_bytes();
+        copy_to_user(child_tid as *mut u8, &tid_bytes)?;
+    }
+
+    // 将子进程添加到调度器（通过回调，避免循环依赖）
+    if let Some(child_arc) = get_process(child_pid) {
+        crate::process::notify_scheduler_add_process(child_arc);
+    }
+
+    println!(
+        "sys_clone: parent={}, child={}, flags=0x{:x}, is_thread={}",
+        parent_pid,
+        child_pid,
+        flags,
+        flags & CLONE_THREAD != 0
+    );
+
+    Ok(child_pid)
 }
 
 /// sys_exec - 执行新程序
@@ -1247,15 +1650,13 @@ fn sys_getppid() -> SyscallResult {
 
 /// sys_gettid - 获取当前线程ID
 ///
-/// 在单线程进程模型中，TID 等于 PID。
-/// 当实现完整线程支持后，应返回独立的线程 ID。
+/// 返回当前线程的 TID。对于主线程，TID == PID == TGID。
+/// 对于子线程，TID 是线程的唯一标识，TGID 是所属进程组。
 fn sys_gettid() -> SyscallResult {
-    // 当前单线程模型：TID == PID
-    if let Some(pid) = current_pid() {
-        Ok(pid)
-    } else {
-        Err(SyscallError::ESRCH)
-    }
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let proc = process.lock();
+    Ok(proc.tid)
 }
 
 /// sys_set_tid_address - 设置 clear_child_tid 指针
@@ -2518,6 +2919,9 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
             if !is_canonical(addr) {
                 return Err(SyscallError::EINVAL);
             }
+
+            // Debug: 打印 ARCH_SET_FS 调用
+            println!("[arch_prctl] PID={} ARCH_SET_FS addr=0x{:x}", pid, addr);
 
             // 更新进程 PCB 中的 fs_base
             {

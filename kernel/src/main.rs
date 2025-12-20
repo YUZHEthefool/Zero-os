@@ -246,7 +246,11 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         unsafe {
             arch::init_syscall_msr(syscall_entry);
         }
+        // 注册 syscall 帧回调，让 kernel_core 能访问当前 syscall 帧
+        // 这对于 clone/fork 正确设置子进程上下文至关重要
+        arch::register_frame_callback();
         println!("      ✓ SYSCALL MSR configured");
+        println!("      ✓ Syscall frame callback registered");
         println!("      ✓ Ring 3 transition support ready");
     }
 
