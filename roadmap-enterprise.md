@@ -1,10 +1,10 @@
 # Zero-OS Enterprise Security Kernel Roadmap
 
-**Version:** 2.0
+**Version:** 3.0
 **Last Updated:** 2025-12-20
-**Design Principle:** Security > Efficiency > Speed
+**Design Principle:** Security > Correctness > Efficiency > Performance
 
-This document extends the Zero-OS development roadmap toward an **enterprise-grade secure server kernel**, comparable to Linux and Windows Server in capability while prioritizing security-first design.
+This document extends the Zero-OS development roadmap toward an **enterprise-grade secure server kernel**, with detailed gap analysis against Linux and a security-first implementation plan.
 
 ---
 
@@ -19,890 +19,739 @@ Zero-OS aims to be an enterprise-grade server kernel with:
 - **Secure IPC**: Capability-based access control for all kernel objects
 - **Compliance Ready**: Comprehensive audit logging with tamper evidence
 
-### Current Status (as of 2025-12-20)
+### Current Status (2025-12-20)
 
 | Component | Status | Security Level |
 |-----------|--------|----------------|
 | Boot & Memory | Complete | Hardened (COW, guard pages, W^X) |
-| Process Management | Complete | Isolated (per-process address space) |
+| Process Management | Complete | Isolated (per-process CR3) |
+| Thread Support | Complete | Clone syscall, TLS inheritance |
 | Scheduler | Complete | Safe (IRQ-safe, MLFQ) |
 | IPC (Pipe/MQ/Futex) | Complete | Basic capabilities |
-| Signals | Complete | Basic |
+| Signals | Complete | Basic permission checks |
 | VFS | Complete | DAC permissions (owner/group/other/umask) |
-| Audit | Complete | Hash-chained syscall logging |
-| User Mode (Ring 3) | In Progress | SYSCALL/SYSRET, IRETQ entry |
-| Thread Support | In Progress | Clone syscall, TLS inheritance |
+| Audit | Complete | SHA-256 hash-chained syscall logging |
+| User Mode (Ring 3) | Complete | SYSCALL/SYSRET, IRETQ entry |
 | Network | Not started | - |
 | SMP | Not started | - |
-| Security Framework | In progress | Audit only (no MAC/LSM/Capabilities) |
+| Security Framework | Partial | Audit only (no MAC/LSM/full Capabilities) |
 
-### Issue Resolution Summary
+### Security Audit Summary
 
-- **Total Audits**: 23 rounds
-- **Issues Identified**: 120
-- **Issues Fixed**: 96 (80%)
-- **Open Issues**: 24 (deferred to future phases)
+- **Total Audits**: 24 rounds
+- **Issues Identified**: 138
+- **Issues Fixed**: 111 (80%)
+- **Open Issues**: 27 (mostly SMP-related, deferred)
 
 ---
 
-## Part I: Threat Model
+## Part I: Gap Analysis vs Linux Kernel
+
+### Quantitative Comparison
+
+| Metric | Linux 6.x | Zero-OS 0.6 | Gap Factor |
+|--------|-----------|-------------|------------|
+| Lines of Code | ~30M | ~15K | 2000x |
+| Syscalls | 450+ | 50 (35 impl) | 13x |
+| Drivers | 10M+ LOC | 3 basic | N/A |
+| File Systems | 30+ | 2 (ramfs/devfs) | 15x |
+| CPU Architectures | 20+ | 1 (x86_64) | 20x |
+| Security Modules | LSM/SELinux/AppArmor/SMACK | Basic IPC caps | N/A |
+| Container Support | Namespaces/Cgroups v2 | None | Full gap |
+
+### Feature Gap Matrix
+
+| Category | Linux | Zero-OS | Priority |
+|----------|-------|---------|----------|
+| **SMP/Multi-core** | 256+ CPUs, NUMA | Single-core | High (Phase E) |
+| **Security Framework** | LSM + multiple policies | None | Critical (Phase B) |
+| **Capability System** | POSIX caps (CAP_*) | IPC-only | Critical (Phase B) |
+| **Syscall Filtering** | seccomp-bpf | None | Critical (Phase B) |
+| **Namespaces** | pid/mnt/net/ipc/user/cgroup | None | Medium (Phase F) |
+| **Cgroups** | v2 unified hierarchy | None | Medium (Phase F) |
+| **Network Stack** | Full TCP/IP + netfilter | None | High (Phase D) |
+| **Block Layer** | Multi-queue + schedulers | None | High (Phase C) |
+| **File Systems** | ext4/xfs/btrfs/zfs/overlay | ramfs/devfs | High (Phase C) |
+| **Virtualization** | KVM/QEMU | None | Future |
+| **IOMMU** | VT-d/AMD-Vi | None | Medium (Phase F) |
+| **Power Management** | ACPI/cpufreq/suspend | None | Low |
+| **Hot-plug** | CPU/Memory/Devices | None | Low |
+
+### Security Feature Gap
+
+| Feature | Linux | Zero-OS | Notes |
+|---------|-------|---------|-------|
+| W^X (NX bit) | Yes | **Yes** | Implemented |
+| SMEP | Yes | **Yes** | Enabled at boot |
+| SMAP | Yes | **Yes** | Enabled at boot |
+| UMIP | Yes | **Yes** | Enabled at boot |
+| KASLR | Yes | No | Phase A planned |
+| KPTI | Yes | No | Phase A planned |
+| Stack Canaries | Yes | Partial | Rust has some |
+| Spectre v1 | mitigated | Basic | IBRS/IBPB/STIBP |
+| Spectre v2 | retpoline/IBRS | Basic | Needs RSB stuffing |
+| Meltdown | KPTI | No | Phase A planned |
+| seccomp-bpf | Yes | No | Phase B planned |
+| LSM (SELinux/AppArmor) | Yes | No | Phase B planned |
+| Audit subsystem | Yes | **Yes** | Hash-chained |
+| Integrity (IMA/EVM) | Yes | No | Phase C planned |
+
+---
+
+## Part II: Threat Model
 
 ### Attacker Profiles
 
-1. **Malicious Tenant** (Multi-tenant server)
-   - Goal: Escape container/VM, access other tenant data
-   - Mitigations: Address space isolation, capability-based IPC, MAC
+| Profile | Goal | Current Mitigation | Gap |
+|---------|------|-------------------|-----|
+| **Malicious Tenant** | Escape container, access other data | Address space isolation | Namespace/cgroup |
+| **Remote Attacker** | Network exploitation | N/A (no network) | Full stack needed |
+| **Compromised Process** | Privilege escalation | SMAP/SMEP, Ring 3 | MAC/LSM needed |
+| **Insider** | Data exfiltration | DAC permissions | MAC needed |
+| **Supply Chain** | Malicious code | None | Code signing needed |
 
-2. **Remote Attacker**
-   - Goal: Network exploitation, code execution
-   - Mitigations: Secure network stack, firewall, input validation
+### Trust Boundaries
 
-3. **Compromised User Process**
-   - Goal: Privilege escalation, kernel exploitation
-   - Mitigations: SMAP/SMEP, syscall filtering, W^X
-
-4. **Insider with User Access**
-   - Goal: Data exfiltration, audit tampering
-   - Mitigations: MAC, audit with tamper evidence, least privilege
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     UNTRUSTED                                │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │
+│  │ User Apps   │  │ Network     │  │ Storage     │          │
+│  │ (Ring 3)    │  │ Packets     │  │ Files       │          │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘          │
+│         │                │                │                  │
+│         ▼                ▼                ▼                  │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │              TRUST BOUNDARY: SYSCALL/LSM              │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                          │                                   │
+│                          ▼                                   │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │                    KERNEL SPACE                       │   │
+│  │   ┌──────────┐  ┌──────────┐  ┌──────────┐           │   │
+│  │   │ Scheduler│  │ VMM      │  │ IPC      │           │   │
+│  │   └──────────┘  └──────────┘  └──────────┘           │   │
+│  │                       │                               │   │
+│  │                       ▼                               │   │
+│  │   ┌──────────────────────────────────────────────┐   │   │
+│  │   │         TRUST BOUNDARY: HARDWARE              │   │   │
+│  │   └──────────────────────────────────────────────┘   │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                          │                                   │
+│                          ▼                                   │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │                    HARDWARE                           │   │
+│  │   CPU (Ring 0) │ Memory │ Devices │ Firmware          │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                        TRUSTED                               │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ### Trust Anchors
 
-- UEFI Secure Boot chain
-- Kernel image integrity (signed)
-- TPM-based entropy and measurements
+- UEFI Secure Boot chain (future)
+- Kernel image integrity (future signing)
 - Capability-based resource handles (non-forgeable)
-- Audit log integrity chain
+- Audit log integrity chain (SHA-256/HMAC planned)
+- Hardware RNG (RDRAND/RDSEED)
 
 ---
 
-## Part II: Current Implementation Analysis
+## Part III: Security-First Implementation Plan
 
-### 2.1 Completed Security Features
+### Guiding Principles
 
-#### Memory Management
-- [x] Buddy physical page allocator with validation
-- [x] LockedHeap with proper initialization
-- [x] COW with IRQ-safe reference counting (RwLock + AtomicU64)
-- [x] Per-process mmap regions tracking
-- [x] User pointer validation (verify_user_memory)
-- [x] Page zeroing before allocation (info leak prevention)
-- [x] Guard pages for kernel stacks
-- [x] 4GB identity map limit enforcement
+1. **Security before features**: Complete security framework before adding network/storage
+2. **Defense in depth**: Multiple layers (Capability + MAC + DAC + Audit)
+3. **Fail-closed**: Deny by default, explicit allow
+4. **Minimal TCB**: Keep kernel small, move complexity to userspace
+5. **Audit everything**: All security decisions logged
 
-#### Process Isolation
-- [x] Per-process page tables (CR3 switching)
-- [x] Per-process kernel stacks
-- [x] Full context switch (registers + FPU/SIMD)
-- [x] Orphan process reparenting to init
-- [x] Zombie cleanup with resource reclamation
-- [x] Page table hierarchy recursive teardown
+### Phase Order Rationale
 
-#### IPC Security
-- [x] Capability-based endpoint access control
-- [x] Per-process endpoint isolation
-- [x] Message queue backpressure (quota enforcement)
-- [x] Futex with lost-wake race protection
-- [x] Pipe with reference counting
-- [x] Process exit cleanup for IPC resources
+```
+Phase A (Security Foundation)
+    ↓
+Phase B (Capability/MAC Framework) ← Security gate for all features
+    ↓
+┌───┴───┐
+↓       ↓
+Phase C (Storage)   Phase D (Network)  ← Can be parallel on single-core
+        ↓
+Phase E (SMP) ← Performance, not security
+    ↓
+Phase F (Resource Governance)
+    ↓
+Phase G (Production Readiness)
+```
 
-#### Scheduler Safety
-- [x] IRQ-safe lock ordering (without_interrupts)
-- [x] NEED_RESCHED flag (no CR3 switch in interrupt context)
-- [x] Priority-based selection (MLFQ)
-- [x] Process cleanup notification
-
-### 2.2 Known Gaps (To Be Addressed)
-
-#### Critical Security Gaps
-1. **No User Mode (Ring 3)** - All code runs in Ring 0
-2. **No Syscall Gate** - Uses cooperative function calls
-3. **No MAC/LSM Framework** - Only basic DAC
-4. **No Capability System** - IPC-only capabilities
-5. **No Audit Subsystem** - Only debug logging
-
-#### High Priority Gaps
-1. **No VFS** - No file-based permissions
-2. **No Network Stack** - No network security
-3. **No SMP** - Single CPU only
-4. **No SMAP/SMEP** - Not enabled
-5. **No seccomp/pledge** - No syscall filtering
-6. **No IOMMU/VT-d** - No DMA isolation
-7. **No Spectre/Meltdown mitigations** - Side channel vulnerable
-8. **No IMA/EVM** - No integrity measurement
+**Key Decision**: SMP is deferred after storage/network because:
+1. Security framework must be complete first (no race conditions in security code)
+2. Single-core is sufficient for security testing
+3. SMP adds complexity (locks, per-CPU data, TLB shootdown)
+4. Storage/network can work on single-core
 
 ---
 
-## Part II-B: Codex Audit Findings (2025-12-11)
+## Part IV: Detailed Phase Specifications
 
-### Completeness Gaps
+### Phase A: Security Foundation
 
-The following enterprise-critical components are missing from current implementation:
+**Duration Estimate**: 2-4 weeks
+**Blocking**: All subsequent phases
 
-| Category | Missing Feature | Priority |
-|----------|----------------|----------|
-| Integrity | IMA/EVM-like measurement | High |
-| Storage | dm-verity/measure-on-open | High |
-| Storage | Journaling/write barriers | High |
-| Crypto | TPM-backed keystore | High |
-| Crypto | Key rotation policy | Medium |
-| Time | Secure NTP/PTP with auth | Medium |
-| Update | Secure update/rollback (A/B) | High |
-| Encryption | Per-volume disk encryption | High |
-| Debug | kdump/redaction | Medium |
-| Attestation | Remote attestation | Medium |
-| Patching | Live patch policy | Low |
-| Device | IOMMU/VT-d isolation | High |
-| Virtualization | Container/VM posture | Medium |
-| Compliance | Hardening profiles | High |
+#### A.1 Usercopy API (Critical)
 
-### Priority Adjustments
+**Current State**: Partial implementation with SMAP support
+**Target**: Complete, audited usercopy with all edge cases
 
-**Move to Phase 0 (Immediate):**
-
-- SMAP/SMEP/KPTI/retpoline
-- Spectre/Meltdown mitigations (IBRS/IBPB/STIBP)
-- kptr guard/redaction
-
-**Gate Requirements:**
-
-- Capability + LSM + Audit must be ready BEFORE enabling VFS/Net/SMP
-- Integrity measurement (IMA/verity) must ship with VFS
-- Firewall/conntrack baseline before TCP features
-- Lockdep/RCU debug enabled during SMP bring-up
-
-### Feasibility Notes
-
-1. **Ring 3 Entry:** Requires trapframe save/restore not in current context_switch
-2. **Capability Migration:** Must coexist with fd_table; needs migration helpers
-3. **VFS ACL/MAC:** Depends on xattr support in tmpfs/devfs/procfs
-4. **Network Stack:** Depends on timer/wallclock entropy and per-CPU data
-5. **kdump:** Depends on block I/O path
-
-### Security Design Gaps
-
-1. **Kernel pointer exposure** - Need kASLR + KPTI + kptr guard + log redaction
-2. **No panic-on-UB policy** - Should be configurable
-3. **BPF/JIT policy** - Should default-deny
-4. **Side channels** - Timer granularity, scheduler leakage not addressed
-5. **Audit shipping** - No attestation of remote log integrity
-6. **DMA protection** - No IOMMU enablement plan
-
-### Enterprise Parity Gaps (vs Linux/Windows Server)
-
-| Feature | Linux | Windows Server | Zero-OS Status |
-|---------|-------|----------------|----------------|
-| Role-based admin | Capabilities | AD Groups | Not started |
-| Strong auth | Kerberos/LDAP | AD/Kerberos | Not started |
-| Storage reliability | Journaling | NTFS journal | Not started |
-| HA/Upgrade | A/B boot | WIM | Not started |
-| Cgroups | v2 unified | Job Objects | Not started |
-| Remote mgmt | IPMI/Serial | WMI/WinRM | Not started |
-| FIPS crypto | FIPS modules | FIPS mode | Not started |
-| Compliance | STIG profiles | SCM | Not started |
-
----
-
-## Part III: Enterprise Security Roadmap
-
-### Phase 0: Security Hardening Foundation (Current + Next)
-
-**Priority:** Critical
-**Target:** Harden existing subsystems before adding features
-
-#### 0.1 Memory Hardening
-
-- [x] Enable W^X (no writable+executable pages) ✓ (W-1, W^X-1, W^X-2, 2025-12-16)
-- [x] Remove writable identity map after boot ✓ (L-5, 2025-12-16 - RemoveWritable strategy)
-- [ ] Stack canaries for kernel functions
-- [ ] KASLR (Kernel Address Space Layout Randomization)
-- [ ] Slab allocator with red zones and quarantine
-- [ ] KPTI (Kernel Page Table Isolation) preparation
-- [ ] **Spectre/Meltdown mitigations** (IBRS/IBPB/STIBP or retpoline)
-- [ ] **kptr guard/redaction** for logs and debug paths
-
-#### 0.2 Cryptographic Foundation
-
-- [ ] Hardware RNG integration (RDRAND/RDSEED)
-- [ ] CSPRNG (Cryptographically Secure PRNG)
-- [ ] Entropy health monitoring
-- [ ] Kernel crypto API (constant-time primitives)
-- [ ] **TPM-backed keystore** (seal/unseal) and key rollover policy
-
-#### 0.3 Secure Boot Enhancement
-- [ ] Kernel image signature verification
-- [ ] TPM PCR measurements
-- [ ] Module signing infrastructure
-- [ ] Boot parameter integrity
-
-#### 0.4 Testing Infrastructure
-- [ ] Syscall fuzzer (all implemented syscalls)
-- [ ] Memory allocator property tests
-- [ ] IPC stress tests
-- [ ] COW correctness tests
-
----
-
-### Phase 1: Isolation & Policy Primitives
-
-**Priority:** Critical
-**Target:** Enable security policy enforcement
-
-#### 1.1 User Mode (Ring 3) Implementation
-
-**Technical Design:**
 ```rust
-// Syscall entry (LSTAR target)
-#[naked]
-unsafe extern "C" fn syscall_entry() {
-    asm!(
-        "swapgs",                    // Switch to kernel GS
-        "mov gs:[kstack], rsp",      // Save user RSP
-        "mov rsp, gs:[kstack_top]",  // Load kernel RSP
-        "push rcx",                  // Save user RIP
-        "push r11",                  // Save user RFLAGS
-        "call syscall_dispatch",
-        "pop r11",
-        "pop rcx",
-        "mov rsp, gs:[user_rsp]",
-        "swapgs",
-        "sysretq",
-        options(noreturn)
-    )
+// API specification
+pub fn copy_from_user<T: Copy>(dst: &mut T, src: UserPtr<T>) -> Result<(), Errno>;
+pub fn copy_to_user<T: Copy>(dst: UserPtr<T>, src: &T) -> Result<(), Errno>;
+pub fn copy_from_user_slice(dst: &mut [u8], src: UserPtr<[u8]>) -> Result<usize, Errno>;
+pub fn strncpy_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<usize, Errno>;
+
+// Must handle:
+// - SMAP: stac/clac bracketing
+// - Alignment: handle unaligned access
+// - Cross-page: validate both pages
+// - Length limits: prevent DoS
+// - Null termination: for strings
+```
+
+**Security Requirements**:
+- All user pointer access through this API
+- Panic on direct user pointer dereference in kernel
+- Audit log on validation failure
+
+#### A.2 Syscall Hardening
+
+**Current State**: ~35 implemented, many return ENOSYS
+**Target**: All defined syscalls either implemented or return proper error
+
+| Category | Syscalls | Status |
+|----------|----------|--------|
+| Process | fork, clone, exec, exit, wait | Implemented |
+| Memory | mmap, munmap, mprotect, brk | Implemented |
+| File | open, read, write, close, lseek | Implemented |
+| IPC | pipe, futex, kill | Implemented |
+| Info | getpid, gettid, getppid | Implemented |
+| Time | time, sleep | Partial |
+| Network | socket, bind, connect... | ENOSYS (Phase D) |
+
+#### A.3 Spectre/Meltdown Hardening
+
+**Current State**: Complete mitigation suite implemented
+**Target**: Complete mitigation suite ✓
+
+| Mitigation | Status | Action |
+|------------|--------|--------|
+| IBRS | Done | Enabled if supported |
+| IBPB | Done | Used on context switch |
+| STIBP | Done | Enabled if supported |
+| SSBD | Done | Enabled if supported |
+| RSB stuffing | Done | Implemented in spectre.rs |
+| Retpoline | Build option | Verify in CI |
+| KPTI skeleton | Done | Infrastructure in kaslr.rs |
+| SWAPGS fence | Done | CVE-2019-1125 mitigated in syscall.rs |
+
+#### A.4 KASLR/KPTI Preparation
+
+**KASLR Design**:
+```
++------------------+
+| Randomized Slide | (boot-time, from RDRAND)
++------------------+
+| Kernel Text      | 0xffffffff80000000 + slide
++------------------+
+| Kernel Data      | Text + text_size + slide
++------------------+
+| Kernel Heap      | Fixed (for now)
++------------------+
+```
+
+**KPTI Design** (dual page tables):
+```
+User-mode page table:        Kernel-mode page table:
++------------------+         +------------------+
+| User mappings    |         | User mappings    |
++------------------+         +------------------+
+| Trampoline only  |    ←→   | Full kernel      |
+| (syscall entry)  |         | mappings         |
++------------------+         +------------------+
+```
+
+---
+
+### Phase B: Capability & MAC Framework
+
+**Duration Estimate**: 4-6 weeks
+**Blocking**: Storage and Network phases
+
+#### B.1 Unified Capability System
+
+**Design Goals**:
+- Every kernel object is a capability
+- Every operation requires capability check
+- Capabilities are non-forgeable (generation counter)
+- Delegation with rights restriction
+
+**CapId Structure**:
+```
+63              32 31              0
++----------------+------------------+
+|   Generation   |      Index       |
++----------------+------------------+
+```
+
+- **Index**: Slot in per-process CapTable (max 65536)
+- **Generation**: Incremented on free, prevents use-after-free
+
+**CapObject Variants**:
+```rust
+enum CapObject {
+    File(Arc<File>),           // VFS file handle
+    Directory(Arc<Dir>),       // VFS directory handle
+    Socket(Arc<Socket>),       // Network socket
+    Endpoint(Arc<Endpoint>),   // IPC endpoint
+    Shm(Arc<ShmRegion>),       // Shared memory
+    Timer(Arc<Timer>),         // Timer handle
+    Process(Pid),              // Process reference
+    Thread(Tid),               // Thread reference
+    Namespace(NsId),           // Namespace reference
+    Cgroup(CgroupId),          // Cgroup reference
 }
 ```
 
-**Tasks:**
-- [ ] MSR setup (STAR, LSTAR, SFMASK, KERNEL_GSBASE)
-- [ ] syscall/sysret fast path
-- [ ] int 0x80 compatibility path
-- [ ] iretq for signal return
-- [ ] SMAP/SMEP enable (CR4.SMAP, CR4.SMEP)
-- [ ] stac/clac wrappers for user memory access
-
-#### 1.2 Capability Framework
-
-**Technical Design:**
+**CapRights Bits**:
 ```rust
-/// Opaque handle for userland
-#[derive(Copy, Clone)]
-struct CapId(u64);  // table_index (32) | generation (32)
-
-/// Kernel capability descriptor
-struct Capability {
-    id: CapId,
-    obj: CapObject,        // IpcEndpoint, VfsNode, Socket, Shm, Timer
-    rights: CapRights,     // READ|WRITE|EXEC|IOCTL|ADMIN|BIND|CONNECT
-    label: MacLabel,       // For MAC checks
-    owner_pid: Pid,
-    rev_gen: u32,          // Revocation generation
-}
-
 bitflags! {
-    struct CapRights: u64 {
-        const READ     = 1 << 0;
-        const WRITE    = 1 << 1;
-        const EXEC     = 1 << 2;
-        const IOCTL    = 1 << 3;
-        const ADMIN    = 1 << 4;
-        const DELEGATE = 1 << 5;
-        // ... object-specific rights
+    pub struct CapRights: u64 {
+        // Generic
+        const READ       = 1 << 0;   // Read data
+        const WRITE      = 1 << 1;   // Write data
+        const EXEC       = 1 << 2;   // Execute/map executable
+        const IOCTL      = 1 << 3;   // Device control
+        const ADMIN      = 1 << 4;   // Administrative operations
+
+        // Memory
+        const MAP        = 1 << 5;   // mmap allowed
+        const MAP_EXEC   = 1 << 6;   // mmap PROT_EXEC allowed
+
+        // Network
+        const BIND       = 1 << 7;   // Bind to address
+        const CONNECT    = 1 << 8;   // Connect to remote
+        const LISTEN     = 1 << 9;   // Listen for connections
+        const ACCEPT     = 1 << 10;  // Accept connections
+
+        // Process
+        const SIGNAL     = 1 << 11;  // Send signals
+        const WAIT       = 1 << 12;  // Wait for termination
+        const PTRACE     = 1 << 13;  // Debug/trace
+
+        // Special
+        const BYPASS_DAC = 1 << 30;  // Bypass DAC checks
+        const BYPASS_MAC = 1 << 31;  // Bypass MAC checks (root only)
     }
 }
 ```
 
-**Tasks:**
-- [ ] Per-process CapSpace table
-- [ ] Capability allocation/lookup/revocation
-- [ ] Delegation with rights restriction
-- [ ] Integration with existing IPC endpoints
-- [ ] Integration with future VFS/Socket
+#### B.2 LSM Hook Infrastructure
 
-#### 1.3 MAC/LSM Hook Layer
+**Hook Categories**:
 
-**Technical Design:**
+| Category | Hooks |
+|----------|-------|
+| **Syscall** | enter, exit |
+| **Process** | fork, exec, exit, setuid, setgid |
+| **File** | lookup, open, create, read, write, mmap, chmod, chown |
+| **Directory** | mkdir, rmdir, rename, link, unlink |
+| **Mount** | mount, umount, remount |
+| **IPC** | mq_send, mq_recv, pipe_create, shm_create |
+| **Network** | socket, bind, connect, listen, accept, send, recv |
+| **Signal** | kill, ptrace |
+| **Namespace** | create, enter, leave |
+
+**Policy Interface**:
 ```rust
-trait LsmPolicy: Send + Sync {
+pub trait LsmPolicy: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn priority(&self) -> u32;  // Lower = earlier
+
+    // Process hooks
+    fn task_alloc(&self, task: &Task, clone_flags: CloneFlags) -> Result<()>;
+    fn task_free(&self, task: &Task);
     fn cred_prepare(&self, cred: &mut Credentials) -> Result<()>;
-    fn syscall_enter(&self, ctx: &SyscallCtx) -> Result<()>;
-    fn file_open(&self, ctx: &TaskCtx, inode: &Inode, flags: OpenFlags) -> Result<()>;
-    fn inode_permission(&self, ctx: &TaskCtx, inode: &Inode, mask: PermMask) -> Result<()>;
-    fn ipc_send(&self, ctx: &TaskCtx, ep: &Endpoint, bytes: usize) -> Result<()>;
-    fn signal_send(&self, ctx: &TaskCtx, target: Pid, sig: Signal) -> Result<()>;
-    fn socket_create(&self, ctx: &TaskCtx, domain: Domain, ty: SockType) -> Result<()>;
-    fn socket_connect(&self, ctx: &TaskCtx, sock: &Socket, addr: &SockAddr) -> Result<()>;
-}
 
-struct LsmManager {
-    policies: Vec<Arc<dyn LsmPolicy>>,  // All must permit (AND)
+    // File hooks
+    fn inode_permission(&self, inode: &Inode, mask: Permission) -> Result<()>;
+    fn file_open(&self, file: &File) -> Result<()>;
+    fn file_mmap(&self, file: &File, prot: Protection) -> Result<()>;
+
+    // IPC hooks
+    fn ipc_permission(&self, ipc: &IpcObject, perm: IpcPerm) -> Result<()>;
+
+    // Network hooks
+    fn socket_create(&self, family: u16, type_: u16, protocol: u16) -> Result<()>;
+    fn socket_connect(&self, sock: &Socket, addr: &SockAddr) -> Result<()>;
+    fn socket_bind(&self, sock: &Socket, addr: &SockAddr) -> Result<()>;
 }
 ```
 
-**Hook Points:**
-- Syscall entry/exit
-- Process: fork, exec, exit, setuid
-- VFS: lookup, open, create, unlink, chmod, mount
-- IPC: mq send/recv, pipe create, futex, shm
-- Signal: send_signal, ptrace
-- Network: socket, bind, connect, send/recv
+#### B.3 Seccomp/Pledge
 
-**Tasks:**
-- [ ] Hook point infrastructure
-- [ ] Policy registration API
-- [ ] Default permissive policy
-- [ ] Build-time feature gate
+**Design Options**:
+1. **BPF-based** (like Linux seccomp-bpf): Flexible but complex
+2. **Pledge-based** (like OpenBSD): Simple, predefined profiles
+3. **Hybrid**: Pledge profiles + custom rules
 
-#### 1.4 Audit Subsystem
+**Recommended**: Pledge-style with extension capability
 
-**Technical Design:**
 ```rust
-struct AuditEvent {
-    id: u64,
-    timestamp: Time,
-    subject: Subject,      // pid, uid, gid, cap_id
-    kind: AuditKind,       // Syscall, Signal, Net, IPC, FS, Policy
-    outcome: Outcome,      // Success/Error
-    object: Option<Object>,// path, inode, socket, endpoint
-    args: SmallVec<u64, 6>,
-    prev_hash: Hash256,    // Tamper evidence
+pub enum PledgePromise {
+    Stdio,      // read, write, close on existing fds
+    Rpath,      // read-only file access
+    Wpath,      // write file access
+    Cpath,      // create/delete files
+    Fattr,      // file attribute modification
+    Proc,       // fork, exec, wait
+    Exec,       // execve
+    Net,        // network access
+    Unix,       // unix domain sockets
+    Inet,       // IPv4/IPv6
+    Dns,        // DNS resolution
+    Mcast,      // multicast
+    Ioctl,      // limited ioctls
+    // ... more as needed
 }
 
-impl AuditSubsystem {
-    fn emit(&self, event: AuditEvent) {
-        let hash = hash(self.prev_hash, &event);
-        self.buffer.push(event);
-        self.prev_hash = hash;
-    }
-}
+// Syscall: pledge(promises, execpromises)
+// - promises: active promises
+// - execpromises: promises after exec (can only reduce)
 ```
 
-**Tasks:**
-- [ ] Event structure and serialization
-- [ ] Hash chain for tamper evidence
-- [ ] Ring buffer with overflow handling
-- [ ] syscall_dispatcher integration
-- [ ] Reader interface with capability gate
-- [ ] Persistent log flushing
+---
 
-#### 1.5 Seccomp/Pledge Syscall Filtering
+### Phase C: Storage Foundation
 
-**Technical Design:**
+**Duration Estimate**: 4-6 weeks
+**Dependencies**: Phase B complete
+
+#### C.1 Block Layer
+
+**Architecture**:
+```
+┌─────────────┐
+│   VFS       │
+└──────┬──────┘
+       ↓
+┌─────────────┐
+│ Page Cache  │ ← Radix tree, per-inode
+└──────┬──────┘
+       ↓
+┌─────────────┐
+│ Block Layer │ ← BIO queue, request merging
+└──────┬──────┘
+       ↓
+┌─────────────┐
+│ I/O Sched   │ ← FIFO initially, then mq-deadline
+└──────┬──────┘
+       ↓
+┌─────────────┐
+│ Driver      │ ← virtio-blk / AHCI
+└─────────────┘
+```
+
+#### C.2 File Systems
+
+**Priority Order**:
+1. **ext2 read-only**: Proven, simple, good for initial testing
+2. **tmpfs enhancement**: Already have ramfs, extend with size limits
+3. **procfs**: /proc/self, /proc/[pid]/*, /proc/sys
+4. **initramfs**: CPIO archive for init
+
+**Permission Chain** (in order):
+```
+1. MAC (LSM) → Check security labels
+2. Capability → Check CapRights
+3. DAC → Check uid/gid/mode
+4. ACL → Extended permissions (future)
+5. Inode Flags → IMMUTABLE, APPEND, NOEXEC
+6. W^X → No writable+executable mmap
+```
+
+---
+
+### Phase D: Network Foundation
+
+**Duration Estimate**: 6-8 weeks
+**Dependencies**: Phase B complete
+
+#### D.1 Stack Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       Socket Layer                           │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │
+│  │ TCP Socket  │  │ UDP Socket  │  │ Raw Socket  │          │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘          │
+└─────────┼────────────────┼────────────────┼─────────────────┘
+          ↓                ↓                ↓
+┌─────────────────────────────────────────────────────────────┐
+│                     Transport Layer                          │
+│  ┌─────────────┐  ┌─────────────┐                           │
+│  │    TCP      │  │    UDP      │                           │
+│  │ (stateful)  │  │ (stateless) │                           │
+│  └──────┬──────┘  └──────┬──────┘                           │
+└─────────┼────────────────┼──────────────────────────────────┘
+          ↓                ↓
+┌─────────────────────────────────────────────────────────────┐
+│                      Network Layer                           │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │
+│  │    IPv4     │  │   ICMP      │  │  Routing    │          │
+│  └──────┬──────┘  └──────┬──────┘  └─────────────┘          │
+└─────────┼────────────────┼──────────────────────────────────┘
+          ↓                ↓
+┌─────────────────────────────────────────────────────────────┐
+│                        Netfilter                             │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │
+│  │  Conntrack  │  │  Firewall   │  │    NAT      │          │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘          │
+└─────────┼────────────────┼────────────────┼─────────────────┘
+          ↓                ↓                ↓
+┌─────────────────────────────────────────────────────────────┐
+│                       Link Layer                             │
+│  ┌─────────────┐  ┌─────────────┐                           │
+│  │   Driver    │  │    ARP      │                           │
+│  │(virtio/e1000)│  │             │                           │
+│  └─────────────┘  └─────────────┘                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### D.2 Security Mechanisms
+
+| Mechanism | Description |
+|-----------|-------------|
+| **SYN Cookies** | Prevent SYN flood DoS |
+| **Conntrack limits** | Per-source connection caps |
+| **Rate limiting** | Token bucket per-IP |
+| **ISN randomization** | RFC 6528 compliant |
+| **Port randomization** | Ephemeral port selection |
+| **Source routing disabled** | Drop source-routed packets |
+| **Fragment limits** | Maximum fragments, timeout |
+| **TTL/hop limit** | Prevent routing loops |
+
+---
+
+### Phase E: SMP & Concurrency
+
+**Duration Estimate**: 6-8 weeks
+**Dependencies**: Phase A.6 (SMP-ready interfaces)
+
+#### E.1 Hardware Topology
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                          BSP (CPU 0)                         │
+│  ┌─────────────┐                                            │
+│  │   LAPIC     │ ← Local APIC for each CPU                  │
+│  └──────┬──────┘                                            │
+│         │                                                    │
+│         ↓                                                    │
+│  ┌─────────────┐                                            │
+│  │   IOAPIC    │ ← Distributes external interrupts          │
+│  └──────┬──────┘                                            │
+│         │                                                    │
+│         ↓                                                    │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │
+│  │    AP 1     │  │    AP 2     │  │    AP N     │          │
+│  │   (CPU 1)   │  │   (CPU 2)   │  │   (CPU N)   │          │
+│  └─────────────┘  └─────────────┘  └─────────────┘          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### E.2 Lock Ordering
+
+**Global Lock Order** (acquire in this order, release in reverse):
+```
+1. irq_disable
+2. percpu_lock
+3. rcu_read_lock
+4. mm_lock (per-process)
+5. vfs_inode_lock
+6. vfs_dentry_lock
+7. file_table_lock
+8. socket_lock
+9. proc_table_lock
+10. sched_lock (per-runqueue)
+11. net_route_lock
+```
+
+#### E.3 Per-CPU Data
+
 ```rust
-struct SeccompFilter {
-    rules: Vec<SeccompRule>,
-    default_action: SeccompAction,
-}
+#[repr(C)]
+pub struct PerCpuData {
+    // Identity
+    pub cpu_id: u32,
+    pub lapic_id: u32,
 
-struct SeccompRule {
-    syscall: u64,
-    arg_checks: Vec<ArgCheck>,
-    action: SeccompAction,
-}
+    // Scheduling
+    pub current_task: *mut Task,
+    pub idle_task: *mut Task,
+    pub runqueue: RunQueue,
 
-enum SeccompAction {
-    Allow,
-    Kill,
-    Errno(i32),
-    Trace,
-    Log,
-}
-```
+    // Stacks
+    pub kernel_stack_top: usize,
+    pub irq_stack_top: usize,
+    pub syscall_stack_top: usize,
 
-**Tasks:**
-- [ ] Per-process filter storage
-- [ ] sys_seccomp implementation
-- [ ] BPF-like rule evaluation
-- [ ] Fork inheritance rules
+    // State
+    pub preempt_count: u32,
+    pub irq_count: u32,
+    pub need_resched: bool,
 
----
-
-### Phase 2: VFS & Storage Security
-
-**Priority:** High
-**Target:** Secure file system abstraction
-
-#### 2.1 VFS Core
-
-**Technical Design:**
-```rust
-struct Inode {
-    id: InodeId,
-    kind: InodeKind,       // File, Dir, Symlink, Device, Pipe, Socket
-    security: InodeSecurity,
-    ops: &'static dyn InodeOps,
-    // ...
-}
-
-struct InodeSecurity {
-    uid: Uid,
-    gid: Gid,
-    mode: FileMode,        // POSIX bits
-    acl: Option<Acl>,      // Extended ACL
-    mac_label: MacLabel,   // LSM label
-    flags: InodeFlags,     // IMMUTABLE, APPEND, NOEXEC
+    // Epoch/RCU
+    pub rcu_epoch: u64,
+    pub rcu_callbacks: CallbackQueue,
 }
 ```
 
-**Permission Check Order:**
-1. MAC: `lsm.inode_permission(task, inode, perm)`
-2. Capability override: `CapRights::BYPASS_DAC`
-3. POSIX DAC: uid/gid/mode
-4. ACL: extended allow/deny
-5. Flags: NOEXEC, IMMUTABLE, APPEND
-6. W^X: no writable+executable mmap
+---
 
-**Tasks:**
-- [ ] Inode abstraction
-- [ ] Dentry cache with RCU
-- [ ] Mount infrastructure
-- [ ] Permission check framework
-- [ ] ACL implementation
-- [ ] xattr for labels
+### Phase F: Resource Governance
 
-#### 2.2 Secure Path Resolution
+**Duration Estimate**: 4-6 weeks
+**Dependencies**: Phase B, C, D
 
-**Anti-TOCTOU Design:**
-```rust
-fn lookup_at(dirfd: CapId, path: &[u8], flags: LookupFlags) -> Result<Inode> {
-    // 1. Resolve each component with locked dentries
-    // 2. Check MAC at each symlink hop
-    // 3. Validate mount/rename sequence numbers
-    // 4. Return O_PATH handle for later operations
-}
+#### F.1 Namespaces
+
+| Namespace | Isolates | Priority |
+|-----------|----------|----------|
+| **PID** | Process IDs | High |
+| **Mount** | Filesystem view | High |
+| **Network** | Network stack | High |
+| **IPC** | Message queues, semaphores | Medium |
+| **User** | UID/GID mapping | Medium |
+| **Cgroup** | Cgroup root | Medium |
+
+#### F.2 Cgroups v1.5
+
+**Controllers**:
+```
+/sys/fs/cgroup/
+├── cpu/
+│   ├── cpu.shares      # Proportional weight
+│   ├── cpu.max         # Quota (max, period)
+│   └── cpu.stat        # Usage statistics
+├── memory/
+│   ├── memory.max      # Hard limit
+│   ├── memory.high     # Throttle threshold
+│   ├── memory.low      # Protection
+│   └── memory.oom.group # OOM together
+├── io/
+│   ├── io.max          # BPS/IOPS limits
+│   └── io.stat         # I/O statistics
+└── pids/
+    └── pids.max        # Process count limit
 ```
 
-**Tasks:**
-- [ ] RESOLVE_NO_SYMLINKS flag
-- [ ] Symlink depth limit
-- [ ] Sequence number validation
-- [ ] O_PATH handle support
+---
 
-#### 2.3 File Systems
+### Phase G: Production Readiness
 
-**Tasks:**
-- [ ] tmpfs (memory-backed)
-- [ ] devfs (/dev/null, /dev/zero, /dev/urandom)
-- [ ] procfs (/proc) with MAC labels
-- [ ] initramfs (CPIO archive)
-- [ ] ext2 (read-only initially)
+**Duration Estimate**: 4-6 weeks
+**Dependencies**: All previous phases
+
+#### G.1 Observability
+
+| Feature | Description |
+|---------|-------------|
+| **Tracepoints** | Static instrumentation points |
+| **Counters** | Atomic per-CPU counters |
+| **Profiler** | Sampling-based CPU profiler |
+| **kdump** | Kernel crash dump (encrypted) |
+| **Watchdog** | Hardware watchdog integration |
+| **Hung task** | Detect stuck processes |
+
+#### G.2 Hardening Profiles
+
+| Profile | Security | Performance | Use Case |
+|---------|----------|-------------|----------|
+| **Secure** | Maximum | Reduced | Sensitive workloads |
+| **Balanced** | Standard | Normal | General purpose |
+| **Performance** | Minimal | Maximum | Benchmarks only |
+
+**Secure Profile Settings**:
+- KASLR: enabled
+- KPTI: enabled
+- Spectre mitigations: all
+- W^X: enforced
+- Audit: all syscalls
+- seccomp: default deny
+- LSM: enforcing
 
 ---
 
-### Phase 3: IPC/Process Sandboxing Maturity
+## Part V: Enterprise Parity Roadmap
 
-**Priority:** High
-**Target:** Enterprise-grade isolation
+### Linux Feature Parity Timeline
 
-#### 3.1 Namespace Isolation
+| Feature | Linux | Zero-OS Phase | Priority |
+|---------|-------|---------------|----------|
+| Basic syscalls | 6.0 | 0.6 (done) | Done |
+| Ring 3 | 2.0 | 0.6 (done) | Done |
+| VFS | 0.1 | 0.4 (done) | Done |
+| Audit | 2.6 | 0.4 (done) | Done |
+| Capabilities | 2.6.24 | B | Critical |
+| LSM | 2.6 | B | Critical |
+| seccomp | 3.5 | B | Critical |
+| ext2 | 0.1 | C | High |
+| TCP/IP | 1.0 | D | High |
+| SMP | 2.0 | E | Medium |
+| Namespaces | 2.6.24+ | F | Medium |
+| Cgroups | 2.6.24+ | F | Medium |
 
-**Tasks:**
-- [ ] PID namespace (isolated PID numbering)
-- [ ] Mount namespace (isolated filesystem view)
-- [ ] IPC namespace (isolated message queues)
-- [ ] Network namespace (isolated network stack)
-- [ ] User namespace (UID/GID mapping)
+### Gap Closure Metrics
 
-#### 3.2 Resource Limits (rlimits)
-
-**Tasks:**
-- [ ] RLIMIT_CPU (CPU time)
-- [ ] RLIMIT_FSIZE (file size)
-- [ ] RLIMIT_DATA (data segment)
-- [ ] RLIMIT_STACK (stack size)
-- [ ] RLIMIT_CORE (core file size)
-- [ ] RLIMIT_NOFILE (open files)
-- [ ] RLIMIT_NPROC (process count)
-
-#### 3.3 Cgroup Controllers
-
-**Tasks:**
-- [ ] cpu controller (shares, quotas)
-- [ ] memory controller (limits, OOM)
-- [ ] pids controller (process limits)
-- [ ] io controller (bandwidth limits)
-
-#### 3.4 IPC Hardening
-
-**Tasks:**
-- [ ] Capability-gated message queues
-- [ ] Per-namespace endpoint isolation
-- [ ] Priority inheritance for futex
-- [ ] Pipe capacity limits per cgroup
+| Metric | Current | Phase B | Phase E | 1.0 |
+|--------|---------|---------|---------|-----|
+| Syscalls impl | 35 | 50 | 80 | 100+ |
+| Security features | 4 | 8 | 10 | 12 |
+| File systems | 2 | 3 | 5 | 7 |
+| Network protocols | 0 | 0 | 4 | 6 |
+| Container support | 0% | 0% | 50% | 80% |
 
 ---
 
-### Phase 4: Secure Networking Stack
+## Appendix A: Security Audit History
 
-**Priority:** High
-**Target:** Enterprise network security
+| Round | Date | Focus | Issues | Fixed |
+|-------|------|-------|--------|-------|
+| 1-3 | 2025-12-09 | Initial baseline | 25 | 24 |
+| 4-7 | 2025-12-10 | Preemption, COW | 22 | 21 |
+| 8-13 | 2025-12-11 | IPC, signals | 23 | 19 |
+| 16-19 | 2025-12-15/16 | VFS, W^X | 11 | 10 |
+| 20-22 | 2025-12-17/18 | Ring 3, SYSCALL | 29 | 19 |
+| 23-24 | 2025-12-20 | Thread, TLS | 12 | 12 |
+| **Total** | - | - | **138** | **111 (80%)** |
 
-#### 4.1 Protocol Stack Architecture
+## Appendix B: Code Statistics
 
-**Design:**
-```
-NIC Driver -> L2 Validation -> L3 Firewall -> L4 Conntrack -> Socket
-                   |               |              |
-              MAC filter    IP validation   State tracking
-              Length/CRC    TTL/hop limit   Rate limiting
-```
-
-**Tasks:**
-- [ ] IP header validation
-- [ ] TCP/UDP checksum verification
-- [ ] Fragment reassembly with limits
-- [ ] Source routing disabled
-
-#### 4.2 Protection Mechanisms
-
-**SYN Cookie:**
-```rust
-struct SynCookieState {
-    secret: [u8; 32],
-    timestamp_granularity: u32,
-}
-
-fn encode_syn_cookie(mss: u16, wscale: u8, ts: bool) -> u32;
-fn verify_syn_cookie(cookie: u32) -> Option<(u16, u8, bool)>;
-```
-
-**Tasks:**
-- [ ] SYN cookie generation/verification
-- [ ] Connection rate limiting (token bucket)
-- [ ] Per-source connection caps
-- [ ] ISN randomization (RFC 6528)
-- [ ] Ephemeral port randomization
-
-#### 4.3 Kernel Firewall
-
-**Design:**
-```rust
-enum MatchExpr {
-    SrcIp(IpNet), DstIp(IpNet),
-    SrcPort(u16), DstPort(u16),
-    Proto(u8), State(ConnState),
-    Mark(u32), Cgroup(u64),
-}
-
-enum Action {
-    Accept, Drop, Log,
-    Limit(RateLimiter),
-    SetMark(u32),
-    Redirect(IpAddr, u16),
-}
-
-struct Firewall {
-    chains: Vec<Chain>,
-    conntrack: ConntrackTable,
-}
-```
-
-**Tasks:**
-- [ ] Rule table structure
-- [ ] Match expression evaluation
-- [ ] Conntrack state machine
-- [ ] NAT support
-- [ ] IPsec SAD/SPD integration
-
-#### 4.4 Secure Socket API
-
-**Tasks:**
-- [ ] Socket as CapId handle
-- [ ] Per-socket credentials
-- [ ] Zero-copy with pinned buffers
-- [ ] LSM hooks for all operations
+| Module | LOC | Files | Description |
+|--------|-----|-------|-------------|
+| kernel_core | ~4000 | 8 | Process, syscall, ELF |
+| sched | ~1500 | 4 | Scheduler, MLFQ |
+| mm | ~2000 | 4 | Memory, page table |
+| arch | ~2000 | 6 | x86_64, interrupts |
+| ipc | ~1500 | 5 | Pipe, futex, signals |
+| vfs | ~1500 | 6 | VFS, ramfs, devfs |
+| drivers | ~800 | 4 | VGA, serial, keyboard |
+| security | ~500 | 2 | Hardening, RNG |
+| audit | ~800 | 1 | SHA-256 hash-chained events |
+| **Total** | **~15000** | **40+** | - |
 
 ---
 
-### Phase 5: SMP & Performance-Safe Concurrency
-
-**Priority:** Medium-High
-**Target:** Multi-core support
-
-#### 5.1 Lock Hierarchy
-
-**Global Order:**
-```
-irq_disable -> percpu -> mm -> vfs_inode -> vfs_dentry ->
-file_table -> socket -> proc_table -> sched -> net_route
-```
-
-**Tasks:**
-- [ ] Lock class annotations
-- [ ] Runtime lockdep checker
-- [ ] Deadlock detection (debug)
-
-#### 5.2 Per-CPU Data
-
-**Design:**
-```rust
-struct PerCpu<T> {
-    shards: [T; MAX_CPUS],
-}
-
-fn with_local<T, R>(pcpu: &PerCpu<T>, f: impl FnOnce(&mut T) -> R) -> R;
-```
-
-**Tasks:**
-- [ ] Per-CPU allocator
-- [ ] Safe cross-CPU access API
-- [ ] Interrupt vs process context separation
-
-#### 5.3 RCU/Epoch GC
-
-**Design:**
-```rust
-struct RcuDomain {
-    global_epoch: AtomicU64,
-    per_cpu_epoch: PerCpu<AtomicU64>,
-    callbacks: SegQueue<Box<dyn FnOnce()>>,
-}
-
-fn rcu_read_lock() -> RcuGuard;
-fn rcu_defer(cb: impl FnOnce() + 'static);
-```
-
-**Use Cases:**
-- VFS dentry cache
-- Routing table
-- Process list snapshots
-- Firewall rules
-
-**Tasks:**
-- [ ] Epoch-based RCU implementation
-- [ ] Grace period detection
-- [ ] Callback queue management
-
-#### 5.4 Scheduler SMP Extensions
-
-**Tasks:**
-- [ ] Per-CPU run queues
-- [ ] Load balancing with affinity
-- [ ] Priority inheritance protocol
-- [ ] CPU isolation (cpuset)
-
-#### 5.5 TLB Coherence
-
-**Design:**
-```rust
-struct TlbShootdownReq {
-    asid: Option<Asid>,
-    range: VirtRange,
-}
-
-fn tlb_shootdown(range: VirtRange, asid: Option<Asid>) {
-    ipi::broadcast(IpiKind::TlbShootdown(req));
-    wait_for_acks();
-}
-```
-
-**Tasks:**
-- [ ] IPI infrastructure
-- [ ] Batched shootdown
-- [ ] PCID/ASID support
-
----
-
-### Phase 6: Resource Governance & QoS
-
-**Priority:** Medium
-**Target:** Fair resource allocation
-
-#### 6.1 CPU Controller
-
-**Tasks:**
-- [ ] CPU shares (proportional weight)
-- [ ] CPU quota (hard limit)
-- [ ] CPU burst (temporary overdraft)
-- [ ] Real-time band with budget
-
-#### 6.2 Memory Controller
-
-**Tasks:**
-- [ ] Memory limits (hard/soft)
-- [ ] OOM killer with policy
-- [ ] Swap accounting (when swap added)
-- [ ] Memory pressure notifications
-
-#### 6.3 I/O Controller
-
-**Tasks:**
-- [ ] Block I/O bandwidth limits
-- [ ] Network bandwidth limits
-- [ ] Fair queueing (FQ-CoDel like)
-- [ ] Priority classes
-
----
-
-### Phase 7: Observability & Reliability
-
-**Priority:** Medium
-**Target:** Production operations support
-
-#### 7.1 Crash Handling
-
-**Tasks:**
-- [ ] Kernel dump infrastructure
-- [ ] Sensitive data redaction
-- [ ] Dump encryption
-- [ ] Panic-on-UB toggle
-
-#### 7.2 Tracing
-
-**Tasks:**
-- [ ] Structured event tracing
-- [ ] Sampling profiler
-- [ ] Capability-gated readers
-- [ ] Low-overhead counters
-
-#### 7.3 Health Monitoring
-
-**Tasks:**
-- [ ] Hardware watchdog
-- [ ] Hung task detection
-- [ ] Starvation detection
-- [ ] Live patching (optional)
-
----
-
-## Part IV: Module Security Matrix
-
-| Module | Capability | MAC/LSM | Audit | Sandboxing |
-|--------|------------|---------|-------|------------|
-| Process | Owner cap | exec hook | lifecycle | namespace |
-| VFS | File cap | inode_permission | file ops | mount ns |
-| IPC | Endpoint cap | ipc_send/recv | message | IPC ns |
-| Network | Socket cap | socket_* | connect/send | net ns |
-| Memory | SHM cap | mmap hook | alloc | cgroup |
-| Scheduler | - | - | context switch | cpuset |
-
----
-
-## Part V: Implementation Guidelines
-
-### Security Gate Requirements
-
-**Each new feature must have:**
-1. Threat model document
-2. LSM hook integration
-3. Capability access control
-4. Audit events
-5. Fuzz coverage
-6. Security review
-
-### Code Quality Requirements
-
-**All PRs must:**
-1. Pass CI (build + tests)
-2. Pass Miri (UB detection)
-3. Pass Clippy (lint)
-4. Have security review for:
-   - Syscall implementations
-   - Memory management changes
-   - IPC/network code
-   - Capability checks
-
-### Release Tiers
-
-| Tier | Description | Hardening |
-|------|-------------|-----------|
-| Secure-Preview | All hardening on | Full |
-| Balanced | Default production | Standard |
-| Performance | Selective hardening | Minimal (integrity only) |
-
----
-
-## Part VI: Timeline & Priorities
-
-### Immediate (Next Sprint)
-
-1. ~~W^X enforcement~~ ✓ (W-1, W^X-1, W^X-2, 2025-12-16)
-2. ~~Remove writable identity map~~ ✓ (L-5, 2025-12-16)
-3. ~~Audit event infrastructure~~ ✓ (2025-12-16, hash-chained syscall audit)
-4. Syscall fuzzer setup
-
-### Short Term (1-2 Months)
-
-1. User mode (Ring 3)
-2. Basic capability framework
-3. LSM hook points
-4. VFS foundation
-
-### Medium Term (3-6 Months)
-
-1. Complete VFS with permissions
-2. Network stack with firewall
-3. Namespace isolation
-4. SMP support
-
-### Long Term (6-12 Months)
-
-1. Full MAC policy modules
-2. Cgroup controllers
-3. IPsec/TLS
-4. Production hardening
-
----
-
-## Part VII: References
-
-### Security Standards
-- CIS Benchmarks for Linux
-- NIST SP 800-53 (Security Controls)
-- Common Criteria (EAL)
-- FIPS 140-3 (Cryptography)
-
-### Implementation References
-- Linux Security Module (LSM)
-- FreeBSD Capsicum
-- seL4 Capabilities
-- Fuchsia Zircon Security
-
----
-
-## Appendix A: Current Codebase Statistics
-
-| Metric | Value |
-|--------|-------|
-| Total Rust LOC | ~13,000 |
-| Kernel modules | 9 (arch, mm, sched, ipc, vfs, cpu_local, security, drivers, kernel_core, bootloader) |
-| Syscalls defined | 50+ |
-| Syscalls implemented | ~35 |
-| Security audits | 23 |
-| Issues fixed | 96/120 (80%) |
-
-## Appendix B: Existing Security Features Detail
-
-### Memory Safety
-- COW with atomic reference counting
-- User pointer validation (boundary + page table)
-- Page zeroing on allocation
-- Guard pages for kernel stacks
-- mmap rollback on failure
-- **W^X enforcement in ELF loader (W-1, 2025-12-16)**
-
-### Process Isolation
-- Per-process page tables
-- CR3 switching on context switch
-- Per-process kernel stacks
-- Resource cleanup on exit
-- **Clone syscall with CLONE_VM | CLONE_THREAD (2025-12-20)**
-- **TLS (FS_BASE) inheritance for child threads (T-1, 2025-12-20)**
-
-### VFS Security (2025-12-15/16)
-
-- POSIX DAC permissions (owner/group/other)
-- Supplementary groups support
-- umask enforcement
-- Sticky bit semantics
-- Path traversal permission checks
-- readdir permission enforcement (W-2)
-
-### IPC Security
-- Capability-based endpoint access
-- Per-process endpoint isolation
-- Message queue quotas
-- Pipe reference counting
-- Futex lost-wake protection
-
----
-
-*This roadmap is a living document, updated as the project evolves toward enterprise-grade security.*
+*This enterprise roadmap is a living document, updated as the project evolves toward production-grade security. The security-first approach ensures that every feature added is built on a solid, audited foundation.*

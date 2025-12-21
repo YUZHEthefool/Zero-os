@@ -10,6 +10,7 @@ pub mod context_switch;
 pub mod cpu_protection;
 pub mod gdt;
 pub mod interrupts;
+pub mod ipi;
 pub mod syscall;
 
 pub use context_switch::{

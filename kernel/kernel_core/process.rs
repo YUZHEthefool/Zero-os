@@ -979,22 +979,26 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // 处理 clear_child_tid (CLONE_CHILD_CLEARTID)
         // 线程退出时将 clear_child_tid 地址处的值设为 0 并唤醒 futex
         if clear_child_tid != 0 && memory_space != 0 {
-            // 写入 0 到 clear_child_tid 地址
+            // R24-3 fix: 写入 0 到 clear_child_tid 地址（SMAP + fault-tolerant）
             // 注意：需要在正确的地址空间中执行
             unsafe {
                 use x86_64::registers::control::Cr3;
                 use x86_64::structures::paging::PhysFrame;
                 use x86_64::PhysAddr;
+                use crate::usercopy::{UserAccessGuard, copy_to_user_safe};
 
                 // 切换到目标进程的地址空间
                 let current_cr3 = Cr3::read();
                 let target_frame = PhysFrame::containing_address(PhysAddr::new(memory_space as u64));
                 Cr3::write(target_frame, current_cr3.1);
 
-                // 将 0 写入 clear_child_tid 地址
-                let tid_ptr = clear_child_tid as *mut i32;
-                if tid_ptr as usize >= 0x1000 && (tid_ptr as usize) < 0x8000_0000_0000 {
-                    core::ptr::write_volatile(tid_ptr, 0);
+                // 将 0 写入 clear_child_tid 地址（带 SMAP 保护和容错处理）
+                let tid_ptr = clear_child_tid as *mut u8;
+                if (tid_ptr as usize) >= 0x1000 && (tid_ptr as usize) < 0x8000_0000_0000 {
+                    let _user = UserAccessGuard::new();
+                    let zero = 0i32.to_ne_bytes();
+                    // 忽略写入错误（用户可能已 unmap 该地址）
+                    let _ = copy_to_user_safe(tid_ptr, &zero);
                 }
 
                 // 恢复原来的地址空间
@@ -1093,24 +1097,67 @@ pub fn wait_process(pid: ProcessId) -> Option<i32> {
 pub fn cleanup_zombie(pid: ProcessId) {
     let removed = {
         let mut table = PROCESS_TABLE.lock();
-        if let Some(slot) = table.get_mut(pid) {
-            if let Some(process) = slot {
-                let mut proc = process.lock();
-                if proc.state == ProcessState::Zombie {
-                    // 释放进程持有的内存资源
-                    free_process_resources(&mut proc);
-                    proc.state = ProcessState::Terminated;
-                    drop(proc);
-                    *slot = None;
-                    true
+
+        // R24-1 fix: 分两阶段处理，避免借用冲突
+        // 阶段1：检查进程状态和共享情况
+        let (memory_space, is_zombie) = {
+            if let Some(slot) = table.get(pid) {
+                if let Some(process) = slot {
+                    let proc = process.lock();
+                    if proc.state == ProcessState::Zombie {
+                        (proc.memory_space, true)
+                    } else {
+                        (0, false)
+                    }
+                } else {
+                    (0, false)
+                }
+            } else {
+                (0, false)
+            }
+        };
+
+        if !is_zombie {
+            false
+        } else {
+            // 阶段2：检查是否有其他进程共享地址空间
+            let keep_address_space = if memory_space == 0 {
+                false
+            } else {
+                table.iter().enumerate().any(|(idx, other_slot)| {
+                    if idx == pid {
+                        return false;
+                    }
+                    if let Some(other_proc_arc) = other_slot {
+                        let other = other_proc_arc.lock();
+                        other.memory_space == memory_space
+                            && other.state != ProcessState::Terminated
+                    } else {
+                        false
+                    }
+                })
+            };
+
+            // 阶段3：现在可以安全地获取可变引用并清理
+            if let Some(slot) = table.get_mut(pid) {
+                if let Some(process) = slot {
+                    let mut proc = process.lock();
+                    // 再次验证状态（防止并发修改）
+                    if proc.state == ProcessState::Zombie {
+                        free_process_resources(&mut proc, keep_address_space);
+                        proc.state = ProcessState::Terminated;
+                        drop(proc);
+                        *slot = None;
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
             } else {
                 false
             }
-        } else {
-            false
         }
     };
 
@@ -1135,7 +1182,12 @@ pub fn cleanup_zombie(pid: ProcessId) {
 ///
 /// - **HUGE_PAGE**: 用户空间应仅使用 4KB 页面。若存在 2MB/1GB 大页映射，
 ///   当前实现会跳过以避免 buddy allocator 损坏。
-fn free_process_resources(proc: &mut Process) {
+///
+/// # Arguments
+///
+/// * `proc` - 进程引用
+/// * `keep_address_space` - R24-1 fix: 如果为 true，不释放地址空间（其他线程仍在使用）
+fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
     let region_count = proc.mmap_regions.len();
     let total_size: usize = proc.mmap_regions.values().sum();
 
@@ -1161,16 +1213,23 @@ fn free_process_resources(proc: &mut Process) {
     }
 
     // 如果进程拥有独立的页表（memory_space != 0），释放页表及其管理的物理帧
+    // R24-1 fix: 检查是否有其他线程共享地址空间，只有在无共享引用时才释放
     // 【线程修复】线程共享地址空间，只有主进程（is_thread == false）才释放
-    if proc.memory_space != 0 && !proc.is_thread {
+    if proc.memory_space != 0 && !proc.is_thread && !keep_address_space {
         free_address_space(proc.memory_space);
         println!(
             "  Released page table hierarchy for process {} (root=0x{:x})",
             proc.pid, proc.memory_space
         );
         proc.memory_space = 0;
-    } else if proc.is_thread {
-        // 线程不释放地址空间，只清零引用
+    } else if proc.is_thread || keep_address_space {
+        // 线程或被共享的地址空间不释放，只清零引用
+        if keep_address_space && !proc.is_thread {
+            println!(
+                "  Deferred address space release for process {} (shared by other threads)",
+                proc.pid
+            );
+        }
         proc.memory_space = 0;
     }
 

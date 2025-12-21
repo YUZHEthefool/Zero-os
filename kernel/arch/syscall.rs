@@ -42,6 +42,19 @@ const IA32_SFMASK: u32 = 0xC000_0084;
 /// IA32_EFER MSR 地址
 const IA32_EFER: u32 = 0xC000_0080;
 
+/// IA32_GS_BASE MSR 地址 (用户态 GS 基址)
+///
+/// Used with SWAPGS instruction to swap between user and kernel GS base.
+/// User-space programs can set this via arch_prctl(ARCH_SET_GS).
+const IA32_GS_BASE: u32 = 0xC000_0101;
+
+/// IA32_KERNEL_GS_BASE MSR 地址 (内核态 GS 基址)
+///
+/// Contains the kernel's GS base address. The SWAPGS instruction atomically
+/// swaps IA32_GS_BASE and IA32_KERNEL_GS_BASE. In single-core mode, this is
+/// set to 0. In SMP mode, this would point to per-CPU data structures.
+const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
+
 /// EFER.SCE 位 (System Call Extensions)
 const EFER_SCE: u64 = 1 << 0;
 
@@ -245,6 +258,17 @@ pub unsafe fn init_syscall_msr(syscall_entry: u64) {
         RFLAGS_IF | RFLAGS_TF | RFLAGS_DF | RFLAGS_AC | RFLAGS_IOPL | RFLAGS_NT | RFLAGS_RF;
     wrmsr(IA32_SFMASK, sfmask);
 
+    // CVE-2019-1125 SWAPGS 防护：初始化 GS 基址 MSR
+    //
+    // - IA32_KERNEL_GS_BASE: 内核 GS 基址（用于 per-CPU 数据）
+    //   单核模式设置为 0；SMP 时将指向 per-CPU 数据结构
+    // - IA32_GS_BASE: 用户态 GS 基址（初始化为 0）
+    //   用户态程序可通过 arch_prctl(ARCH_SET_GS) 设置
+    //
+    // SWAPGS 指令在 syscall 入口/出口原子交换这两个值
+    wrmsr(IA32_KERNEL_GS_BASE, 0);
+    wrmsr(IA32_GS_BASE, 0);
+
     // 启用 EFER.SCE (System Call Extensions)
     let efer = rdmsr(IA32_EFER);
     wrmsr(IA32_EFER, efer | EFER_SCE);
@@ -422,12 +446,19 @@ extern "C" fn syscall_dispatcher_bridge(
 pub unsafe extern "C" fn syscall_entry_stub() -> ! {
     core::arch::naked_asm!(
         // ========================================
-        // 阶段 1: SMAP 安全 & 保存用户 RSP
+        // 阶段 1: SMAP 安全 & SWAPGS & 保存用户 RSP
         // ========================================
         // NOTE: CLAC requires SMAP support (CR4.SMAP). If CPU doesn't support SMAP,
         // CLAC is undefined and causes #UD. Using NOP instead for compatibility.
         // TODO: Check SMAP support at runtime and conditionally use CLAC.
         "nop", "nop", "nop",                        // 替代 clac (需要 SMAP 支持)
+
+        // CVE-2019-1125 SWAPGS 防护：
+        // 立即执行 SWAPGS 切换到内核 GS 基址，然后使用 LFENCE 序列化
+        // 以关闭推测执行窗口，防止攻击者利用 SWAPGS 推测泄露内核数据
+        "swapgs",
+        "lfence",
+
         // R23-2 fix: 使用 per-CPU 数组 slot 0（当前 CPU ID = 0）
         "mov [{user_rsp_arr}], rsp",                // 保存用户 RSP 到 per-CPU 暂存区
 
@@ -581,6 +612,11 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         // ========================================
         // 阶段 7: 返回用户态 (SYSRET 快速路径)
         // ========================================
+        // CVE-2019-1125 SWAPGS 防护：
+        // 返回用户态前执行 SWAPGS 恢复用户 GS 基址
+        // LFENCE 序列化以关闭推测窗口
+        "swapgs",
+        "lfence",
         "sysretq",                                  // 返回用户态
 
         // ========================================
@@ -610,6 +646,10 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "push rcx",                                 // 用户 RIP
         "mov rdx, [r12 + {off_rdx}]",               // 恢复用户 rdx
         "mov r12, [r12 + {off_r12}]",               // 恢复 r12
+        // CVE-2019-1125 SWAPGS 防护：
+        // IRETQ 慢路径同样需要恢复用户 GS 基址并序列化
+        "swapgs",
+        "lfence",
         "iretq",                                    // 通过 IRETQ 返回用户态
 
         // 符号绑定

@@ -214,6 +214,18 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             let file_size = program_header.file_size();
             let file_offset = program_header.offset();
 
+            // R24-10 fix: Validate that file_offset + file_size doesn't exceed kernel_data bounds
+            // A malformed ELF could have segments pointing beyond the file, causing OOB read
+            let file_end = file_offset
+                .checked_add(file_size)
+                .expect("ELF segment offset+size overflow");
+            if file_end as usize > kernel_data.len() {
+                panic!(
+                    "ELF segment out of bounds: offset=0x{:x}, file_size=0x{:x}, file_len=0x{:x}",
+                    file_offset, file_size, kernel_data.len()
+                );
+            }
+
             // 计算物理地址：虚拟地址 - 虚拟基址 + 物理基址
             // 虚拟基址是 min_addr (0xffffffff80000000)，物理基址是 actual_phys_base (0x100000)
             let phys_addr = actual_phys_base + (virt_addr - min_addr);

@@ -13,6 +13,7 @@ extern crate spin;
 pub use kernel_core::process;
 
 pub mod enhanced_scheduler;
+pub mod lock_ordering;
 pub mod scheduler;
 
 pub fn init() {

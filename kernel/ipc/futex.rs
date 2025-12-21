@@ -63,32 +63,44 @@ lazy_static::lazy_static! {
 /// 从用户空间读取 u32 值
 ///
 /// 用于 futex_wait 在入队前二次检查值，防止 lost-wake 竞态
+/// R24-5 fix: 验证跨页、使用 SMAP 保护和容错 usercopy
 fn read_user_u32(uaddr: usize) -> Result<u32, FutexError> {
     use mm::page_table::PageTableManager;
     use x86_64::structures::paging::PageTableFlags;
     use x86_64::VirtAddr;
+    use kernel_core::usercopy::{UserAccessGuard, copy_from_user_safe};
 
-    // 验证用户内存
+    // 验证并读取跨页安全
     unsafe {
         mm::page_table::with_current_manager(
             VirtAddr::new(0),
             |manager: &mut PageTableManager| -> Result<u32, FutexError> {
-                let page_addr = uaddr & !0xfff;
-                if let Some((_, flags)) =
-                    manager.translate_with_flags(VirtAddr::new(page_addr as u64))
-                {
-                    if !flags.contains(PageTableFlags::PRESENT)
-                        || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+                let end = uaddr
+                    .checked_add(core::mem::size_of::<u32>())
+                    .ok_or(FutexError::Fault)?;
+
+                // 验证起止两页（处理跨页读取）
+                for addr in [uaddr, end - 1] {
+                    let page_addr = addr & !0xfff;
+                    if let Some((_, flags)) =
+                        manager.translate_with_flags(VirtAddr::new(page_addr as u64))
                     {
+                        if !flags.contains(PageTableFlags::PRESENT)
+                            || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+                        {
+                            return Err(FutexError::Fault);
+                        }
+                    } else {
                         return Err(FutexError::Fault);
                     }
-                } else {
-                    return Err(FutexError::Fault);
                 }
 
-                // 安全：已验证用户内存
-                let value = core::ptr::read_volatile(uaddr as *const u32);
-                Ok(value)
+                // 使用 SMAP 安全的容错复制
+                let _guard = UserAccessGuard::new();
+                let mut buf = [0u8; 4];
+                copy_from_user_safe(&mut buf, uaddr as *const u8)
+                    .map_err(|_| FutexError::Fault)?;
+                Ok(u32::from_ne_bytes(buf))
             },
         )
     }

@@ -2,7 +2,7 @@
 //!
 //! This module provides enterprise-grade security audit logging with:
 //!
-//! - **Tamper Evidence**: Hash-chained events prevent undetected modification
+//! - **Tamper Evidence**: SHA-256 hash-chained events prevent undetected modification
 //! - **IRQ Safety**: Lock operations disable interrupts to prevent deadlock
 //! - **Fixed Ring Buffer**: Bounded memory with overflow accounting
 //! - **Zero Allocation**: Event emission path avoids heap allocation
@@ -10,9 +10,10 @@
 //!
 //! # Security Design
 //!
-//! 1. **Hash Chain**: Each event includes `prev_hash` and `hash` fields.
-//!    The chain allows verification that no events were inserted, deleted,
-//!    or modified between any two points.
+//! 1. **Hash Chain**: Each event includes `prev_hash` and `hash` fields (32 bytes each).
+//!    The chain uses SHA-256 with domain separation ("AUDIT-SHA256-V1") and allows
+//!    verification that no events were inserted, deleted, or modified between any
+//!    two points.
 //!
 //! 2. **Overflow Handling**: When the ring buffer is full, oldest events
 //!    are evicted. The `dropped` counter in each event tracks how many
@@ -20,6 +21,14 @@
 //!
 //! 3. **Subject/Object Model**: Events capture WHO (subject: pid/uid/gid/cap)
 //!    did WHAT (kind: syscall/fs/ipc) to WHOM (object: path/endpoint/socket).
+//!
+//! # Hash Algorithm History
+//!
+//! - **v0.x (legacy)**: Used FNV-1a 64-bit hash
+//! - **v1.0 (current)**: Upgraded to SHA-256 (32-byte hash) for enterprise security
+//!
+//! Note: Hash chain format is incompatible between versions. Old FNV-1a chains
+//! cannot be verified with the new SHA-256 implementation.
 //!
 //! # Usage
 //!
@@ -248,10 +257,10 @@ pub struct AuditEvent {
     pub errno: i32,
     /// Number of events dropped before this one
     pub dropped: u64,
-    /// Hash of the previous event (for chain verification)
-    pub prev_hash: u64,
-    /// Hash of this event (FNV-1a over all fields)
-    pub hash: u64,
+    /// Hash of the previous event (for chain verification) - SHA-256
+    pub prev_hash: [u8; 32],
+    /// Hash of this event (SHA-256 over all fields)
+    pub hash: [u8; 32],
 }
 
 impl AuditEvent {
@@ -280,53 +289,249 @@ impl AuditEvent {
             arg_count: arg_count as u8,
             errno,
             dropped: 0,
-            prev_hash: 0,
-            hash: 0,
+            prev_hash: ZERO_HASH,
+            hash: ZERO_HASH,
         }
     }
 }
 
 // ============================================================================
-// Hash Chain (FNV-1a 64-bit)
+// Hash Chain (SHA-256)
 // ============================================================================
 
-const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
+/// Zero-initialized hash constant
+const ZERO_HASH: [u8; 32] = [0u8; 32];
 
-/// FNV-1a 64-bit hasher
-struct Fnv1a64(u64);
+/// SHA-256 initial state constants (FIPS 180-4)
+const SHA256_INIT_STATE: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
 
-impl Fnv1a64 {
+/// SHA-256 round constants (FIPS 180-4)
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+/// Pure Rust SHA-256 implementation for no_std kernel environment
+#[derive(Clone)]
+struct Sha256 {
+    state: [u32; 8],
+    buffer: [u8; 64],
+    buffer_len: usize,
+    total_len: u64,
+}
+
+impl Sha256 {
+    /// Create a new SHA-256 hasher
     #[inline]
     fn new() -> Self {
-        Self(FNV_OFFSET_BASIS)
+        Self {
+            state: SHA256_INIT_STATE,
+            buffer: [0u8; 64],
+            buffer_len: 0,
+            total_len: 0,
+        }
+    }
+
+    /// Compute SHA-256 digest of a single message
+    #[inline]
+    #[allow(dead_code)]
+    fn digest(data: &[u8]) -> [u8; 32] {
+        let mut hasher = Self::new();
+        hasher.update(data);
+        hasher.finalize()
+    }
+
+    /// Update the hasher with more data
+    fn update(&mut self, data: &[u8]) {
+        let mut input = data;
+
+        while !input.is_empty() {
+            let take = core::cmp::min(64 - self.buffer_len, input.len());
+            self.buffer[self.buffer_len..self.buffer_len + take]
+                .copy_from_slice(&input[..take]);
+            self.buffer_len += take;
+            self.total_len = self.total_len.wrapping_add(take as u64);
+
+            if self.buffer_len == 64 {
+                let block = self.buffer;
+                self.compress_block(&block);
+                self.buffer_len = 0;
+            }
+            input = &input[take..];
+        }
+    }
+
+    /// Finalize the hash and return the digest
+    fn finalize(mut self) -> [u8; 32] {
+        let total_bits = self.total_len.wrapping_mul(8);
+
+        // Pad with 0x80
+        self.buffer[self.buffer_len] = 0x80;
+        self.buffer_len += 1;
+
+        // If not enough room for length, pad and compress
+        if self.buffer_len > 56 {
+            for i in self.buffer_len..64 {
+                self.buffer[i] = 0;
+            }
+            let block = self.buffer;
+            self.compress_block(&block);
+            self.buffer_len = 0;
+        }
+
+        // Pad with zeros until length field position
+        for i in self.buffer_len..56 {
+            self.buffer[i] = 0;
+        }
+
+        // Append bit length in big-endian
+        self.buffer[56..64].copy_from_slice(&total_bits.to_be_bytes());
+        let block = self.buffer;
+        self.compress_block(&block);
+
+        // Output state in big-endian
+        let mut out = [0u8; 32];
+        for (i, chunk) in out.chunks_mut(4).enumerate() {
+            chunk.copy_from_slice(&self.state[i].to_be_bytes());
+        }
+        out
+    }
+
+    /// Compress a single 512-bit block
+    #[inline(always)]
+    fn compress_block(&mut self, block: &[u8; 64]) {
+        // Helper functions per FIPS 180-4
+        #[inline(always)]
+        fn ch(x: u32, y: u32, z: u32) -> u32 {
+            (x & y) ^ (!x & z)
+        }
+
+        #[inline(always)]
+        fn maj(x: u32, y: u32, z: u32) -> u32 {
+            (x & y) ^ (x & z) ^ (y & z)
+        }
+
+        #[inline(always)]
+        fn big_sigma0(x: u32) -> u32 {
+            x.rotate_right(2) ^ x.rotate_right(13) ^ x.rotate_right(22)
+        }
+
+        #[inline(always)]
+        fn big_sigma1(x: u32) -> u32 {
+            x.rotate_right(6) ^ x.rotate_right(11) ^ x.rotate_right(25)
+        }
+
+        #[inline(always)]
+        fn small_sigma0(x: u32) -> u32 {
+            x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3)
+        }
+
+        #[inline(always)]
+        fn small_sigma1(x: u32) -> u32 {
+            x.rotate_right(17) ^ x.rotate_right(19) ^ (x >> 10)
+        }
+
+        // Message schedule
+        let mut w = [0u32; 64];
+        for (i, chunk) in block.chunks_exact(4).enumerate().take(16) {
+            w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        for i in 16..64 {
+            w[i] = small_sigma1(w[i - 2])
+                .wrapping_add(w[i - 7])
+                .wrapping_add(small_sigma0(w[i - 15]))
+                .wrapping_add(w[i - 16]);
+        }
+
+        // Working variables
+        let mut a = self.state[0];
+        let mut b = self.state[1];
+        let mut c = self.state[2];
+        let mut d = self.state[3];
+        let mut e = self.state[4];
+        let mut f = self.state[5];
+        let mut g = self.state[6];
+        let mut h = self.state[7];
+
+        // 64 rounds
+        for i in 0..64 {
+            let t1 = h
+                .wrapping_add(big_sigma1(e))
+                .wrapping_add(ch(e, f, g))
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let t2 = big_sigma0(a).wrapping_add(maj(a, b, c));
+
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+
+        // Update state
+        self.state[0] = self.state[0].wrapping_add(a);
+        self.state[1] = self.state[1].wrapping_add(b);
+        self.state[2] = self.state[2].wrapping_add(c);
+        self.state[3] = self.state[3].wrapping_add(d);
+        self.state[4] = self.state[4].wrapping_add(e);
+        self.state[5] = self.state[5].wrapping_add(f);
+        self.state[6] = self.state[6].wrapping_add(g);
+        self.state[7] = self.state[7].wrapping_add(h);
+    }
+}
+
+/// Helper to feed typed data into SHA-256 with consistent encoding
+struct Sha256Writer {
+    hasher: Sha256,
+}
+
+impl Sha256Writer {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+        }
     }
 
     #[inline]
-    fn write_u8(&mut self, byte: u8) {
-        self.0 ^= byte as u64;
-        self.0 = self.0.wrapping_mul(FNV_PRIME);
+    fn write_u8(&mut self, v: u8) {
+        self.hasher.update(&[v]);
     }
 
     #[inline]
     fn write_u16(&mut self, v: u16) {
-        for b in v.to_le_bytes() {
-            self.write_u8(b);
-        }
+        self.hasher.update(&v.to_le_bytes());
     }
 
     #[inline]
     fn write_u32(&mut self, v: u32) {
-        for b in v.to_le_bytes() {
-            self.write_u8(b);
-        }
+        self.hasher.update(&v.to_le_bytes());
     }
 
     #[inline]
     fn write_u64(&mut self, v: u64) {
-        for b in v.to_le_bytes() {
-            self.write_u8(b);
-        }
+        self.hasher.update(&v.to_le_bytes());
     }
 
     #[inline]
@@ -335,13 +540,18 @@ impl Fnv1a64 {
     }
 
     #[inline]
-    fn finish(self) -> u64 {
-        self.0
+    fn write_bytes(&mut self, data: &[u8]) {
+        self.hasher.update(data);
+    }
+
+    #[inline]
+    fn finish(self) -> [u8; 32] {
+        self.hasher.finalize()
     }
 }
 
-/// Compute FNV-1a hash of an AuditObject
-fn hash_object(hasher: &mut Fnv1a64, obj: &AuditObject) {
+/// Compute SHA-256 hash of an AuditObject
+fn hash_object(hasher: &mut Sha256Writer, obj: &AuditObject) {
     match obj {
         AuditObject::None => {
             hasher.write_u8(0);
@@ -392,12 +602,46 @@ fn hash_object(hasher: &mut Fnv1a64, obj: &AuditObject) {
     }
 }
 
-/// Compute the hash of an audit event
-fn hash_event(prev_hash: u64, event: &AuditEvent) -> u64 {
-    let mut hasher = Fnv1a64::new();
+/// Compute the hash of an audit event (SHA-256 with domain separation)
+fn hash_event(prev_hash: [u8; 32], event: &AuditEvent) -> [u8; 32] {
+    hash_event_prefixed(prev_hash, event, None)
+}
+
+/// Compute the hash of an audit event with optional key prefix
+///
+/// **SECURITY NOTE**: This is NOT HMAC. When `key` is Some, it uses a simple
+/// prefix construction (SHA-256(domain || key || data)), which does NOT provide
+/// HMAC security properties (specifically, it's vulnerable to length extension
+/// if the key length is known). This is intended only as a placeholder for
+/// future HMAC implementation.
+///
+/// For production use with secret keys, implement proper HMAC-SHA256:
+/// HMAC(K, m) = SHA-256((K' ⊕ opad) || SHA-256((K' ⊕ ipad) || m))
+///
+/// Current modes:
+/// - `key=None`: Uses domain separator "AUDIT-SHA256-V1" (keyless chain)
+/// - `key=Some(k)`: Uses domain separator "AUDIT-KEYED-V1" + key prefix (NOT HMAC)
+#[allow(dead_code)]
+fn hash_event_prefixed(
+    prev_hash: [u8; 32],
+    event: &AuditEvent,
+    key: Option<&[u8]>,
+) -> [u8; 32] {
+    let mut hasher = Sha256Writer::new();
+
+    // Domain separation for version and mode
+    if let Some(k) = key {
+        // NOT HMAC - simple prefix construction, vulnerable to length extension
+        // TODO: Implement proper HMAC-SHA256 in Phase B when key management is ready
+        hasher.write_bytes(b"AUDIT-KEYED-V1");
+        hasher.write_u64(k.len() as u64);  // Include key length for domain separation
+        hasher.write_bytes(k);
+    } else {
+        hasher.write_bytes(b"AUDIT-SHA256-V1");
+    }
 
     // Chain to previous event
-    hasher.write_u64(prev_hash);
+    hasher.write_bytes(&prev_hash);
 
     // Event metadata
     hasher.write_u64(event.id);
@@ -441,8 +685,8 @@ struct AuditRing {
     len: usize,
     /// Next event ID
     next_id: u64,
-    /// Hash of the last event (chain head)
-    prev_hash: u64,
+    /// Hash of the last event (chain head) - SHA-256
+    prev_hash: [u8; 32],
     /// Accumulated dropped count since last emit
     dropped: u64,
 }
@@ -455,7 +699,7 @@ impl AuditRing {
             head: 0,
             len: 0,
             next_id: 0,
-            prev_hash: FNV_OFFSET_BASIS,
+            prev_hash: ZERO_HASH,
             dropped: 0,
         }
     }
@@ -502,7 +746,7 @@ impl AuditRing {
     }
 
     /// Get the current tail hash (for integrity verification)
-    fn tail_hash(&self) -> u64 {
+    fn tail_hash(&self) -> [u8; 32] {
         self.prev_hash
     }
 
@@ -528,8 +772,8 @@ pub struct AuditSnapshot {
     pub events: Vec<AuditEvent>,
     /// Number of events dropped since last snapshot
     pub dropped: u64,
-    /// Hash of the last event in the chain
-    pub tail_hash: u64,
+    /// Hash of the last event in the chain (SHA-256)
+    pub tail_hash: [u8; 32],
 }
 
 /// Audit subsystem statistics
@@ -543,8 +787,8 @@ pub struct AuditStats {
     pub dropped_events: u64,
     /// Buffer capacity
     pub capacity: u64,
-    /// Current tail hash
-    pub tail_hash: u64,
+    /// Current tail hash (SHA-256)
+    pub tail_hash: [u8; 32],
 }
 
 // ============================================================================
@@ -806,6 +1050,34 @@ macro_rules! audit_security {
 }
 
 // ============================================================================
+// FNV-1a Utility (compact hashing for paths/identifiers)
+// ============================================================================
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+/// FNV-1a 64-bit hasher for lightweight path/identifier hashing
+struct Fnv1a64(u64);
+
+impl Fnv1a64 {
+    #[inline]
+    fn new() -> Self {
+        Self(FNV_OFFSET_BASIS)
+    }
+
+    #[inline]
+    fn write_u8(&mut self, byte: u8) {
+        self.0 ^= byte as u64;
+        self.0 = self.0.wrapping_mul(FNV_PRIME);
+    }
+
+    #[inline]
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+// ============================================================================
 // Path Hashing Utility
 // ============================================================================
 
@@ -866,9 +1138,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fnv1a_hash() {
+    fn test_sha256_known_vector() {
+        // NIST test vector: SHA-256("abc") = ba7816bf...
+        let digest = Sha256::digest(b"abc");
+        let expected = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+            0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+            0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+            0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!(digest, expected);
+    }
+
+    #[test]
+    fn test_sha256_empty() {
+        // SHA-256("") = e3b0c442...
+        let digest = Sha256::digest(b"");
+        let expected = [
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+            0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+            0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+            0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+        ];
+        assert_eq!(digest, expected);
+    }
+
+    #[test]
+    fn test_sha256_multiblock() {
+        // NIST test vector: SHA-256 of 1,000,000 'a' characters
+        // This tests multi-block processing (>64 bytes)
+        // We'll use a shorter but still multi-block test: 128 bytes of 'a'
+        let data: [u8; 128] = [b'a'; 128];
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        let digest = hasher.finalize();
+
+        // Pre-computed: SHA-256 of 128 'a's
+        // echo -n "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" | sha256sum
+        let expected = [
+            0x76, 0xb7, 0xd0, 0x74, 0xc5, 0x46, 0x4f, 0x46,
+            0x85, 0xa5, 0x4b, 0x5b, 0xdd, 0x69, 0x60, 0xde,
+            0x46, 0x83, 0x45, 0x41, 0x72, 0x6d, 0x1c, 0x35,
+            0xbd, 0x02, 0xdb, 0x2a, 0x6c, 0x4d, 0xa7, 0xa2,
+        ];
+        assert_eq!(digest, expected);
+    }
+
+    #[test]
+    fn test_fnv1a_hash_nonzero() {
         let mut hasher = Fnv1a64::new();
-        hasher.write_u64(0x12345678);
+        hasher.write_u8(0x12);
+        hasher.write_u8(0x34);
+        hasher.write_u8(0x56);
+        hasher.write_u8(0x78);
         let hash = hasher.finish();
         assert_ne!(hash, FNV_OFFSET_BASIS);
     }
@@ -897,5 +1219,86 @@ mod tests {
         assert_eq!(event.kind, AuditKind::Syscall);
         assert_eq!(event.arg_count, 3);
         assert_eq!(event.args[0], 1);
+        assert_eq!(event.prev_hash, ZERO_HASH);
+        assert_eq!(event.hash, ZERO_HASH);
+    }
+
+    #[test]
+    fn test_hash_event_chain() {
+        let mut event1 = AuditEvent::new(
+            1,
+            AuditKind::Syscall,
+            AuditOutcome::Success,
+            AuditSubject::new(1, 0, 0, None),
+            AuditObject::None,
+            &[1, 2, 3],
+            0,
+        );
+        event1.id = 0;
+        event1.prev_hash = ZERO_HASH;
+        event1.hash = hash_event(event1.prev_hash, &event1);
+
+        let mut event2 = AuditEvent::new(
+            2,
+            AuditKind::Syscall,
+            AuditOutcome::Success,
+            AuditSubject::new(2, 0, 0, None),
+            AuditObject::Process {
+                pid: 10,
+                signal: Some(9),
+            },
+            &[4, 5, 6],
+            0,
+        );
+        event2.id = 1;
+        event2.prev_hash = event1.hash;
+        event2.hash = hash_event(event2.prev_hash, &event2);
+
+        // Verify chain
+        let events = alloc::vec![event1.clone(), event2.clone()];
+        assert!(verify_chain(&events));
+
+        // Verify chain links
+        assert_eq!(event2.prev_hash, event1.hash);
+
+        // Hashes should be non-zero
+        assert_ne!(event1.hash, ZERO_HASH);
+        assert_ne!(event2.hash, ZERO_HASH);
+    }
+
+    #[test]
+    fn test_verify_chain_detects_tampering() {
+        let mut event1 = AuditEvent::new(
+            1,
+            AuditKind::Syscall,
+            AuditOutcome::Success,
+            AuditSubject::new(1, 0, 0, None),
+            AuditObject::None,
+            &[1, 2, 3],
+            0,
+        );
+        event1.id = 0;
+        event1.prev_hash = ZERO_HASH;
+        event1.hash = hash_event(event1.prev_hash, &event1);
+
+        let mut event2 = AuditEvent::new(
+            2,
+            AuditKind::Syscall,
+            AuditOutcome::Success,
+            AuditSubject::new(2, 0, 0, None),
+            AuditObject::None,
+            &[4, 5, 6],
+            0,
+        );
+        event2.id = 1;
+        event2.prev_hash = event1.hash;
+        event2.hash = hash_event(event2.prev_hash, &event2);
+
+        // Tamper with event1's data
+        let mut tampered_event1 = event1.clone();
+        tampered_event1.args[0] = 999;  // Modify data without updating hash
+
+        let events = alloc::vec![tampered_event1, event2];
+        assert!(!verify_chain(&events), "Tampering should be detected");
     }
 }

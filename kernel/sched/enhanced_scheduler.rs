@@ -20,6 +20,21 @@ use arch::Context as ArchContext;
 use arch::{default_kernel_stack_top, set_kernel_stack};
 use arch::{enter_usermode, save_context, switch_context};
 
+/// 调度器调试输出开关
+///
+/// 设置为 true 启用详细调度日志，设置为 false 禁用
+/// 在生产环境或使用 shell 时应设置为 false
+const SCHED_DEBUG: bool = false;
+
+/// 调度器调试输出宏
+macro_rules! sched_debug {
+    ($($arg:tt)*) => {
+        if SCHED_DEBUG {
+            println!($($arg)*);
+        }
+    };
+}
+
 // 类型别名以保持兼容性
 pub type Pid = ProcessId;
 pub type ProcessControlBlock = Arc<Mutex<Process>>;
@@ -102,7 +117,7 @@ impl Scheduler {
         for (priority, bucket) in queue.iter() {
             for (&pid, pcb) in bucket.iter() {
                 let state = pcb.lock().state;
-                println!("[SCHED] queue: pid={}, priority={}, state={:?}", pid, priority, state);
+                sched_debug!("[SCHED] queue: pid={}, priority={}, state={:?}", pid, priority, state);
             }
         }
 
@@ -114,7 +129,7 @@ impl Scheduler {
                     continue;
                 }
                 if pcb.lock().state == ProcessState::Ready {
-                    println!("[SCHED] selected pid={}", pid);
+                    sched_debug!("[SCHED] selected pid={}", pid);
                     return Some(pid);
                 }
             }
@@ -124,13 +139,13 @@ impl Scheduler {
         if let Some(skip) = skip_pid {
             if let Some(pcb) = Self::find_pcb(queue, skip) {
                 if pcb.lock().state == ProcessState::Ready {
-                    println!("[SCHED] fallback to skipped pid={}", skip);
+                    sched_debug!("[SCHED] fallback to skipped pid={}", skip);
                     return Some(skip);
                 }
             }
         }
 
-        println!("[SCHED] no ready process found");
+        sched_debug!("[SCHED] no ready process found");
         None
     }
 
@@ -150,7 +165,7 @@ impl Scheduler {
                 proc.state = ProcessState::Ready;
                 (proc.pid, proc.dynamic_priority)
             };
-            println!("[SCHED] add_process: pid={}, priority={}", pid, priority);
+            sched_debug!("[SCHED] add_process: pid={}, priority={}", pid, priority);
             {
                 let mut queue = READY_QUEUE.lock();
                 // 先从所有桶中移除（防止重复）
@@ -327,7 +342,7 @@ impl Scheduler {
 
             // 获取当前运行的进程
             let current_pid = *CURRENT_PROCESS.lock();
-            println!("[SCHED] schedule: current_pid={:?}", current_pid);
+            sched_debug!("[SCHED] schedule: current_pid={:?}", current_pid);
 
             // 在单次锁定中获取所需的所有引用
             // 注意：传递 current_pid 给 select_next_locked，使其优先选择其他进程
@@ -340,12 +355,12 @@ impl Scheduler {
                 (next, current_proc, next_proc)
             };
 
-            println!("[SCHED] schedule: next_pid={:?}", next_pid);
+            sched_debug!("[SCHED] schedule: next_pid={:?}", next_pid);
 
             // 选择下一个要运行的进程
             if let Some(next_pid) = next_pid {
                 if Some(next_pid) != current_pid {
-                    println!("[SCHED] switching from {:?} to {}", current_pid, next_pid);
+                    sched_debug!("[SCHED] switching from {:?} to {}", current_pid, next_pid);
                     // 保存当前进程状态
                     if let Some(proc) = current_proc {
                         let mut pcb = proc.lock();
@@ -469,6 +484,24 @@ impl Scheduler {
             let old_ctx_ptr: *mut ArchContext = match old_pid.and_then(process::get_process) {
                 Some(old_pcb) => {
                     let mut guard = old_pcb.lock();
+
+                    // R24-6 fix: 保存当前硬件 FS/GS base 到 PCB
+                    // 用户态可能通过 wrfsbase/wrgsbase 指令修改了 TLS 基址，
+                    // 必须在切换前读取 MSR 并保存，否则下次恢复时会使用旧值
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        use x86_64::registers::model_specific::Msr;
+                        const MSR_FS_BASE: u32 = 0xC000_0100;
+                        const MSR_GS_BASE: u32 = 0xC000_0101;
+
+                        unsafe {
+                            let fs_msr = Msr::new(MSR_FS_BASE);
+                            let gs_msr = Msr::new(MSR_GS_BASE);
+                            guard.fs_base = fs_msr.read();
+                            guard.gs_base = gs_msr.read();
+                        }
+                    }
+
                     &mut guard.context as *mut _ as *mut ArchContext
                 }
                 None => {
@@ -541,7 +574,7 @@ impl Scheduler {
                     // Debug: 打印进入用户态前的上下文（必须在 MSR 写入之前）
                     {
                         let ctx = &*new_ctx_ptr;
-                        println!(
+                        sched_debug!(
                             "[SCHED] enter_usermode PID={}: rax=0x{:x}, rip=0x{:x}, rsp=0x{:x}, fs_base=0x{:x}",
                             next_pid, ctx.rax, ctx.rip, ctx.rsp, next_fs_base
                         );

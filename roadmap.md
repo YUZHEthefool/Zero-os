@@ -1,458 +1,566 @@
 # Zero-OS Development Roadmap
 
 **Last Updated:** 2025-12-20
+**Architecture:** Security-First Hybrid Kernel
+**Design Principle:** Security > Correctness > Efficiency > Performance
 
-This document outlines the development roadmap for Zero-OS, a microkernel operating system written in Rust for x86_64 architecture.
-
----
-
-## Current Status: Phase 6.2 In Progress (Thread Support)
-
-### Completed Features
-
-- UEFI Bootloader with ELF parsing
-- High-half kernel mapping (0xffffffff80000000)
-- VGA text mode driver
-- Serial port output (0x3F8)
-- IDT with 20+ exception handlers
-- Heap allocator (LockedHeap)
-- Buddy physical page allocator
-- Process Control Block (PCB) structure
-- Enhanced scheduler (multi-level feedback queue with priority buckets)
-- Context switch framework (176-byte context)
-- System call framework (50+ defined)
-- Fork API with COW implementation
-- Memory mapping API (mmap/munmap) with per-process isolation
-- PIC initialization for hardware interrupts
-- User pointer validation in syscalls
-- Timestamp support via timer tick
-- Per-process address space isolation
-- Scheduler-process state synchronization
-- **Preemptive scheduling (timer connected to scheduler)**
-- **IRQ-safe COW reference counting**
-- **Priority-based process selection**
-- **UEFI memory map integration (BootInfo)**
-- **GDT/TSS for user-kernel transitions**
-- **IST for double fault safety**
-- **Security Audit subsystem (hash-chained events)**
-- **SYSCALL/SYSRET MSR configuration (Ring 3 transition)**
-- **IRETQ-based user mode entry**
-- **Clone syscall with thread support (CLONE_VM | CLONE_THREAD)**
-- **TLS (Thread Local Storage) inheritance for child threads**
-
-### Fixed Issues (2025-12-20 Thread TLS)
-
-- [x] T-1: Child thread crash at CR2=0x38 (CRITICAL - FIXED)
-  - Child thread page fault on TLS access (fs:0x38) due to FS_BASE=0
-  - Root cause: PCB fs_base not synced when parent uses wrfsbase instruction
-  - Fix 1: Clone syscall now reads FS_BASE from MSR and syncs to PCB
-  - Fix 2: Scheduler MSR write moved to last step before enter_usermode
-  - Files: kernel/kernel_core/syscall.rs, kernel/sched/enhanced_scheduler.rs
-
-### Fixed Issues (2025-12-10 Seventh Audit)
-
-- [x] C-18: Timer interrupt CR3 switch without context switch (CRITICAL - FIXED)
-  - Removed CR3 switch from schedule() to prevent wrong address space after IRQ
-  - Added NEED_RESCHED atomic flag for deferred scheduling
-  - All scheduler APIs wrapped with without_interrupts()
-- [x] H-19: copy_to_user kernel panic on read-only pages (HIGH - FIXED)
-  - verify_user_memory now checks WRITABLE or BIT_9 (COW) for writes
-  - True read-only pages correctly return EFAULT
-- [x] H-20: sys_mmap frame leak on error (HIGH - FIXED)
-  - Added tracked vector to record mapped (page, frame) pairs
-  - Proper rollback on allocate_frame or map_page failure
-- [x] H-21: Potential UAF in mmap rollback (HIGH - FIXED)
-  - Only deallocate frames when unmap_page succeeds
-- [x] M-12: Ready queue locks not interrupt-safe (MEDIUM - FIXED)
-  - All scheduler public APIs wrapped with without_interrupts()
-
-### Fixed Issues (2025-12-10 Fourth Audit)
-
-- [x] C-5: COW refcount deadlock (CRITICAL - FIXED)
-  - Changed Mutex to RwLock + AtomicU64
-  - Added `without_interrupts` for IRQ safety
-- [x] C-6: munmap double-free (CRITICAL - FIXED)
-  - Added PAGE_REF_COUNT check before deallocation
-- [x] H-11: Timer not connected to scheduler (HIGH - FIXED)
-  - Timer ISR now calls `Scheduler::on_clock_tick()`
-- [x] H-12: BootInfo ignored (HIGH - FIXED)
-  - Kernel `_start` now accepts BootInfo pointer
-  - UEFI memory map parsed to find largest usable region
-  - 4GB identity map limit enforced
-- [x] H-13: Scheduler PID-order selection (HIGH - FIXED)
-  - Changed to `BTreeMap<Priority, BTreeMap<Pid, PCB>>`
-  - Proper priority-based selection implemented
-- [x] H-15: Process resource cleanup (HIGH - FIXED)
-  - Added `free_process_resources()` with page table teardown
-  - Recursive page table traversal via identity mapping
-  - COW pages managed by refcount, non-COW freed directly
-  - Kernel stack: placeholder for future per-process allocation
-- [x] H-16: Missing TSS setup (HIGH - FIXED)
-  - New `kernel/arch/gdt.rs` with GDT/TSS initialization
-  - IST configured for double fault handler
-  - `set_kernel_stack()` for context switch integration
-
-### Fixed Issues (2025-12-09 Third Audit)
-
-- [x] C-3: mmap/munmap per-process isolation (CRITICAL - FIXED)
-  - Removed global MMAP_REGISTRY, moved to per-process PCB
-  - sys_mmap/sys_munmap now use with_current_manager()
-- [x] H-9: Scheduler state synchronization (HIGH - FIXED)
-  - Scheduler now uses Arc<Mutex<Process>> references
-  - State changes propagate automatically
-- [x] H-10: Zombie process cleanup (HIGH - FIXED)
-  - cleanup_zombie() now removes from PROCESS_TABLE
-  - Scheduler notified via register_cleanup_notifier()
-
-### Fixed Issues (2025-12-09 Second Audit)
-
-- [x] L-4: Panic handler now disables interrupts immediately
-- [x] H-8: sys_fork syscall now calls real fork implementation
-- [x] M-6: mmap pages zeroed before mapping (info leak fix)
-- [x] M-7: mmap bounds checking against USER_SPACE_TOP
-- [x] C-4: COW fault handler uses current CR3 via with_current_manager
-
-### Previously Fixed Issues (2025-12-09 First Audit)
-
-- [x] C-1: Process table PID indexing (Critical)
-- [x] C-2: Bootloader address fallback
-- [x] H-1: Interrupt enable (sti) for hardware interrupts
-- [x] H-2: PIC initialization and remapping
-- [x] H-3: Atomic interrupt statistics (deadlock prevention)
-- [x] H-4: User pointer validation in syscalls
-- [x] H-5: Buddy allocator with validation
-- [x] H-6: ExitBootServices called properly
-- [x] H-7: Kernel file complete read loop
-- [x] M-1 - M-5: Various medium issues fixed
-
-### Open Issues Requiring Future Work
-
-- [ ] L-1: Many syscalls still return ENOSYS
-- [x] H-12: BootInfo ignored - UEFI memory map not used ✓ FIXED
-- [x] H-14: IPC lacks process isolation ✓ FIXED
-- [x] H-15: Kernel stack/page tables not freed on exit ✓ FIXED
-- [x] H-16: Missing TSS setup for user-kernel transition ✓ FIXED
-- [x] M-8: No kernel stack guard pages ✓ FIXED
-- [x] M-9: FPU/SIMD context not saved ✓ FIXED
-- [x] L-5: Identity map left writable after boot ✓ FIXED (Round 18 - security hardening)
-
-### Architectural Limitations (Partially Resolved - Dec 11)
-
-- [x] A-1: Preemption mode - PARTIALLY RESOLVED
-  - Cooperative scheduling implemented via `reschedule_now()`
-  - NEED_RESCHED consumed at syscall return and sys_yield
-  - True preemption (interrupt return path) still pending
-- [x] A-2: Process address space isolation - RESOLVED
-  - CR3 switching implemented in `reschedule_now()`
-  - Context switch properly saves/restores registers + FPU
-  - First schedule handled via BOOTSTRAP_CONTEXT
-
-See [qa-2025-12-10.md](qa-2025-12-10.md) and [qa-2025-12-10-v2.md](qa-2025-12-10-v2.md) for detailed issue descriptions.
+This document outlines the development roadmap for Zero-OS, a microkernel operating system written in Rust for x86_64 architecture, designed to evolve toward enterprise-grade security.
 
 ---
 
-## Architecture Vision: Hybrid Macro/Micro Kernel
+## Executive Summary
 
-Zero-OS is evolving toward a **hybrid kernel architecture** inspired by Linux, combining the performance of a monolithic kernel with the modularity and security of a microkernel.
+### Current Status: Phase 6.2 Complete (Thread Support)
 
-### Design Principles
+Zero-OS has completed foundational kernel development with strong security focus:
+- **24 security audits** with 111/138 issues fixed (80%)
+- **Ring 3 user mode** with SYSCALL/SYSRET support
+- **Thread support** with Clone syscall and TLS inheritance
+- **VFS** with POSIX DAC permissions
+- **Security hardening**: W^X, SMEP/SMAP/UMIP, hash-chained audit
+
+### Gap Analysis vs Linux Kernel
+
+| Category | Linux | Zero-OS | Gap |
+|----------|-------|---------|-----|
+| **SMP** | 256+ CPUs | Single-core | Full implementation needed |
+| **Security Framework** | LSM/SELinux/AppArmor | Basic IPC capabilities | MAC/Capability framework needed |
+| **Network** | Full TCP/IP stack | Not started | Full implementation needed |
+| **Storage** | ext4/xfs/btrfs/zfs | ramfs/devfs only | Block layer + real FS needed |
+| **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard | Driver framework needed |
+| **Containers** | Namespaces/Cgroups | Not started | Full implementation needed |
+| **Virtualization** | KVM/QEMU | Not started | Future consideration |
+
+---
+
+## Completed Features
+
+### Core Infrastructure (Phase 1-2)
+
+- [x] UEFI Bootloader with ELF parsing
+- [x] High-half kernel mapping (0xffffffff80000000)
+- [x] VGA text mode driver + Framebuffer (GOP)
+- [x] Serial port output (0x3F8)
+- [x] IDT with 20+ exception handlers
+- [x] Heap allocator (LockedHeap)
+- [x] Buddy physical page allocator
+- [x] GDT/TSS for user-kernel transitions
+- [x] IST for double fault safety
+
+### Process Management (Phase 3)
+
+- [x] Process Control Block (PCB) structure
+- [x] Enhanced scheduler (MLFQ with priority buckets)
+- [x] Context switch framework (176-byte + FPU/SIMD)
+- [x] Fork API with COW implementation
+- [x] Clone syscall (CLONE_VM | CLONE_THREAD)
+- [x] TLS inheritance for child threads
+- [x] Per-process address space isolation (CR3)
+- [x] Preemptive scheduling (timer connected)
+- [x] IRQ-safe COW reference counting
+
+### IPC (Phase 4)
+
+- [x] Capability-based message queues
+- [x] Pipes with blocking I/O
+- [x] Futex (FUTEX_WAIT/FUTEX_WAKE)
+- [x] Signals (SIGKILL, SIGTERM, SIGSTOP, SIGCONT)
+- [x] Per-process file descriptor table
+
+### VFS (Phase 5)
+
+- [x] VFS layer with inode abstraction
+- [x] ramfs (memory-backed)
+- [x] devfs (/dev/null, /dev/zero, /dev/console)
+- [x] POSIX DAC permissions (owner/group/other/umask)
+- [x] Sticky bit semantics
+- [x] Path traversal permission checks
+
+### User Mode (Phase 6)
+
+- [x] SYSCALL/SYSRET MSR configuration
+- [x] IRETQ-based Ring 3 entry
+- [x] System call framework (50+ defined, ~35 implemented)
+- [x] User/kernel segment selectors (CS=0x23, SS=0x1B)
+
+### Security Hardening
+
+- [x] W^X enforcement (no writable+executable pages)
+- [x] SMEP/SMAP/UMIP enabled
+- [x] User pointer validation
+- [x] mmap page zeroing (info leak prevention)
+- [x] Kernel stack guard pages
+- [x] CSPRNG (ChaCha20 + RDRAND/RDSEED)
+- [x] kptr guard (kernel pointer obfuscation)
+- [x] Spectre/Meltdown basic mitigations (IBRS/IBPB/STIBP)
+- [x] Audit subsystem (hash-chained events)
+
+---
+
+## Architecture Vision: Hybrid Kernel
 
 ```
 +------------------------------------------------------------------+
 |                        USER SPACE                                 |
 |  +---------------+  +---------------+  +---------------+          |
-|  | FS Server     |  | Net Server    |  | Device Mgr    |          |
-|  | (ext2, FAT)   |  | (TCP/IP)      |  | (USB, etc)    |          |
+|  | FS Server     |  | Net Server    |  | Policy Daemon |          |
+|  | (ext2, FAT)   |  | (TCP/IP L7)   |  | (LSM policy)  |          |
 |  +-------+-------+  +-------+-------+  +-------+-------+          |
 |          |                  |                  |                  |
 |          v                  v                  v                  |
 |  +----------------------------------------------------------+    |
-|  |              Capability-Based IPC Layer                   |    |
+|  |         Capability-Based IPC + Shared Memory              |    |
 |  +----------------------------------------------------------+    |
 +------------------------------------------------------------------+
 |                       KERNEL SPACE                                |
 |  +------------------+  +------------------+  +------------------+ |
 |  | Scheduler        |  | VMM/PMM          |  | IPC Fast Path    | |
-|  | (MLFQ + Priority)|  | (COW, mmap)      |  | (Ring Buffers)   | |
+|  | (MLFQ + Per-CPU) |  | (COW, Page Cache)|  | (Ring Buffers)   | |
 |  +------------------+  +------------------+  +------------------+ |
 |  +------------------+  +------------------+  +------------------+ |
-|  | Interrupt/Trap   |  | Basic Drivers    |  | Capability DB    | |
-|  | Handlers         |  | (Timer,UART,VGA) |  | (Security)       | |
+|  | Interrupt/Trap   |  | Block Layer      |  | Capability DB    | |
+|  | (APIC/IOAPIC)    |  | (virtio-blk)     |  | + LSM Hooks      | |
+|  +------------------+  +------------------+  +------------------+ |
+|  +------------------+  +------------------+  +------------------+ |
+|  | Network L2-L4    |  | Basic Drivers    |  | Audit Engine     | |
+|  | (TCP/IP core)    |  | (Timer,RNG,UART) |  | (Hash-chained)   | |
 |  +------------------+  +------------------+  +------------------+ |
 +------------------------------------------------------------------+
 |                        HARDWARE                                   |
 +------------------------------------------------------------------+
 ```
 
-### In-Kernel (Macro-style) - Performance Critical
+### Design Rationale
 
-1. **Scheduler** - Direct hardware access, minimal latency
-2. **Virtual/Physical Memory Manager** - Page tables, COW, buddy allocator
-3. **IPC Fast Path** - Optimized send/recv for servers
-4. **Interrupt Handling** - IDT, PIC, exception handlers
-5. **Basic Drivers** - Timer, APIC, UART, VGA
-6. **Page Fault Handler** - COW resolution
-7. **Capability Database** - Security-critical access control
+**In-Kernel (Performance Critical)**:
+1. Scheduler - Direct hardware access, minimal latency
+2. VMM/PMM - Page tables, COW, page cache
+3. IPC Fast Path - Zero-copy ring buffers
+4. Interrupt Handling - APIC, exception handlers
+5. Block Layer - I/O critical path
+6. Network L2-L4 - TCP/IP core for DoS protection
+7. Capability/LSM - Security-critical decisions
+8. Audit - Tamper-evident logging
 
-### User-Space Services (Micro-style) - Isolation & Modularity
-
-1. **File Systems** - ext2, FAT, tmpfs as isolated servers
-2. **Network Stack** - TCP/IP protocol implementation
-3. **Block Device Drivers** - With DMA via kernel helper
-4. **USB Stack** - Complex protocol handling
-5. **Init/Service Manager** - Process supervision (PID 1)
-6. **POSIX Compatibility Layer** - Legacy syscall translation
-
-### IPC Design for Hybrid Architecture
-
-- **Capability-based endpoints** - Fine-grained access control
-- **Per-process endpoint tables** - Namespace isolation
-- **Zero-copy shared pages** - With refcounting
-- **Ring buffers with backpressure** - Quota enforcement
-- **Async notifications + sync RPC** - Flexible communication
+**User-Space (Isolation & Modularity)**:
+1. File System Servers - ext2, tmpfs policy
+2. Network L7 - Application protocols
+3. Device Managers - Hot-plug, USB complex protocols
+4. Policy Daemons - LSM policy loading, audit shipping
+5. Init/Service Manager - PID 1 supervision
 
 ---
 
-## Phase 2: Core Infrastructure Hardening (COMPLETED ✓)
+## Future Phases (Security-First Order)
 
-**Priority: Critical**
-**Target: Production-Ready Kernel Boot**
-**Status: COMPLETE ✓**
+### Phase A: Security Foundation [NEXT]
 
-### 2.1 Process Isolation (COMPLETED ✓)
+**Goal**: Establish minimum trusted base before adding features.
 
-- [x] **Per-Process Address Space**
-  - ✓ Move mmap tracking into PCB (mmap_regions, next_mmap_addr)
-  - ✓ Use with_current_manager for all mmap operations
-  - [ ] Implement proper address space teardown on exit
+**Priority**: Critical
+**Dependencies**: None (current baseline)
 
-- [x] **Scheduler-Process State Unification**
-  - ✓ Replace READY_QUEUE copies with Arc<Mutex<Process>> references
-  - ✓ Add process exit notification to scheduler (register_cleanup_notifier)
-  - [ ] Implement proper priority-based selection
+#### A.1 Usercopy API Hardening
 
-- [x] **Zombie Process Cleanup**
-  - ✓ Implement full resource cleanup on termination
-  - [ ] Free kernel stacks and page tables
-  - ✓ Remove from PROCESS_TABLE and notify scheduler
+- [ ] Unified `copy_from_user` / `copy_to_user` with SMAP guard
+- [ ] Path string copy with length limits
+- [ ] Alignment and bounds validation
+- [ ] STAC/CLAC wrapper for all user memory access
 
-### 2.2 Hardware Initialization
+#### A.2 Syscall Coverage
 
-- [x] **PIC Configuration**
-  - Remap 8259 PIC (IRQ 0-15 to vectors 32-47) ✓
-  - Timer and keyboard interrupts enabled ✓
+- [ ] Eliminate all ENOSYS returns for defined syscalls
+- [ ] Proper error code semantics
+- [ ] User-space signal handler infrastructure
 
-- [x] **Timer Enhancement** ✓
-  - Configure PIT frequency for accurate timing ✓
-  - Connect timer interrupt to scheduler tick ✓
+#### A.3 Audit Enhancement
 
-- [ ] **Keyboard Driver Enhancement**
-  - PS/2 keyboard scancode translation
-  - Key event queue implementation
+- [ ] Upgrade hash chain to SHA-256/HMAC
+- [ ] Overflow handling policy (drop oldest/block/alert)
+- [ ] Read-only export interface with capability gate
+- [ ] Persistent flush hook (for future storage)
 
-### 2.3 Memory Management Completion
+#### A.4 KASLR/KPTI Preparation
 
-- [ ] **UEFI Memory Map Integration**
-  - Parse boot info memory map in kernel
-  - Initialize buddy allocator from actual available regions
-  - Avoid reserved/firmware regions
+- [ ] Linker script layering for randomization
+- [ ] KASLR slide reservation
+- [ ] KPTI dual page table skeleton (single-core stub)
+- [ ] PCID support detection
 
-- [ ] **Page Table Manager Enhancement**
-  - Per-process page table cloning
-  - Proper TLB invalidation
+#### A.5 Spectre/Meltdown Hardening
 
-### 2.4 Security Hardening
+- [x] Context switch IBPB on untrusted transition
+- [x] RSB stuffing stub (spectre.rs)
+- [ ] Retpoline build option verification
+- [x] SWAPGS fence beyond syscall stub (syscall.rs CVE-2019-1125)
 
-- [x] **User Pointer Validation** ✓
-- [x] **mmap Page Zeroing** ✓
-- [x] **mmap Bounds Checking** ✓
-- [ ] **Implement copy_from_user/copy_to_user wrappers**
+#### A.6 SMP-Ready Interfaces (Stubs)
 
----
+- [x] Per-CPU data structure abstraction (cpu_local crate)
+- [x] IPI type definitions (arch/ipi.rs - TLB, resched, profile, halt, panic)
+- [x] TLB shootdown API (mm/tlb_shootdown.rs - single-core)
+- [x] Lock ordering documentation (sched/lock_ordering.rs)
 
-## Phase 3: Process Management Maturity (COMPLETED ✓)
+**Security Requirements**:
+- W^X/NX/SMEP/SMAP/UMIP enabled by default
+- panic-on-UB configurable
+- kptr guard active
+- Audit cannot be disabled
 
-**Priority: High**
-**Target: Multi-Process Support**
-**Status: COMPLETE ✓**
-
-### 3.1 Fork/Exec Implementation
-
-- [x] **Copy-On-Write (COW)** ✓
-  - Page table duplication with shared pages
-  - COW fault handler implementation
-  - Physical page reference counting
-
-- [x] **Exec System Call** ✓
-  - ELF binary loading ✓
-  - User-space address space setup ✓
-  - Argument/environment passing ✓
-
-### 3.2 Process Lifecycle
-
-- [x] **Wait/Exit Semantics** ✓
-  - Parent waiting for child termination ✓
-  - Exit code propagation ✓
-  - Zombie process cleanup ✓
-
-- [x] **Orphan Handling** ✓
-  - Reparenting to init process
-
-### 3.3 Scheduler Enhancement (COMPLETED ✓)
-
-- [x] **Preemptive Scheduling** ✓
-  - Timer-driven context switch ✓
-  - Priority recalculation (MLFQ) ✓
-  - CPU accounting ✓
+**Testing Strategy**:
+- Syscall fuzzer for all implemented syscalls
+- Usercopy property tests
+- Audit chain integrity verification
+- KASLR randomness validation
 
 ---
 
-## Phase 4: Inter-Process Communication
+### Phase B: Capability & MAC Framework
 
-**Priority: Medium**
-**Target: Process Coordination**
-**Status: In Progress**
+**Goal**: Unified object capability model + LSM hooks + syscall filtering.
 
-### 4.1 Synchronization Primitives
+**Priority**: Critical
+**Dependencies**: Phase A
 
-- [x] **Kernel Wait Queue**
-  - Process blocking/waking mechanism ✓
-  - Foundation for blocking I/O
+#### B.1 Capability System
 
-- [x] **Kernel Mutex (KMutex)**
-  - Blocking mutex implementation ✓
-  - try_lock non-blocking variant ✓
+```rust
+// Design specification
+pub struct CapId(u64);  // idx(32) | gen(32)
 
-- [x] **Semaphore**
-  - Counting semaphore ✓
-  - wait/signal operations ✓
+pub enum CapObject {
+    Endpoint(Arc<Endpoint>),
+    File(Arc<File>),
+    Socket(Arc<Socket>),
+    Shm(Arc<Shm>),
+    Timer(Arc<Timer>),
+    Process(Pid),
+    Namespace(NsId),
+}
 
-- [x] **Condition Variable**
-  - wait/notify_one/notify_all ✓
+bitflags! {
+    pub struct CapRights: u64 {
+        const READ      = 1 << 0;
+        const WRITE     = 1 << 1;
+        const EXEC      = 1 << 2;
+        const IOCTL     = 1 << 3;
+        const ADMIN     = 1 << 4;
+        const MAP       = 1 << 5;
+        const BIND      = 1 << 6;
+        const CONNECT   = 1 << 7;
+        const SIGNAL    = 1 << 8;
+        const BYPASS_DAC = 1 << 30;
+    }
+}
+```
 
-- [x] **User-space Futex**
-  - sys_futex syscall (202) ✓
-  - FUTEX_WAIT: block if value matches ✓
-  - FUTEX_WAKE: wake up to N waiters ✓
-  - Global FutexTable with (pid, vaddr) key ✓
-  - Lost-wake race protection ✓
-  - Process exit cleanup ✓
+- [ ] Per-process CapTable with generation counter
+- [ ] CapId allocation/lookup/revocation
+- [ ] Delegation with rights restriction
+- [ ] fd_table -> CapId integration
+- [ ] O_PATH/CLOEXEC/CLOFORK semantics
 
-### 4.2 IPC Mechanisms
+#### B.2 LSM Hook Infrastructure
 
-- [x] **Message Queue (Capability-Based)**
-  - Endpoint registration ✓
-  - Send/receive with access control ✓
-  - Backpressure (64 msg limit) ✓
+**Hook Points**:
+- Syscall: enter/exit
+- Process: fork/exec/exit/setuid
+- VFS: lookup/open/create/mmap/chmod/mount
+- IPC: mq send/recv, pipe, futex, shm
+- Signal: send_signal, ptrace
+- Network: socket/bind/connect/send/recv
 
-- [x] **Pipes**
-  - Anonymous pipe creation ✓
-  - Ring buffer with blocking I/O ✓
-  - PipeHandle with read/write/close ✓
-  - sys_pipe syscall with fd_table integration ✓
-  - sys_read/sys_write support for pipe fds ✓
-  - Per-process file descriptor table ✓
+```rust
+trait LsmPolicy: Send + Sync {
+    fn syscall_enter(&self, ctx: &SyscallCtx) -> Result<()>;
+    fn file_open(&self, task: &Task, inode: &Inode, flags: OpenFlags) -> Result<()>;
+    fn ipc_send(&self, task: &Task, ep: &Endpoint, bytes: usize) -> Result<()>;
+    // ... other hooks
+}
+```
 
-- [x] **Blocking IPC**
-  - Integration with WaitQueue ✓
-  - send_message_notify, receive_message_blocking ✓
-  - Retry-based timeout support ✓
+- [ ] Hook point infrastructure
+- [ ] Policy registration API
+- [ ] Default permissive policy
+- [ ] Build-time feature gate
 
-### 4.3 Signal Handling
+#### B.3 Seccomp/Pledge
 
-- [x] **Signal Delivery**
-  - Signal definitions (SIGKILL, SIGTERM, SIGSTOP, SIGCONT, etc.) ✓
-  - PendingSignals bitmap per process ✓
-  - Default signal actions ✓
-  - sys_kill syscall implementation ✓
-  - Scheduler integration for SIGCONT resume ✓
-  - [ ] User signal handlers (future)
+- [ ] Per-process filter storage
+- [ ] sys_seccomp implementation
+- [ ] BPF-like or simplified predicate rules
+- [ ] Fork inheritance policy
 
----
+#### B.4 Audit Integration
 
-## Phase 5: File System Foundation (COMPLETED ✓)
+- [ ] Every hook emits CapId/uid/gid/label/path/socket
+- [ ] MAC decision logging
+- [ ] Capability use tracking
 
-**Priority: Medium**
-**Target: Basic I/O Operations**
-**Status: COMPLETE ✓**
+**Security Requirements**:
+- Default-allow policy initially
+- Policy load requires ADMIN capability
+- Deny decisions are fail-closed
+- Generation counter prevents use-after-free
 
-### 5.1 Virtual File System (VFS)
-
-- [x] VFS layer design ✓
-- [x] Inode abstraction ✓
-- [x] File descriptor table ✓
-
-### 5.2 Initial File Systems
-
-- [x] RAM Disk (ramfs) ✓
-- [x] Device files (/dev/null, /dev/zero, /dev/console) ✓
-
-### 5.3 System Calls
-
-- [x] open/close implementation ✓
-- [x] read/write for files ✓
-- [x] lseek support ✓
-
-### 5.4 Security Features (2025-12-15/16)
-
-- [x] POSIX DAC permissions (owner/group/other) ✓
-- [x] Supplementary groups support ✓
-- [x] umask enforcement ✓
-- [x] Sticky bit semantics ✓
-- [x] Path traversal permission checks ✓
-- [x] readdir permission enforcement (W-2) ✓
-
----
-
-## Phase 6: User Space
-
-**Priority: Medium**
-**Target: First User Program**
-**Status: In Progress (6.1 Core Infrastructure Complete)**
-
-### 6.1 User Mode Support (COMPLETED ✓)
-
-- [x] TSS setup ✓ (GDT with TSS RSP0 for syscall return)
-- [x] Ring 3 transition ✓ (IRETQ-based enter_usermode)
-- [x] System call entry/exit ✓ (SYSCALL/SYSRET with proper stack switching)
-- [x] SYSCALL MSR configuration ✓ (STAR, LSTAR, SFMASK, EFER.SCE)
-- [x] User/kernel segment selectors ✓ (CS=0x23, SS=0x1B)
-
-### 6.2 User Libraries
-
-- [ ] Minimal libc
-- [ ] System call wrappers
-
-### 6.3 Initial Programs
-
-- [ ] Init process (PID 1)
-- [ ] Simple shell
+**Testing Strategy**:
+- Capability/LSM/audit API unit tests
+- Fork/exec inheritance behavior tests
+- Seccomp rule matching (table-driven)
+- Fuzzer coverage of syscall dispatch path
 
 ---
 
-## Phase 7: Advanced Features
+### Phase C: Storage Foundation
 
-**Priority: Future**
-**Target: Feature Completeness**
+**Goal**: Usable persistent storage with full permission chain.
 
-### 7.1 Networking
+**Priority**: High
+**Dependencies**: Phase B (LSM/Capability hooks)
 
-- [ ] Network stack design
-- [ ] TCP/IP implementation
+#### C.1 Block Layer
 
-### 7.2 Graphics
+- [ ] virtio-blk driver (priority) or AHCI
+- [ ] BIO queue abstraction
+- [ ] Minimal I/O scheduler (FIFO initially)
+- [ ] Request batching
 
-- [ ] Framebuffer support
+#### C.2 Page Cache
 
-### 7.3 Storage
+- [ ] Radix/tree-based page cache
+- [ ] Page lifecycle with Cap/LSM binding
+- [ ] Writeback policy (placeholder)
+- [ ] Cache invalidation
 
-- [ ] ATA/AHCI driver
-- [ ] Ext2 filesystem
+#### C.3 File Systems
 
-### 7.4 Multi-Core
+- [ ] ext2 read-only (first milestone)
+- [ ] tmpfs completion
+- [ ] procfs (/proc/self, /proc/[pid])
+- [ ] Mount table and superblock cache
+- [ ] initramfs (CPIO archive) support
 
-- [ ] SMP boot
-- [ ] Per-CPU scheduling
+#### C.4 Permission Chain Integration
+
+```
+MAC (LSM hook) → CapRights → DAC (uid/gid/mode) → ACL →
+inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
+```
+
+- [ ] All FS ops through LSM + Cap
+- [ ] Path resolution anti-TOCTOU (sequence numbers, depth limit)
+- [ ] RESOLVE_NO_SYMLINKS flag
+
+#### C.5 OOM Killer (Basic)
+
+- [ ] Memory pressure detection
+- [ ] Process scoring
+- [ ] Kill policy (configurable)
+
+**Security Requirements**:
+- Write operations enforce W^X
+- Path traversal validates at each component
+- Mount requires ADMIN capability
+- No executable pages from untrusted storage without explicit allow
+
+**Testing Strategy**:
+- ext2 compatibility tests
+- Page cache consistency tests
+- Permission matrix (MAC/Cap/DAC/flags) table-driven
+- fstress (concurrent open/read)
+
+---
+
+### Phase D: Network Foundation
+
+**Goal**: Minimal usable network stack with kernel protection.
+
+**Priority**: High
+**Dependencies**: Phase B (Cap/LSM), Phase A (usercopy)
+
+#### D.1 Drivers
+
+- [ ] virtio-net (primary)
+- [ ] e1000 (fallback)
+- [ ] Minimal RX/TX path
+- [ ] Interrupt coalescing
+
+#### D.2 Protocol Stack
+
+- [ ] IPv4 header validation
+- [ ] ICMP (ping)
+- [ ] UDP
+- [ ] TCP (3-way handshake, timeout, retransmit, sliding window)
+- [ ] Checksum verification
+- [ ] Fragment reassembly with limits
+- [ ] Source routing disabled
+
+#### D.3 Protection Mechanisms
+
+- [ ] Conntrack state machine
+- [ ] SYN cookies
+- [ ] Rate limiting (token bucket)
+- [ ] Basic firewall (match + action table)
+- [ ] ISN randomization (RFC 6528)
+- [ ] Ephemeral port randomization
+
+#### D.4 Socket API
+
+- [ ] Socket as CapId handle
+- [ ] LSM hooks for create/bind/connect/send/recv
+- [ ] Per-socket security context
+- [ ] Zero-copy path reservation (pinned buffers)
+
+**Security Requirements**:
+- Default DROP policy option
+- Conntrack resource limits
+- Fragment/TTL/checksum anomaly protection
+- Each socket bound to security context
+
+**Testing Strategy**:
+- Loopback self-test
+- TCP/UDP interop suite
+- SYN flood benchmark
+- Firewall rule table-driven tests
+- Audit event coverage
+
+---
+
+### Phase E: SMP & Concurrency
+
+**Goal**: Multi-core support with correct synchronization.
+
+**Priority**: Medium-High (can be deferred after D)
+**Dependencies**: Phase A.6 (SMP-ready interfaces)
+
+#### E.1 Hardware Initialization
+
+- [ ] LAPIC initialization
+- [ ] IOAPIC initialization
+- [ ] HPET timer
+- [ ] AP boot (trampoline)
+- [ ] IPI type table (resched, TLB, profile, panic)
+
+#### E.2 TLB Shootdown
+
+- [ ] IPI-driven global/range invalidation
+- [ ] Batched shootdown
+- [ ] Online CPU count guard
+- [ ] PCID/ASID support (if available)
+
+#### E.3 Per-CPU Data
+
+- [ ] Per-CPU segment (%gs)
+- [ ] Syscall stack per-CPU
+- [ ] Scheduler runqueue per-CPU
+- [ ] IRQ stack per-CPU
+- [ ] Safe cross-CPU access API
+
+#### E.4 Synchronization
+
+- [ ] Lock class annotations
+- [ ] Runtime lockdep checker (debug)
+- [ ] RCU/epoch-based garbage collection
+- [ ] Futex priority inheritance (preparation)
+
+#### E.5 Scheduler SMP
+
+- [ ] Per-CPU runqueues
+- [ ] Load balancing
+- [ ] CPU affinity
+- [ ] CPU isolation (cpuset preparation)
+
+**Security Requirements**:
+- Cross-CPU kernel pointers obfuscated (kptr guard)
+- IPI path audited
+- SMP enable gate: assert IPI/TLB ready
+- No global lock held during user code execution
+
+**Testing Strategy**:
+- SMP self-check (IPI ping-pong, TLB flush verification)
+- RCU torture test
+- Lockdep scenario tests
+- Scheduler timing consistency
+
+---
+
+### Phase F: Resource Governance
+
+**Goal**: Multi-tenant resource isolation.
+
+**Priority**: Medium
+**Dependencies**: Phase B (Cap/LSM), Phase C (storage), Phase D (network)
+
+#### F.1 Namespaces
+
+- [ ] PID namespace (isolated PID numbering)
+- [ ] Mount namespace (isolated FS view)
+- [ ] IPC namespace (isolated message queues)
+- [ ] Network namespace (isolated stack)
+- [ ] User namespace (UID/GID mapping)
+
+#### F.2 Cgroups v1.5
+
+- [ ] cpu controller (shares, quota, burst)
+- [ ] memory controller (hard/soft limits, OOM)
+- [ ] pids controller (process count limit)
+- [ ] io controller (bandwidth limit)
+
+#### F.3 IOMMU/VT-d
+
+- [ ] DMA isolation
+- [ ] Device domain binding
+- [ ] Passthrough preparation
+
+**Security Requirements**:
+- Default resource limits
+- Cross-namespace ops require ADMIN cap
+- IOMMU binding validation
+- OOM policy configurable
+
+**Testing Strategy**:
+- Namespace isolation matrix
+- Cgroup stress and throttle tests
+- DMA pollution prevention tests
+
+---
+
+### Phase G: Production Readiness
+
+**Goal**: Observable, compliant, updatable.
+
+**Priority**: Medium
+**Dependencies**: All previous phases
+
+#### G.1 Observability
+
+- [ ] Tracepoints/counters infrastructure
+- [ ] Sampling profiler
+- [ ] kdump (encrypted, redacted)
+- [ ] Health monitoring (watchdog, hung-task)
+
+#### G.2 Live Patching
+
+- [ ] Patch framework
+- [ ] Rollback policy
+- [ ] Signature verification
+
+#### G.3 Compliance
+
+- [ ] Hardening profiles (Secure/Balanced/Performance)
+- [ ] Audit remote delivery
+- [ ] FIPS mode preparation
+
+**Security Requirements**:
+- Debug interfaces require Cap/LSM authorization
+- Dump redaction with kptr guard
+- Patch signature mandatory
+
+**Testing Strategy**:
+- Trace/kdump regression
+- Hot patch drill
+- Benchmark and regression
+- Compliance config scan
 
 ---
 
@@ -461,53 +569,28 @@ Zero-OS is evolving toward a **hybrid kernel architecture** inspired by Linux, c
 ### Current Tests
 
 - Buddy allocator self-test
-- Basic module loading verification
 - Boot sequence validation
+- Integration tests in QEMU
+- Clone/thread test suite
 
-### Needed Tests
+### Testing Infrastructure Needed
 
-- Process creation/termination cycles
-- Fork/COW stress tests
-- mmap/munmap validation
-- System call round-trips
+| Category | Tests |
+|----------|-------|
+| **Syscall** | Fuzzer for all 35+ syscalls, error path coverage |
+| **Memory** | COW stress, mmap/munmap cycles, page cache consistency |
+| **IPC** | Pipe throughput, futex contention, signal delivery |
+| **Security** | Capability inheritance, LSM policy enforcement, audit integrity |
+| **SMP** | Lock contention, TLB shootdown, scheduler fairness |
+| **Storage** | FS compatibility, I/O error handling |
+| **Network** | Protocol compliance, DoS resistance |
 
 ### Debugging Tools
 
 - QEMU monitor integration
 - GDB remote debugging (:1234)
 - Serial console logging
-
----
-
-## Known Technical Debt
-
-### Critical (RESOLVED ✓)
-
-All critical issues have been resolved:
-
-1. ✓ mmap/munmap now use per-process page table
-2. ✓ Scheduler uses Arc references, synchronized with PROCESS_TABLE
-3. ✓ Zombie cleanup removes from all data structures
-4. ✓ COW refcount uses atomic operations with IRQ safety
-5. ✓ munmap checks refcount before freeing
-
-### High Priority
-
-1. ~~**UEFI memory map not used**~~ - ✓ FIXED (init_with_bootinfo)
-2. ~~**IPC lacks process isolation**~~ - ✓ FIXED (capability-based endpoints)
-3. ~~**Kernel stack/page table not freed on exit**~~ - ✓ FIXED (page table teardown)
-4. ~~**Missing TSS setup**~~ - ✓ FIXED (gdt.rs with GDT/TSS)
-
-### Medium Priority
-
-1. **Many syscalls return ENOSYS** - need implementation (exec, wait, kill, etc.)
-2. **No exec() implementation** - can't load new programs
-3. ~~**No kernel stack guard pages**~~ - ✓ FIXED (stack_guard.rs)
-4. ~~**FPU/SIMD context not saved**~~ - ✓ FIXED (FXSAVE/FXRSTOR in context_switch.rs)
-
-### Low Priority
-
-1. **No file system** - required for exec and general I/O
+- kdump analysis (future)
 
 ---
 
@@ -515,44 +598,24 @@ All critical issues have been resolved:
 
 ### Audit History
 
-| Date | Auditor | Issues Found | Issues Fixed |
-|------|---------|--------------|--------------|
-| 2025-12-09 | Claude + Codex (1st) | 17 | 16 (94%) |
-| 2025-12-09 | Claude + Codex (2nd) | 8 new | 5 (63%) |
-| 2025-12-09 | Claude + Codex (3rd) | 0 new | 3 (100%) |
-| 2025-12-10 | Claude + Codex (4th) | 11 new | 10 (91%) |
-| 2025-12-10 | Claude + Codex (5th) | 5 new | 0 (audit only) |
-| 2025-12-10 | Claude + Codex (6th) | 0 new | 5 (M-10, H-17, H-18, C-17, M-11) |
-| 2025-12-10 | Claude + Codex (7th) | 6 new | 6 (C-18, H-19, H-20, H-21, M-12) |
-| 2025-12-11 | Claude + Codex (8th) | 0 new | 2 arch limits (A-1 partial, A-2 full) |
-| 2025-12-11 | Claude + Codex (9th) | 7 new | 7 (C-19, C-20, H-22, H-23, H-24, M-13, M-14) |
-| 2025-12-11 | Claude + Codex (10th) | 5 new | 2 (M-15, M-16), 3 deferred (A-3, H-25, H-26) |
-| 2025-12-11 | Claude + Codex (11th) | 3 new | 3 (C-21, H-27, H-28 - sys_pipe/FD) |
-| 2025-12-11 | Claude + Codex (12th) | 3 new | 3 (H-29, H-30, M-17 - futex) |
-| 2025-12-11 | Claude + Codex (13th) | 5 new | 2 (H-31, H-32 - signal), 3 deferred (H-33, H-34, M-18) |
-| 2025-12-15 | Claude + Codex (16th) | 5 new | 4 (V-1, V-2, V-3, V-4 - VFS perms, SMP SMAP) |
-| 2025-12-16 | Claude + Codex (17th) | 4 new | 2 (W-1: W^X, W-2: readdir), 2 deferred (W-3, W-4: SMP) |
-| 2025-12-16 | Claude + Codex (18th) | 2 new | 2 (W^X-1, W^X-2: boot-time W^X enforcement) |
-| 2025-12-16 | Claude + Codex (19th) | 0 new | Audit subsystem implemented (hash-chained events) |
-| 2025-12-17 | Claude + Codex (20th) | 8 new | 4 fixed (X-2: DoS, X-4: mount perms, X-6: IPC, X-7: TLB), 4 deferred |
-| 2025-12-17 | Claude + Codex (21st) | 10 new | 4 fixed (Y-1: SFMASK, Y-2: SYSRET, Y-3: DR6/DR7, Y-6: enter_usermode), 6 open |
-| 2025-12-18 | Claude + Codex (22nd) | 11 new | **ALL 11 FIXED** (Z-1 to Z-11) |
-| 2025-12-20 | Claude + Codex (23rd) | 1 new | 1 fixed (T-1: Thread TLS inheritance) |
+| Date | Round | Issues Found | Fixed | Notes |
+|------|-------|--------------|-------|-------|
+| 2025-12-09 | 1-3 | 25 | 24 | Initial security baseline |
+| 2025-12-10 | 4-7 | 22 | 21 | Preemption, COW, scheduler |
+| 2025-12-11 | 8-13 | 23 | 19 | IPC, signals, context switch |
+| 2025-12-15-16 | 16-19 | 11 | 10 | VFS, W^X, audit subsystem |
+| 2025-12-17-18 | 20-22 | 29 | 19 | Ring 3, SYSCALL/SYSRET |
+| 2025-12-20 | 23-24 | 12 | 12 | Thread/Clone, TLS, usercopy |
+| **Total** | **24** | **138** | **111 (80%)** | **27 deferred (mostly SMP)** |
 
 ### Current Status
 
-- Total issues tracked: 120
-- Fixed: 96 (80%)
-- Open: 24 (20%)
-  - **Round 22: ALL 11 issues FIXED**
-    - 2 CRITICAL: Z-6 (RNG entropy), Z-7 (kernel stack)
-    - 6 HIGH: Z-1 (FPU/SIMD), Z-2 (stack align), Z-3 (usercopy), Z-4 (callback len), Z-8 (fork COW), Z-9 (signal perms)
-    - 3 MEDIUM: Z-5 (context switch), Z-10 (ELF rollback), Z-11 (pipe wakeup)
-  - 13 Deferred (A-3, H-25, H-26, H-33, H-34, M-18, W-3, W-4, X-1, X-5, Y-7 - mostly SMP)
-  - A-1 partially resolved (cooperative scheduling)
-  - A-2 fully resolved (address space isolation)
+- **Fixed**: 111 issues (80%)
+- **Open**: 27 issues (20%)
+  - Mostly SMP-related (A-3, H-25, H-26, W-3, W-4, etc.)
+  - Deferred to Phase E
 
-See [qa-2025-12-10.md](qa-2025-12-10.md), [qa-2025-12-10-v2.md](qa-2025-12-10-v2.md), [qa-2025-12-11.md](qa-2025-12-11.md), [qa-2025-12-15-v2.md](qa-2025-12-15-v2.md), [qa-2025-12-16.md](qa-2025-12-16.md), [qa-2025-12-17.md](qa-2025-12-17.md), [qa-2025-12-17-v2.md](qa-2025-12-17-v2.md), and [qa-2025-12-18.md](qa-2025-12-18.md) for detailed audit reports.
+See [qa-2025-12-20.md](qa-2025-12-20.md) for latest audit report.
 
 ---
 
@@ -560,40 +623,39 @@ See [qa-2025-12-10.md](qa-2025-12-10.md), [qa-2025-12-10-v2.md](qa-2025-12-10-v2
 
 | Version | Date | Milestone |
 |---------|------|-----------|
-| 0.1.0 | 2025-12 | Phase 1 - Basic kernel boot |
-| 0.1.1 | 2025-12-09 | Security fixes (mmap, panic, fork) |
-| 0.1.2 | 2025-12-10 | Preemptive scheduling, COW safety |
-| 0.1.3 | 2025-12-10 | BootInfo integration, TSS/GDT setup |
-| 0.1.4 | 2025-12-10 | User pointer safety, context switch fix |
-| 0.1.5 | 2025-12-10 | Scheduler IRQ safety, mmap rollback fix |
-| 0.1.6 | 2025-12-11 | Full context switch with CR3, address space isolation |
-| 0.1.7 | 2025-12-11 | sys_wait, exec args, 7 security fixes (C-19, C-20, H-22, H-23, M-13, M-14) |
-| 0.2.0 | 2025-12-10 | Phase 2 - Process isolation (COMPLETE) |
-| 0.3.0 | 2025-12-11 | Phase 3 - Multi-process support (COMPLETE) |
-| 0.3.1 | 2025-12-11 | Phase 4 IPC - Pipes, Futex, Signal handling |
-| 0.4.0 | 2025-12-15 | Phase 5 VFS - ramfs, devfs, DAC permissions |
-| 0.4.1 | 2025-12-16 | Security hardening - W^X enforcement, readdir perms |
-| 0.4.2 | 2025-12-16 | Boot-time W^X validation - 0 violations achieved |
-| 0.4.3 | 2025-12-16 | Security Audit subsystem - hash-chained syscall logging |
-| 0.4.4 | 2025-12-17 | Security fixes - DoS (X-2), mount perms (X-4), IPC cleanup (X-6), TLB flush (X-7) |
-| 0.5.0 | 2025-12-17 | Phase 6 foundation - SYSCALL/SYSRET, Ring 3 transition, enter_usermode |
-| 0.5.1 | 2025-12-17 | Ring 3 security hardening - SYSRET canonical checks, SFMASK, DR clearing, RFLAGS sanitization |
-| 0.5.2 | 2025-12-18 | Critical security fixes - RNG entropy (Z-6), kernel stack allocation (Z-7) |
-| 0.5.3 | 2025-12-18 | HIGH priority fixes - usercopy (Z-3), callback validation (Z-4), signal perms (Z-9), pipe wakeup (Z-11) |
-| 0.5.4 | 2025-12-18 | Complete Round 22 - FPU/SIMD (Z-1), stack align (Z-2), context switch (Z-5), fork COW (Z-8), ELF rollback (Z-10) |
-| 0.6.0 | 2025-12-20 | Phase 6.2 Thread support - Clone syscall with CLONE_VM/CLONE_THREAD, TLS inheritance fix (T-1) |
+| 0.1.x | 2025-12-09/10 | Phase 1-2: Boot, memory, security fixes |
+| 0.2.0 | 2025-12-10 | Phase 2: Process isolation |
+| 0.3.x | 2025-12-11 | Phase 3-4: Multi-process, IPC |
+| 0.4.x | 2025-12-15/16 | Phase 5: VFS, security hardening |
+| 0.5.x | 2025-12-17/18 | Phase 6.1: Ring 3, SYSCALL/SYSRET |
+| **0.6.x** | **2025-12-20** | **Phase 6.2: Thread/Clone, security fixes** |
+| 0.7.0 | TBD | Phase A: Security foundation |
+| 0.8.0 | TBD | Phase B: Capability/MAC |
+| 0.9.0 | TBD | Phase C: Storage |
+| 0.10.0 | TBD | Phase D: Network |
+| 0.11.0 | TBD | Phase E: SMP |
 | 1.0.0 | TBD | First stable release |
 
 ---
 
 ## Contributing Guidelines
 
-1. All code changes require code review
-2. Run `make build` before committing
-3. New features need documentation updates
-4. Bug fixes should include regression tests
-5. Follow existing code style and patterns
+1. All code changes require security review for:
+   - Syscall implementations
+   - Memory management changes
+   - IPC/network code
+   - Capability checks
+
+2. Run `make build && make test` before committing
+
+3. Security-sensitive PRs require:
+   - Threat model documentation
+   - LSM hook integration
+   - Audit event emission
+   - Fuzz coverage
+
+4. Follow existing code patterns and Rust idioms
 
 ---
 
-*This roadmap is subject to change based on project priorities and community feedback.*
+*This roadmap reflects a security-first approach, prioritizing correctness and isolation over performance optimization. SMP support is intentionally deferred until the security framework is complete.*

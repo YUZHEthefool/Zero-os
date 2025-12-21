@@ -56,6 +56,31 @@ static STATS_PAGES_FLUSHED: AtomicU64 = AtomicU64::new(0);
 /// CRITICAL: This must remain false until IPI mechanism is complete
 static SMP_SHOOTDOWN_IMPLEMENTED: bool = false;
 
+/// R24-7 fix: Track number of online CPUs
+/// This counter must be incremented by the SMP bring-up code when each CPU comes online.
+/// Starts at 1 (BSP is always online).
+static ONLINE_CPU_COUNT: AtomicU64 = AtomicU64::new(1);
+
+/// Register a CPU as online.
+///
+/// This function MUST be called by the SMP bring-up code when each AP (Application Processor)
+/// is initialized. The BSP (Boot Strap Processor) is already counted (initial value is 1).
+///
+/// # Safety
+///
+/// This function is safe to call from any context, but should only be called once per CPU
+/// during SMP initialization.
+pub fn register_cpu_online() {
+    ONLINE_CPU_COUNT.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Get the number of online CPUs.
+///
+/// Returns the current count of online CPUs. Useful for debugging and SMP validation.
+pub fn online_cpu_count() -> u64 {
+    ONLINE_CPU_COUNT.load(Ordering::SeqCst)
+}
+
 /// Assert that we're in single-core mode.
 ///
 /// This function should be called at boot time or before any TLB shootdown
@@ -64,8 +89,27 @@ static SMP_SHOOTDOWN_IMPLEMENTED: bool = false;
 /// # Panics
 ///
 /// Panics if multiple CPUs are online but SMP shootdown is not implemented.
+///
+/// # R24-7 Fix
+///
+/// Now checks both `ONLINE_CPU_COUNT` and current CPU ID. This prevents the case where
+/// SMP is enabled but the guard only checks cpu_id (which would pass on BSP even with
+/// multiple CPUs online).
 #[inline]
 fn assert_single_core_mode() {
+    // R24-7 fix: Check online CPU count first
+    // This catches the case where we're on BSP but APs have been brought online
+    let cpu_count = ONLINE_CPU_COUNT.load(Ordering::SeqCst);
+    if cpu_count > 1 && !SMP_SHOOTDOWN_IMPLEMENTED {
+        panic!(
+            "TLB shootdown called with {} CPUs online but SMP support not implemented! \
+             This is a critical bug - stale TLB entries may cause memory corruption. \
+             Implement IPI-based shootdown or disable SMP.",
+            cpu_count
+        );
+    }
+
+    // Also check current CPU ID as a secondary guard
     // cpu_local::current_cpu_id() returns 0 in single-core mode
     // When SMP is enabled, this will return non-zero for secondary CPUs
     let cpu_id = cpu_local::current_cpu_id();

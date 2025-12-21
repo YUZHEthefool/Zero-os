@@ -65,6 +65,9 @@ pub struct FramebufferWriter {
     bg_color: u32,
     /// Whether framebuffer is initialized
     initialized: bool,
+    /// R24-8 fix: Validated framebuffer size in bytes
+    /// All pixel writes must stay within this bound
+    fb_size: usize,
 }
 
 impl FramebufferWriter {
@@ -83,11 +86,29 @@ impl FramebufferWriter {
             fg_color: FG_COLOR,
             bg_color: BG_COLOR,
             initialized: false,
+            fb_size: 0,
         }
     }
 
     /// Initialize with framebuffer info
     pub fn init(&mut self, info: &FramebufferInfo) {
+        // R24-8 fix: Validate framebuffer dimensions before using
+        // Check that stride * height (in bytes) doesn't exceed provided size
+        // stride is in pixels, so multiply by 4 for bytes
+        let stride_bytes = (info.stride as usize).saturating_mul(4);
+        let required_size = stride_bytes.saturating_mul(info.height as usize);
+
+        if info.size == 0 || required_size > info.size {
+            // Invalid framebuffer info - dimensions exceed buffer size
+            // Refuse to initialize to prevent out-of-bounds writes
+            return;
+        }
+
+        // Also validate that width fits within stride
+        if info.width > info.stride {
+            return;
+        }
+
         // Calculate virtual address for framebuffer
         //
         // The bootloader sets up identity mapping for 0-4GB, so we can access
@@ -124,6 +145,8 @@ impl FramebufferWriter {
         self.col = 0;
         self.row = 0;
         self.initialized = true;
+        // R24-8 fix: Store validated framebuffer size for bounds checking
+        self.fb_size = info.size;
 
         // Store framebuffer info for security module to access
         unsafe {
@@ -149,6 +172,13 @@ impl FramebufferWriter {
         }
 
         let offset = (y as u64 * self.stride as u64 + x as u64 * 4) as usize;
+
+        // R24-8 fix: Check that write stays within validated framebuffer bounds
+        // This prevents out-of-bounds writes if GOP info has incorrect stride
+        if offset.saturating_add(4) > self.fb_size {
+            return;
+        }
+
         let pixel_addr = self.fb_base + offset as u64;
 
         // Convert color based on pixel format
@@ -216,6 +246,10 @@ impl FramebufferWriter {
 
         // Fast fill: write entire framebuffer
         let total_bytes = self.height as usize * self.stride as usize;
+
+        // R24-8 fix: Clamp to validated framebuffer size
+        let safe_bytes = total_bytes.min(self.fb_size);
+
         let pixel_value = match self.pixel_format {
             PixelFormat::Bgr => {
                 let r = (self.bg_color >> 16) & 0xFF;
@@ -228,7 +262,7 @@ impl FramebufferWriter {
 
         // Fill 4 bytes at a time
         let ptr = self.fb_base as *mut u32;
-        let count = total_bytes / 4;
+        let count = safe_bytes / 4;
         for i in 0..count {
             unsafe {
                 ptr::write_volatile(ptr.add(i), pixel_value);
@@ -251,17 +285,37 @@ impl FramebufferWriter {
         let dst_start = self.fb_base;
         let copy_bytes = (self.max_row - 1) * line_bytes;
 
+        // R24-8 fix: Validate that operations stay within framebuffer bounds
+        let total_needed = (self.max_row * line_bytes).saturating_add(line_bytes);
+        if total_needed > self.fb_size {
+            // Framebuffer too small for scroll operation, skip
+            return;
+        }
+
         // Copy line by line to handle overlapping regions
         for row in 0..(self.max_row - 1) {
             let src = src_start + (row * line_bytes) as u64;
             let dst = dst_start + (row * line_bytes) as u64;
+
+            // R24-8 fix: Check bounds for each line copy
+            let dst_offset = (row * line_bytes) as usize;
+            let src_offset = dst_offset.saturating_add(line_bytes);
+            if src_offset.saturating_add(line_bytes) > self.fb_size {
+                break;
+            }
+
             unsafe {
                 ptr::copy(src as *const u8, dst as *mut u8, line_bytes);
             }
         }
 
         // Clear the last line
-        let last_line_start = self.fb_base + ((self.max_row - 1) * line_bytes) as u64;
+        let last_line_offset = (self.max_row - 1) * line_bytes;
+        if last_line_offset.saturating_add(line_bytes) > self.fb_size {
+            return;
+        }
+
+        let last_line_start = self.fb_base + last_line_offset as u64;
         let pixel_value = match self.pixel_format {
             PixelFormat::Bgr => {
                 let r = (self.bg_color >> 16) & 0xFF;

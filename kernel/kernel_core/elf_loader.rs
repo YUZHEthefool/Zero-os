@@ -162,6 +162,25 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
         brk_start
     );
 
+    // R24-9 fix: 验证入口点地址是 canonical 且在用户空间范围内
+    // 防止恶意 ELF 设置内核地址或非法地址导致 #GP 或代码执行到错误位置
+    let entry = elf.header.pt2.entry_point();
+    if entry < USER_BASE as u64 || entry >= USER_STACK_TOP {
+        println!(
+            "ELF loader: invalid entry point 0x{:x} (valid range: 0x{:x}-0x{:x})",
+            entry, USER_BASE, USER_STACK_TOP
+        );
+        rollback_all_mappings(&mut all_mappings);
+        return Err(ElfLoadError::SegmentOutOfRange);
+    }
+    // 验证 canonical（虽然上面的范围检查已经隐含了这一点，但显式检查更安全）
+    let sign_extended = ((entry as i64) >> 47) as u64;
+    if sign_extended != 0 && sign_extended != 0x1FFFF {
+        println!("ELF loader: non-canonical entry point 0x{:x}", entry);
+        rollback_all_mappings(&mut all_mappings);
+        return Err(ElfLoadError::SegmentOutOfRange);
+    }
+
     // 【修复】初始 RSP 必须在已映射的栈页内
     // 栈分配从 (USER_STACK_TOP - USER_STACK_SIZE) 到 USER_STACK_TOP
     // 但 USER_STACK_TOP 所在的页边界不在映射范围内

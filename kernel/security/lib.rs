@@ -33,6 +33,7 @@ extern crate alloc;
 #[macro_use]
 extern crate drivers;
 
+pub mod kaslr;
 pub mod kptr;
 pub mod memory_hardening;
 pub mod rng;
@@ -44,6 +45,10 @@ use mm::memory::FrameAllocator;
 use x86_64::VirtAddr;
 
 // Re-export public types
+pub use kaslr::{
+    get_kernel_layout, is_kaslr_enabled, is_kpti_enabled, KernelLayout, KptiContext,
+    TrampolineDesc, KERNEL_PHYS_BASE, KERNEL_VIRT_BASE,
+};
 pub use kptr::KptrGuard;
 pub use memory_hardening::{
     CleanupOutcome, HardeningError, IdentityCleanupStrategy, NxEnforcementSummary,

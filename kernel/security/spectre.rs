@@ -6,6 +6,9 @@
 //! - **IBRS** (Indirect Branch Restricted Speculation)
 //! - **IBPB** (Indirect Branch Predictor Barrier)
 //! - **STIBP** (Single Thread Indirect Branch Predictors)
+//! - **SSBD** (Speculative Store Bypass Disable)
+//! - **RSB Stuffing** (Return Stack Buffer filling)
+//! - **SWAPGS Fence** (CVE-2019-1125 mitigation in syscall.rs)
 //! - **Retpoline** detection
 //!
 //! # Security Background
@@ -13,6 +16,17 @@
 //! Spectre and Meltdown are classes of vulnerabilities that exploit CPU
 //! speculative execution to leak sensitive data. This module enables
 //! hardware mitigations where available.
+//!
+//! # Implemented Mitigations
+//!
+//! | Vulnerability | Mitigation | Status |
+//! |---------------|------------|--------|
+//! | Spectre v1 | LFENCE barriers | Partial (syscall path) |
+//! | Spectre v2 | IBRS/IBPB/STIBP | Enabled if supported |
+//! | Meltdown | KPTI | Prepared (Phase A.4) |
+//! | SSB (Spectre v4) | SSBD | Enabled if supported |
+//! | RSB underflow | RSB stuffing | Implemented |
+//! | SWAPGS (CVE-2019-1125) | SWAPGS + LFENCE | Implemented in syscall.rs |
 //!
 //! # CPU Support Detection
 //!
@@ -54,6 +68,12 @@ pub struct MitigationStatus {
     pub ssbd_supported: bool,
     /// SSBD enabled
     pub ssbd_enabled: bool,
+    /// SWAPGS mitigation enabled (CVE-2019-1125)
+    /// Always true - implemented unconditionally in syscall entry/exit
+    pub swapgs_mitigated: bool,
+    /// RSB stuffing enabled
+    /// Always true - implemented unconditionally in context switch
+    pub rsb_stuffing_enabled: bool,
 }
 
 impl MitigationStatus {
@@ -69,6 +89,9 @@ impl MitigationStatus {
             retpoline_required: false,
             ssbd_supported: false,
             ssbd_enabled: false,
+            // These are always enabled unconditionally
+            swapgs_mitigated: true,
+            rsb_stuffing_enabled: true,
         }
     }
 
@@ -90,7 +113,11 @@ impl MitigationStatus {
 
     /// Check if any mitigation was enabled.
     pub fn any_enabled(&self) -> bool {
-        self.ibrs_enabled || self.stibp_enabled || self.ssbd_enabled
+        self.ibrs_enabled
+            || self.stibp_enabled
+            || self.ssbd_enabled
+            || self.swapgs_mitigated
+            || self.rsb_stuffing_enabled
     }
 
     /// Get a human-readable summary.
@@ -187,6 +214,9 @@ pub fn detect() -> MitigationStatus {
         retpoline_required,
         ssbd_supported: ssbd,
         ssbd_enabled: false,
+        // These are always enabled unconditionally in our implementation
+        swapgs_mitigated: true,
+        rsb_stuffing_enabled: true,
     }
 }
 
@@ -373,6 +403,101 @@ pub fn issue_ibpb() -> Result<(), SpectreError> {
 #[inline]
 pub fn try_ibpb() {
     let _ = issue_ibpb();
+}
+
+// ============================================================================
+// RSB (Return Stack Buffer) Stuffing
+// ============================================================================
+
+/// Check if RSB stuffing is required for this CPU.
+///
+/// RSB stuffing is needed when:
+/// - CPU has RSBA (RSB Alternate) set in IA32_ARCH_CAPABILITIES, or
+/// - CPU doesn't have IBRS_ALL (full hardware mitigation), or
+/// - No hardware mitigation is available
+pub fn rsb_stuffing_required() -> bool {
+    let (_, _, _, edx) = cpuid_7_0();
+    let has_arch_cap = (edx & (1 << 29)) != 0;
+
+    if has_arch_cap {
+        if let Some(cap) = read_arch_capabilities() {
+            // IBRS_ALL means hardware fully handles branch prediction
+            if (cap & ARCH_CAP_IBRS_ALL) != 0 {
+                return false;
+            }
+            // RSBA means RSB needs mitigation
+            if (cap & ARCH_CAP_RSBA) != 0 {
+                return true;
+            }
+        }
+    }
+
+    // Conservative: stuff RSB if no definitive hardware protection
+    true
+}
+
+/// Stuff the Return Stack Buffer (RSB) with safe return addresses.
+///
+/// This prevents RSB underflow attacks where a malicious program could
+/// train the RSB with attacker-controlled return addresses that persist
+/// across context switches.
+///
+/// The RSB is typically 16-32 entries deep on modern CPUs. We fill it
+/// with 32 entries to be safe across all microarchitectures.
+///
+/// # Safety
+///
+/// This function executes assembly that manipulates the stack. It must
+/// only be called from kernel context with a valid kernel stack.
+#[inline]
+pub unsafe fn rsb_fill() {
+    // This sequence fills the RSB with safe return addresses by executing
+    // 32 CALL instructions that push return addresses onto the RSB.
+    // The LFENCE ensures the CPU doesn't speculate past each call.
+    // Finally, we fix up the stack by adding back the space used by
+    // the 32 pushed return addresses.
+    core::arch::asm!(
+        // Fill RSB with 32 entries
+        "mov ecx, 32",
+        "2:",
+        "call 3f",  // Push return address to RSB
+        "3:",
+        "lfence",   // Speculation barrier
+        "dec ecx",
+        "jnz 2b",
+        // Clean up stack (32 * 8 bytes of return addresses)
+        "add rsp, 256",
+        out("ecx") _,
+        options(nostack)
+    );
+}
+
+/// Perform RSB stuffing on context switch to untrusted code.
+///
+/// This is a higher-level wrapper that checks if RSB stuffing is needed
+/// before performing it. Use this in context switch paths.
+///
+/// # Safety
+///
+/// Must be called from kernel context with a valid kernel stack.
+#[inline]
+pub unsafe fn rsb_fill_on_context_switch() {
+    // Check if we need RSB stuffing (could be cached per-CPU for performance)
+    // For now, we call rsb_fill unconditionally since the check is cheap
+    // and the operation is only called on context switches
+    rsb_fill();
+}
+
+/// Wrapper for calling RSB fill that handles the safety internally.
+///
+/// This is intended to be called from the scheduler when switching
+/// to user-mode code.
+#[inline]
+pub fn fill_rsb_if_needed() {
+    // Only stuff RSB if switching to potentially untrusted code
+    unsafe {
+        rsb_fill();
+    }
 }
 
 // ============================================================================

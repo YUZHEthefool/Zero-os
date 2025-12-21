@@ -60,6 +60,15 @@ pub use syscall::{
     wake_stdin_waiters, SyscallError, SyscallFrame, VfsStat,
 };
 pub use time::{current_timestamp_ms, get_ticks, on_timer_tick};
+pub use usercopy::{
+    // Type-safe user pointer API (A.1 Security Hardening)
+    copy_from_user, copy_from_user_slice, copy_to_user, copy_to_user_slice, strncpy_from_user,
+    UsercopyError, UserPtr, UserSlice,
+    // Legacy API (for backward compatibility)
+    copy_from_user_safe, copy_to_user_safe, copy_user_cstring, is_in_usercopy,
+    set_usercopy_fault, try_handle_usercopy_fault, UserAccessGuard, MAX_CSTRING_LEN,
+    USER_SPACE_TOP,
+};
 
 pub fn init() {
     process::init(); // 必须最先初始化，确保 BOOT_CR3 被缓存

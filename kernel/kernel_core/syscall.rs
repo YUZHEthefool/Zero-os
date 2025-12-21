@@ -929,12 +929,13 @@ fn sys_clone(
         | CLONE_CHILD_SETTID;
 
     // 检查不支持的 flags
+    // 返回 EINVAL 而不是 ENOSYS，因为这是参数验证失败而非功能未实现
     if flags & !supported_flags != 0 {
         println!(
             "sys_clone: unsupported flags 0x{:x}",
             flags & !supported_flags
         );
-        return Err(SyscallError::ENOSYS);
+        return Err(SyscallError::EINVAL);
     }
 
     // CLONE_THREAD 要求必须同时设置 CLONE_VM 和 CLONE_SIGHAND
@@ -1142,7 +1143,21 @@ fn sys_clone(
         );
 
         // 设置 TLS
+        // R24-2 fix: 验证 TLS 基址是 canonical 且在用户空间范围内
+        // 避免非法地址导致后续 WRMSR 时 #GP 内核崩溃
         if flags & CLONE_SETTLS != 0 {
+            if !is_canonical(tls) || tls >= USER_SPACE_TOP as u64 {
+                // 非法 TLS 地址：先释放child锁再清理，避免死锁
+                // 标记进程为终止状态并清零共享地址空间引用
+                child.state = ProcessState::Terminated;
+                child.memory_space = 0; // 不释放共享地址空间
+                drop(child);
+                // 通过cleanup_zombie安全地从进程表移除
+                // 但由于子进程还未设置为Zombie状态，我们直接使用terminate
+                // 注意：此时子进程未被调度，terminate_process安全
+                crate::process::terminate_process(child_pid, -1);
+                return Err(SyscallError::EINVAL);
+            }
             child.fs_base = tls;
         } else {
             child.fs_base = parent_fs_base;
@@ -2034,6 +2049,8 @@ const IOV_MAX: usize = 1024;
 /// # Returns
 /// 成功返回写入的总字节数，失败返回错误码
 fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
+    use crate::usercopy::{copy_from_user_safe, UserAccessGuard};
+
     // 验证 iovcnt
     if iovcnt == 0 {
         return Ok(0);
@@ -2049,12 +2066,25 @@ fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
     let iov_size = iovcnt * mem::size_of::<Iovec>();
     validate_user_ptr(iov as *const u8, iov_size)?;
 
-    // 复制 iovec 数组到内核
+    // R24-11 fix: Copy iovec array using fault-tolerant usercopy
+    // This prevents kernel panic if user unmaps iovec during copy
     let mut iov_array: Vec<Iovec> = Vec::with_capacity(iovcnt);
-    unsafe {
+    {
+        let _guard = UserAccessGuard::new();
         for i in 0..iovcnt {
-            let iov_ptr = iov.add(i);
-            let iov_entry = core::ptr::read_volatile(iov_ptr);
+            // Calculate offset for this iovec entry
+            let entry_offset = i * mem::size_of::<Iovec>();
+            let entry_ptr = (iov as usize + entry_offset) as *const u8;
+
+            // Use fault-tolerant copy for each iovec entry
+            let mut entry_bytes = [0u8; mem::size_of::<Iovec>()];
+            if copy_from_user_safe(&mut entry_bytes, entry_ptr).is_err() {
+                return Err(SyscallError::EFAULT);
+            }
+
+            // Safely transmute bytes to Iovec
+            // SAFETY: Iovec is repr(C) and all byte patterns are valid
+            let iov_entry: Iovec = unsafe { core::ptr::read(entry_bytes.as_ptr() as *const Iovec) };
             iov_array.push(iov_entry);
         }
     }
@@ -2827,16 +2857,21 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     }
 
     // 构建页表标志
-    let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-    if prot & PROT_WRITE != 0 {
-        flags |= PageTableFlags::WRITABLE;
-    }
-    if prot & PROT_EXEC == 0 {
-        // 如果没有 EXEC 权限，设置 NX 位
-        flags |= PageTableFlags::NO_EXECUTE;
-    }
-    // PROT_NONE 意味着不可访问，但页仍然存在
-    // 我们通过移除 PRESENT 标志来实现（简化实现）
+    // R24-4 fix: PROT_NONE 需要清除 PRESENT 标志，使页面不可访问
+    let flags = if prot == PROT_NONE {
+        // 不可访问：清除 PRESENT，页存在但任何访问都会触发 #PF
+        PageTableFlags::empty()
+    } else {
+        let mut f = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        if prot & PROT_WRITE != 0 {
+            f |= PageTableFlags::WRITABLE;
+        }
+        if prot & PROT_EXEC == 0 {
+            // 如果没有 EXEC 权限，设置 NX 位
+            f |= PageTableFlags::NO_EXECUTE;
+        }
+        f
+    };
 
     // 更新页表项
     let result: Result<(), SyscallError> = unsafe {

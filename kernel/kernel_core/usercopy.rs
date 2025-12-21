@@ -16,6 +16,18 @@
 //! RIP to skip the faulting instruction. Instead, the process is terminated
 //! gracefully with EFAULT semantics.
 //!
+//! # Type-Safe API (A.1 Security Hardening)
+//!
+//! This module provides type-safe user pointer wrappers:
+//! - `UserPtr<T>`: Single object pointer with alignment validation
+//! - `UserSlice<T>`: Slice pointer with bounds and alignment validation
+//!
+//! These wrappers enforce:
+//! - Non-null pointers
+//! - User-space address range validation
+//! - Type alignment requirements
+//! - Overflow-safe arithmetic
+//!
 //! # SMAP Guard Nesting (S-5 fix)
 //!
 //! UserAccessGuard supports nesting via a depth counter. Only the outermost
@@ -33,6 +45,8 @@
 //! This ensures correct behavior in SMP environments where multiple CPUs may
 //! be performing user copies concurrently.
 
+use core::marker::PhantomData;
+use core::mem::{align_of, size_of};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use cpu_local::{current_cpu_id, CpuLocal};
 use x86_64::registers::control::{Cr4, Cr4Flags};
@@ -269,19 +283,65 @@ impl Drop for UserCopyGuard {
     }
 }
 
-/// User space address boundary
-const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
+/// User space address boundary (canonical lower half on x86_64)
+pub const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
+
+/// Check if a pointer is properly aligned for type T
+#[inline]
+fn is_aligned(ptr: usize, align: usize) -> bool {
+    // Alignment must be power of 2; 0 or 1 means no alignment requirement
+    if align <= 1 {
+        return true;
+    }
+    debug_assert!(align.is_power_of_two(), "alignment must be power of two");
+    ptr & (align - 1) == 0
+}
 
 /// Validate that an address range is in user space
+///
+/// # Arguments
+/// * `ptr` - Starting address
+/// * `len` - Length in bytes
+///
+/// # Returns
+/// * `true` if the range [ptr, ptr+len) is entirely in user space
+/// * `false` if null, in kernel space, or would overflow
+///
+/// # Zero Length Handling
+///
+/// When `len == 0`, returns `true` if `ptr` is a valid non-null user-space
+/// address. This allows validation of pointer-only operations where no
+/// actual memory access will occur.
 #[inline]
 fn validate_user_range(ptr: usize, len: usize) -> bool {
-    if ptr == 0 || len == 0 {
+    // Null pointer is always invalid
+    if ptr == 0 {
         return false;
     }
+    // Pointer must be in user space (below canonical hole)
+    if ptr >= USER_SPACE_TOP {
+        return false;
+    }
+    // Zero-length is valid if pointer itself is in user space
+    // This enables pointer validation without actual access
+    if len == 0 {
+        return true;
+    }
+    // Check for overflow and ensure end is within user space
+    // Note: end is exclusive, and USER_SPACE_TOP marks the start of
+    // the canonical hole, so end must be strictly less than USER_SPACE_TOP
     match ptr.checked_add(len) {
-        Some(end) => end < USER_SPACE_TOP, // Strict less-than
+        Some(end) => end < USER_SPACE_TOP, // Strict less-than (exclusive end)
         None => false,
     }
+}
+
+/// Validate that an address range is in user space with alignment check
+///
+/// Like `validate_user_range` but also checks alignment requirements.
+#[inline]
+fn validate_user_range_aligned(ptr: usize, len: usize, align: usize) -> bool {
+    validate_user_range(ptr, len) && is_aligned(ptr, align)
 }
 
 /// Fault-tolerant copy from user space to kernel buffer
@@ -527,4 +587,471 @@ pub fn copy_user_cstring(src: *const u8) -> Result<alloc::vec::Vec<u8>, ()> {
 
     // String too long (no NUL found within MAX_CSTRING_LEN)
     Err(())
+}
+
+// ============================================================================
+// Type-Safe User Pointer API (A.1 Security Hardening)
+// ============================================================================
+
+/// Error type for usercopy operations
+///
+/// This is a simple unit error type. Callers should convert to appropriate
+/// syscall error codes (typically EFAULT) at the syscall boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsercopyError;
+
+/// Type-safe wrapper for a single user-space object pointer
+///
+/// `UserPtr<T>` enforces:
+/// - Non-null pointer
+/// - Address within user space bounds
+/// - Proper alignment for type T
+/// - T must be Copy (safe to bitwise copy)
+///
+/// # Example
+///
+/// ```ignore
+/// // In syscall handler:
+/// let user_ptr = UserPtr::<u64>::new(arg as *mut u64)?;
+/// let mut value: u64 = 0;
+/// copy_from_user(&mut value, user_ptr)?;
+/// ```
+///
+/// # Security
+///
+/// This type prevents common user pointer bugs:
+/// - Null pointer dereference (validated at construction)
+/// - Kernel pointer confusion (must be below USER_SPACE_TOP)
+/// - Alignment violations (checked against align_of::<T>())
+/// - Type confusion (enforced by generic parameter)
+#[derive(Debug)]
+pub struct UserPtr<T: Copy> {
+    ptr: *mut T,
+    _marker: PhantomData<T>,
+}
+
+// SAFETY: UserPtr only holds a user-space address, not actual data.
+// The pointer is validated to be in user space at construction.
+// Sending the address between threads is safe; actual access requires
+// proper synchronization through the copy functions.
+unsafe impl<T: Copy> Send for UserPtr<T> {}
+unsafe impl<T: Copy> Sync for UserPtr<T> {}
+
+impl<T: Copy> Clone for UserPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: Copy> Copy for UserPtr<T> {}
+
+impl<T: Copy> UserPtr<T> {
+    /// Create a new UserPtr from a mutable raw pointer
+    ///
+    /// Validates that the pointer is:
+    /// - Non-null
+    /// - Within user space address range
+    /// - Properly aligned for type T
+    /// - Has room for size_of::<T>() bytes
+    ///
+    /// # Errors
+    ///
+    /// Returns `UsercopyError` if validation fails.
+    pub fn new(ptr: *mut T) -> Result<Self, UsercopyError> {
+        if ptr.is_null() {
+            return Err(UsercopyError);
+        }
+
+        let addr = ptr as usize;
+        let size = size_of::<T>();
+        let align = align_of::<T>();
+
+        // Validate address range and alignment
+        // For ZSTs (size == 0), we still validate the pointer is in user space
+        if !validate_user_range_aligned(addr, size, align) {
+            return Err(UsercopyError);
+        }
+
+        Ok(Self {
+            ptr,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Create a UserPtr from a const raw pointer (read-only access)
+    ///
+    /// This is useful when you only need to read from user space.
+    /// The internal representation is mutable for API uniformity,
+    /// but the source being const signals read-only intent.
+    pub fn from_const(ptr: *const T) -> Result<Self, UsercopyError> {
+        Self::new(ptr as *mut T)
+    }
+
+    /// Get the underlying pointer as const
+    #[inline]
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr as *const T
+    }
+
+    /// Get the underlying pointer as mutable
+    #[inline]
+    pub fn as_mut_ptr(&self) -> *mut T {
+        self.ptr
+    }
+
+    /// Get the address as usize
+    #[inline]
+    pub fn addr(&self) -> usize {
+        self.ptr as usize
+    }
+
+    /// Offset the pointer by a given number of elements
+    ///
+    /// Returns `UsercopyError` if the result would overflow or
+    /// exceed user space bounds.
+    pub fn offset(&self, count: isize) -> Result<Self, UsercopyError> {
+        let elem_size = size_of::<T>();
+        let offset_bytes = (count as isize).checked_mul(elem_size as isize)
+            .ok_or(UsercopyError)?;
+
+        let new_addr = if offset_bytes >= 0 {
+            self.addr().checked_add(offset_bytes as usize)
+        } else {
+            self.addr().checked_sub((-offset_bytes) as usize)
+        }.ok_or(UsercopyError)?;
+
+        Self::new(new_addr as *mut T)
+    }
+}
+
+/// Type-safe wrapper for a user-space slice pointer
+///
+/// `UserSlice<T>` enforces:
+/// - Non-null base pointer
+/// - Base address within user space bounds
+/// - Proper alignment for type T
+/// - Total byte count doesn't overflow
+/// - Entire range is within user space
+///
+/// # Example
+///
+/// ```ignore
+/// // In syscall handler:
+/// let user_buf = UserSlice::<u8>::new(buf as *mut u8, len)?;
+/// let mut kernel_buf = vec![0u8; len];
+/// let copied = copy_from_user_slice(&mut kernel_buf, user_buf)?;
+/// ```
+#[derive(Debug)]
+pub struct UserSlice<T: Copy> {
+    ptr: *mut T,
+    len: usize,
+    _marker: PhantomData<T>,
+}
+
+unsafe impl<T: Copy> Send for UserSlice<T> {}
+unsafe impl<T: Copy> Sync for UserSlice<T> {}
+
+impl<T: Copy> Clone for UserSlice<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: Copy> Copy for UserSlice<T> {}
+
+impl<T: Copy> UserSlice<T> {
+    /// Create a new UserSlice from a raw pointer and element count
+    ///
+    /// Validates that:
+    /// - Base pointer is non-null
+    /// - Base is within user space and properly aligned
+    /// - Total byte size (len * size_of::<T>()) doesn't overflow
+    /// - Entire range [ptr, ptr + len*sizeof(T)) is in user space
+    ///
+    /// # Arguments
+    /// * `ptr` - Base pointer to the slice
+    /// * `len` - Number of elements (not bytes)
+    ///
+    /// # Errors
+    ///
+    /// Returns `UsercopyError` if validation fails.
+    pub fn new(ptr: *mut T, len: usize) -> Result<Self, UsercopyError> {
+        if ptr.is_null() {
+            return Err(UsercopyError);
+        }
+
+        let addr = ptr as usize;
+        let elem_size = size_of::<T>();
+        let align = align_of::<T>();
+
+        // Calculate total byte size, checking for overflow
+        let byte_len = elem_size.checked_mul(len).ok_or(UsercopyError)?;
+
+        // Validate the entire range
+        if !validate_user_range_aligned(addr, byte_len, align) {
+            return Err(UsercopyError);
+        }
+
+        Ok(Self {
+            ptr,
+            len,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Create a UserSlice from const pointers (read-only access)
+    pub fn from_const(ptr: *const T, len: usize) -> Result<Self, UsercopyError> {
+        Self::new(ptr as *mut T, len)
+    }
+
+    /// Get the number of elements
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Check if the slice is empty
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Get the total byte size
+    ///
+    /// This is guaranteed not to overflow because the constructor validates
+    /// that `len * size_of::<T>()` fits within user space bounds.
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        // Use saturating_mul as defense-in-depth, though the constructor
+        // already validated this won't overflow
+        self.len.saturating_mul(size_of::<T>())
+    }
+
+    /// Get the base pointer as const
+    #[inline]
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr as *const T
+    }
+
+    /// Get the base pointer as mutable
+    #[inline]
+    pub fn as_mut_ptr(&self) -> *mut T {
+        self.ptr
+    }
+
+    /// Get the base address as usize
+    #[inline]
+    pub fn addr(&self) -> usize {
+        self.ptr as usize
+    }
+}
+
+// ============================================================================
+// Generic Copy Functions
+// ============================================================================
+
+/// Copy a single typed value from user space
+///
+/// # Type Safety
+///
+/// The `UserPtr<T>` wrapper ensures:
+/// - The pointer is properly aligned for T
+/// - The pointer is in user space
+/// - There is room for size_of::<T>() bytes
+///
+/// # Arguments
+/// * `dst` - Destination kernel buffer
+/// * `src` - Source user space pointer (validated)
+///
+/// # Errors
+///
+/// Returns `UsercopyError` if:
+/// - A page fault occurs during the copy
+/// - The user memory is not mapped or readable
+pub fn copy_from_user<T: Copy>(dst: &mut T, src: UserPtr<T>) -> Result<(), UsercopyError> {
+    let size = size_of::<T>();
+    if size == 0 {
+        // ZST: nothing to copy
+        return Ok(());
+    }
+
+    // SAFETY: dst is a valid kernel reference, size matches T
+    let dst_bytes = unsafe {
+        core::slice::from_raw_parts_mut(dst as *mut T as *mut u8, size)
+    };
+
+    copy_from_user_safe(dst_bytes, src.as_ptr() as *const u8)
+        .map_err(|_| UsercopyError)
+}
+
+/// Copy a single typed value to user space
+///
+/// # Type Safety
+///
+/// The `UserPtr<T>` wrapper ensures:
+/// - The pointer is properly aligned for T
+/// - The pointer is in user space
+/// - There is room for size_of::<T>() bytes
+///
+/// # Arguments
+/// * `dst` - Destination user space pointer (validated)
+/// * `src` - Source kernel value
+///
+/// # Errors
+///
+/// Returns `UsercopyError` if:
+/// - A page fault occurs during the copy
+/// - The user memory is not mapped or writable
+/// - COW page could not be resolved
+pub fn copy_to_user<T: Copy>(dst: UserPtr<T>, src: &T) -> Result<(), UsercopyError> {
+    let size = size_of::<T>();
+    if size == 0 {
+        // ZST: nothing to copy
+        return Ok(());
+    }
+
+    // SAFETY: src is a valid kernel reference, size matches T
+    let src_bytes = unsafe {
+        core::slice::from_raw_parts(src as *const T as *const u8, size)
+    };
+
+    copy_to_user_safe(dst.as_mut_ptr() as *mut u8, src_bytes)
+        .map_err(|_| UsercopyError)
+}
+
+/// Copy bytes from user space slice to kernel buffer
+///
+/// Copies up to `min(dst.len(), src.len())` bytes.
+///
+/// # Arguments
+/// * `dst` - Destination kernel buffer
+/// * `src` - Source user space slice (validated)
+///
+/// # Returns
+/// * `Ok(n)` - Number of bytes successfully copied
+/// * `Err(UsercopyError)` - Copy failed (page fault, unmapped, etc.)
+pub fn copy_from_user_slice(dst: &mut [u8], src: UserSlice<u8>) -> Result<usize, UsercopyError> {
+    if dst.is_empty() || src.is_empty() {
+        return Ok(0);
+    }
+
+    let to_copy = dst.len().min(src.len());
+
+    copy_from_user_safe(&mut dst[..to_copy], src.as_ptr() as *const u8)
+        .map(|_| to_copy)
+        .map_err(|_| UsercopyError)
+}
+
+/// Copy bytes from kernel buffer to user space slice
+///
+/// Copies up to `min(dst.len(), src.len())` bytes.
+///
+/// # Arguments
+/// * `dst` - Destination user space slice (validated)
+/// * `src` - Source kernel buffer
+///
+/// # Returns
+/// * `Ok(n)` - Number of bytes successfully copied
+/// * `Err(UsercopyError)` - Copy failed (page fault, unmapped, etc.)
+pub fn copy_to_user_slice(dst: UserSlice<u8>, src: &[u8]) -> Result<usize, UsercopyError> {
+    if dst.is_empty() || src.is_empty() {
+        return Ok(0);
+    }
+
+    let to_copy = dst.len().min(src.len());
+
+    copy_to_user_safe(dst.as_mut_ptr() as *mut u8, &src[..to_copy])
+        .map(|_| to_copy)
+        .map_err(|_| UsercopyError)
+}
+
+/// Copy a NUL-terminated string from user space into a fixed-size kernel buffer
+///
+/// Unlike `copy_user_cstring`, this function:
+/// - Copies into a caller-provided buffer (no heap allocation)
+/// - Returns the number of bytes copied (excluding NUL)
+/// - Writes NUL terminator to dst if found within bounds
+///
+/// # Arguments
+/// * `dst` - Destination kernel buffer
+/// * `src` - Source user space pointer to start of string
+///
+/// # Returns
+/// * `Ok(n)` - `n` bytes copied (excluding NUL); dst[n] == 0 if NUL was found
+/// * `Err(UsercopyError)` - Page fault or other error
+///
+/// # Behavior
+///
+/// - Copies at most `min(dst.len() - 1, MAX_CSTRING_LEN)` bytes (DoS protection)
+/// - If NUL is found within the limit, dst is NUL-terminated
+/// - If NUL is not found, all copied bytes are in dst without NUL
+///   (caller should check if result == max_copy)
+///
+/// # Security
+///
+/// This function is safe against:
+/// - TOCTOU attacks (fault-tolerant byte-by-byte copy)
+/// - Buffer overflow (bounded by dst.len())
+/// - DoS attacks (bounded by MAX_CSTRING_LEN)
+/// - Kernel pointer confusion (UserPtr validation)
+pub fn strncpy_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<usize, UsercopyError> {
+    if dst.is_empty() {
+        return Ok(0);
+    }
+
+    // Reserve space for NUL and cap at MAX_CSTRING_LEN to prevent DoS
+    let max_copy = dst.len().saturating_sub(1).min(MAX_CSTRING_LEN);
+    if max_copy == 0 {
+        dst[0] = 0;
+        return Ok(0);
+    }
+
+    let start_addr = src.addr();
+
+    // Allow supervisor access to user pages when SMAP is enabled
+    let _smap_guard = UserAccessGuard::new();
+
+    // Set up copy state for fault tracking
+    let _guard = UserCopyGuard::new(start_addr, max_copy);
+    USER_COPY_STATE.with(|s| s.remaining.store(max_copy, Ordering::SeqCst));
+
+    let mut copied = 0usize;
+
+    for i in 0..max_copy {
+        // Check for fault from previous iteration
+        if check_and_clear_fault() {
+            return Err(UsercopyError);
+        }
+
+        // Calculate byte address with overflow check
+        let byte_addr = match start_addr.checked_add(i) {
+            Some(addr) if addr < USER_SPACE_TOP => addr,
+            _ => return Err(UsercopyError),
+        };
+
+        // Read one byte from user space
+        let byte = unsafe { core::ptr::read_volatile(byte_addr as *const u8) };
+
+        // Check for fault after read
+        if check_and_clear_fault() {
+            return Err(UsercopyError);
+        }
+
+        // NUL terminator found
+        if byte == 0 {
+            dst[i] = 0; // Write NUL to destination
+            return Ok(copied);
+        }
+
+        dst[i] = byte;
+        copied += 1;
+
+        USER_COPY_STATE.with(|s| {
+            s.remaining.store(max_copy.saturating_sub(i + 1), Ordering::SeqCst)
+        });
+    }
+
+    // Reached max_copy without finding NUL
+    // Do NOT write NUL - caller should check if returned == max_copy
+    Ok(copied)
 }
