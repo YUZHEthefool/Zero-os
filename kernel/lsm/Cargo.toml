@@ -1,0 +1,22 @@
+[package]
+name = "lsm"
+version = "0.1.0"
+edition = "2021"
+description = "Linux Security Module (LSM) hook infrastructure for Zero-OS"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+spin = "0.9"
+
+# Cross-crate dependencies
+cap = { path = "../cap" }
+kernel_core = { path = "../kernel_core" }
+vfs = { path = "../vfs" }
+audit = { path = "../audit" }
+
+[features]
+default = []
+# Enable LSM policy enforcement (otherwise all hooks are no-ops)
+lsm = []

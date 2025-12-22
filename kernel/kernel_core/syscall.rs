@@ -23,8 +23,83 @@ use x86_64::VirtAddr;
 // Audit integration for syscall security monitoring
 use audit::{AuditKind, AuditObject, AuditOutcome, AuditSubject};
 
+// Seccomp/Pledge syscall filtering
+extern crate seccomp;
+
 /// 最大参数数量（防止恶意用户传递过多参数）
 const MAX_ARG_COUNT: usize = 256;
+
+// ============================================================================
+// Seccomp/Prctl Constants (Linux x86_64 ABI)
+// ============================================================================
+
+/// Seccomp operation modes
+const SECCOMP_SET_MODE_STRICT: u32 = 0;
+const SECCOMP_SET_MODE_FILTER: u32 = 1;
+
+/// Seccomp mode return values for prctl(PR_GET_SECCOMP)
+const SECCOMP_MODE_DISABLED: usize = 0;
+const SECCOMP_MODE_STRICT: usize = 1;
+const SECCOMP_MODE_FILTER: usize = 2;
+
+/// prctl option codes for seccomp operations
+const PR_GET_SECCOMP: i32 = 21;
+const PR_SET_SECCOMP: i32 = 22;
+const PR_SET_NO_NEW_PRIVS: i32 = 38;
+const PR_GET_NO_NEW_PRIVS: i32 = 39;
+
+/// User-space BPF instruction opcodes (simplified encoding)
+/// These define the wire format for filters passed from userspace
+const SECCOMP_USER_OP_LD_NR: u8 = 0;
+const SECCOMP_USER_OP_LD_ARG: u8 = 1;
+const SECCOMP_USER_OP_LD_CONST: u8 = 2;
+const SECCOMP_USER_OP_AND: u8 = 3;
+const SECCOMP_USER_OP_OR: u8 = 4;
+const SECCOMP_USER_OP_SHR: u8 = 5;
+const SECCOMP_USER_OP_JMP_EQ: u8 = 6;
+const SECCOMP_USER_OP_JMP_NE: u8 = 7;
+const SECCOMP_USER_OP_JMP_LT: u8 = 8;
+const SECCOMP_USER_OP_JMP_LE: u8 = 9;
+const SECCOMP_USER_OP_JMP_GT: u8 = 10;
+const SECCOMP_USER_OP_JMP_GE: u8 = 11;
+const SECCOMP_USER_OP_JMP: u8 = 12;
+const SECCOMP_USER_OP_RET: u8 = 13;
+
+/// Seccomp action codes for RET instruction
+const SECCOMP_USER_ACTION_ALLOW: u32 = 0;
+const SECCOMP_USER_ACTION_LOG: u32 = 1;
+const SECCOMP_USER_ACTION_ERRNO: u32 = 2;
+const SECCOMP_USER_ACTION_TRAP: u32 = 3;
+const SECCOMP_USER_ACTION_KILL: u32 = 4;
+
+/// User-space seccomp instruction structure
+/// Matches the format passed from userspace via sys_seccomp(FILTER)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct UserSeccompInsn {
+    /// Opcode (SECCOMP_USER_OP_*)
+    op: u8,
+    _padding: [u8; 7],
+    /// First operand (varies by opcode)
+    arg0: u64,
+    /// Second operand (jump targets for conditional jumps)
+    arg1: u64,
+    /// Third operand (false branch offset for conditional jumps)
+    arg2: u64,
+}
+
+/// User-space seccomp program header
+/// Describes the filter to be installed
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct UserSeccompProg {
+    /// Number of instructions
+    len: u32,
+    /// Default action (applied when no instruction returns)
+    default_action: u32,
+    /// Pointer to instruction array
+    filter: u64, // Using u64 instead of *const for safe Copy
+}
 
 // ============================================================================
 // R23-5 fix: stdin 阻塞等待支持
@@ -728,6 +803,83 @@ pub fn syscall_dispatcher(
     // Capture timestamp at syscall entry
     let timestamp = crate::time::get_ticks();
 
+    // Evaluate seccomp/pledge filters before dispatch
+    let args = [arg0, arg1, arg2, arg3, arg4, arg5];
+    let verdict = crate::process::evaluate_seccomp(syscall_num, &args);
+
+    match verdict.action {
+        seccomp::SeccompAction::Kill => {
+            // Kill process with SIGSYS - audit the violation
+            if let Some(creds) = crate::current_credentials() {
+                if let Some(pid) = crate::process::current_pid() {
+                    seccomp::notify_violation(
+                        pid as u32,
+                        creds.uid,
+                        creds.gid,
+                        syscall_num,
+                        &verdict,
+                        timestamp,
+                    );
+                }
+            }
+            // For now, just return -EPERM and let the process handle it
+            // TODO: Actually terminate with signal delivery
+            return SyscallError::EPERM as i64;
+        }
+        seccomp::SeccompAction::Trap => {
+            // Trigger SIGSYS trap - audit the violation
+            if let Some(creds) = crate::current_credentials() {
+                if let Some(pid) = crate::process::current_pid() {
+                    seccomp::notify_violation(
+                        pid as u32,
+                        creds.uid,
+                        creds.gid,
+                        syscall_num,
+                        &verdict,
+                        timestamp,
+                    );
+                }
+            }
+            // TODO: Implement SIGSYS delivery
+            return SyscallError::EPERM as i64;
+        }
+        seccomp::SeccompAction::Errno(e) => {
+            // Return the error code - audit the violation
+            if let Some(creds) = crate::current_credentials() {
+                if let Some(pid) = crate::process::current_pid() {
+                    seccomp::notify_violation(
+                        pid as u32,
+                        creds.uid,
+                        creds.gid,
+                        syscall_num,
+                        &verdict,
+                        timestamp,
+                    );
+                }
+            }
+            return -(e as i64);
+        }
+        seccomp::SeccompAction::Log => {
+            // Log the violation but continue
+            if let Some(creds) = crate::current_credentials() {
+                if let Some(pid) = crate::process::current_pid() {
+                    seccomp::notify_violation(
+                        pid as u32,
+                        creds.uid,
+                        creds.gid,
+                        syscall_num,
+                        &verdict,
+                        timestamp,
+                    );
+                }
+            }
+            // Fall through to dispatch
+        }
+        seccomp::SeccompAction::Allow => {
+            // Continue to dispatch
+        }
+    }
+
     let result = match syscall_num {
         // 进程管理
         56 => sys_clone(arg0, arg1 as *mut u8, arg2 as *mut i32, arg3 as *mut i32, arg4),
@@ -778,6 +930,10 @@ pub fn syscall_dispatcher(
 
         // Futex
         202 => sys_futex(arg0 as usize, arg1 as i32, arg2 as u32),
+
+        // 安全/沙箱 (Seccomp/Prctl)
+        157 => sys_prctl(arg0 as i32, arg1, arg2, arg3, arg4),
+        317 => sys_seccomp(arg0 as u32, arg1 as u32, arg2),
 
         // 其他
         24 => sys_yield(),
@@ -996,6 +1152,8 @@ fn sys_clone(
         parent_euid,
         parent_egid,
         parent_umask,
+        parent_seccomp_state,
+        parent_pledge_state,
     ) = {
         let mut parent = parent_arc.lock();
         // 始终从 MSR 同步 fs_base 到 PCB
@@ -1022,6 +1180,8 @@ fn sys_clone(
             parent.euid,
             parent.egid,
             parent.umask,
+            parent.seccomp_state.clone(),
+            parent.pledge_state.clone(),
         )
     };
 
@@ -1184,6 +1344,13 @@ fn sys_clone(
         child.euid = parent_euid;
         child.egid = parent_egid;
         child.umask = parent_umask;
+
+        // 继承 Seccomp/Pledge 沙箱状态
+        // - 过滤器栈通过 Arc 共享，父子进程共享同一过滤器对象
+        // - no_new_privs 是粘滞标志，一旦设置无法清除
+        // - pledge 状态包括当前 promises 和 exec_promises（exec 后生效）
+        child.seccomp_state = parent_seccomp_state;
+        child.pledge_state = parent_pledge_state;
 
         // 复制文件描述符表（CLONE_FILES 时理论上应共享，但当前架构暂用克隆）
         if flags & CLONE_FILES != 0 {
@@ -1517,6 +1684,19 @@ fn sys_exec(
         // 重置 TLS 状态（新程序需要重新设置）
         proc.fs_base = 0;
         proc.gs_base = 0;
+
+        // OpenBSD Pledge 语义：exec 后应用 exec_promises
+        // 如果进程设置了 exec_promises，则在 exec 成功后将其替换为当前 promises
+        // 这允许进程在 exec 前声明一组更宽松的权限（用于加载程序），
+        // exec 后自动收紧到更严格的权限集
+        if let Some(ref mut pledge) = proc.pledge_state {
+            if let Some(exec_promises) = pledge.exec_promises.take() {
+                pledge.promises = exec_promises;
+            }
+        }
+
+        // Seccomp 过滤器在 exec 后保持不变（Linux 语义）
+        // no_new_privs 仍然有效，防止特权提升
 
         proc.state = ProcessState::Ready;
 
@@ -2900,6 +3080,310 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     mm::flush_current_as_range(VirtAddr::new(addr as u64), len_aligned);
 
     Ok(0)
+}
+
+// ============================================================================
+// Seccomp/Prctl 系统调用
+// ============================================================================
+
+/// Convert seccomp error to syscall error
+fn seccomp_error_to_syscall(err: seccomp::SeccompError) -> SyscallError {
+    match err {
+        seccomp::SeccompError::Fault => SyscallError::EFAULT,
+        seccomp::SeccompError::NotPermitted => SyscallError::EPERM,
+        seccomp::SeccompError::ProgramTooLong => SyscallError::E2BIG,
+        _ => SyscallError::EINVAL,
+    }
+}
+
+/// Decode user-space action code to SeccompAction
+fn decode_user_action(code: u32, aux: u64) -> Result<seccomp::SeccompAction, SyscallError> {
+    match code {
+        SECCOMP_USER_ACTION_ALLOW => Ok(seccomp::SeccompAction::Allow),
+        SECCOMP_USER_ACTION_LOG => Ok(seccomp::SeccompAction::Log),
+        SECCOMP_USER_ACTION_ERRNO => {
+            if aux > i32::MAX as u64 {
+                return Err(SyscallError::EINVAL);
+            }
+            Ok(seccomp::SeccompAction::Errno(aux as i32))
+        }
+        SECCOMP_USER_ACTION_TRAP => Ok(seccomp::SeccompAction::Trap),
+        SECCOMP_USER_ACTION_KILL => Ok(seccomp::SeccompAction::Kill),
+        _ => Err(SyscallError::EINVAL),
+    }
+}
+
+/// Convert u64 to u8 with bounds check
+#[inline]
+fn to_u8_checked(val: u64) -> Result<u8, SyscallError> {
+    if val > u8::MAX as u64 {
+        return Err(SyscallError::EINVAL);
+    }
+    Ok(val as u8)
+}
+
+/// Translate user-space instruction to kernel SeccompInsn
+fn translate_user_insn(insn: &UserSeccompInsn) -> Result<seccomp::SeccompInsn, SyscallError> {
+    match insn.op {
+        SECCOMP_USER_OP_LD_NR => Ok(seccomp::SeccompInsn::LdSyscallNr),
+        SECCOMP_USER_OP_LD_ARG => {
+            let idx = to_u8_checked(insn.arg0)?;
+            if idx >= 6 {
+                return Err(SyscallError::EINVAL);
+            }
+            Ok(seccomp::SeccompInsn::LdArg(idx))
+        }
+        SECCOMP_USER_OP_LD_CONST => Ok(seccomp::SeccompInsn::LdConst(insn.arg0)),
+        SECCOMP_USER_OP_AND => Ok(seccomp::SeccompInsn::And(insn.arg0)),
+        SECCOMP_USER_OP_OR => Ok(seccomp::SeccompInsn::Or(insn.arg0)),
+        SECCOMP_USER_OP_SHR => Ok(seccomp::SeccompInsn::Shr(to_u8_checked(insn.arg0)?)),
+        SECCOMP_USER_OP_JMP_EQ => Ok(seccomp::SeccompInsn::JmpEq(
+            insn.arg0,
+            to_u8_checked(insn.arg1)?,
+            to_u8_checked(insn.arg2)?,
+        )),
+        SECCOMP_USER_OP_JMP_NE => Ok(seccomp::SeccompInsn::JmpNe(
+            insn.arg0,
+            to_u8_checked(insn.arg1)?,
+            to_u8_checked(insn.arg2)?,
+        )),
+        SECCOMP_USER_OP_JMP_LT => Ok(seccomp::SeccompInsn::JmpLt(
+            insn.arg0,
+            to_u8_checked(insn.arg1)?,
+            to_u8_checked(insn.arg2)?,
+        )),
+        SECCOMP_USER_OP_JMP_LE => Ok(seccomp::SeccompInsn::JmpLe(
+            insn.arg0,
+            to_u8_checked(insn.arg1)?,
+            to_u8_checked(insn.arg2)?,
+        )),
+        SECCOMP_USER_OP_JMP_GT => Ok(seccomp::SeccompInsn::JmpGt(
+            insn.arg0,
+            to_u8_checked(insn.arg1)?,
+            to_u8_checked(insn.arg2)?,
+        )),
+        SECCOMP_USER_OP_JMP_GE => Ok(seccomp::SeccompInsn::JmpGe(
+            insn.arg0,
+            to_u8_checked(insn.arg1)?,
+            to_u8_checked(insn.arg2)?,
+        )),
+        SECCOMP_USER_OP_JMP => Ok(seccomp::SeccompInsn::Jmp(to_u8_checked(insn.arg0)?)),
+        SECCOMP_USER_OP_RET => {
+            let action = decode_user_action(insn.arg0 as u32, insn.arg1)?;
+            Ok(seccomp::SeccompInsn::Ret(action))
+        }
+        _ => Err(SyscallError::EINVAL),
+    }
+}
+
+/// Load and validate a seccomp filter from userspace
+fn load_user_seccomp_filter(flags: u32, args: u64) -> Result<seccomp::SeccompFilter, SyscallError> {
+    // Validate flags - reject TSYNC since we don't implement thread synchronization
+    // Silently accepting TSYNC would leave sibling threads unsandboxed (security gap)
+    if flags & seccomp::SeccompFlags::TSYNC.bits() != 0 {
+        println!("[sys_seccomp] TSYNC not implemented, rejecting");
+        return Err(SyscallError::EINVAL);
+    }
+
+    let filter_flags = seccomp::SeccompFlags::from_bits(flags).ok_or(SyscallError::EINVAL)?;
+
+    // Read program header from userspace
+    let mut prog = UserSeccompProg::default();
+    let prog_bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            &mut prog as *mut _ as *mut u8,
+            mem::size_of::<UserSeccompProg>(),
+        )
+    };
+    copy_from_user(prog_bytes, args as *const u8)?;
+
+    // Validate program length
+    let len = prog.len as usize;
+    if len == 0 || len > seccomp::MAX_INSNS {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Validate filter pointer
+    let insn_ptr = prog.filter as *const UserSeccompInsn;
+    if insn_ptr.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // Calculate total size and validate
+    let insn_size = mem::size_of::<UserSeccompInsn>();
+    let total = insn_size.checked_mul(len).ok_or(SyscallError::EFAULT)?;
+    validate_user_ptr(insn_ptr as *const u8, total)?;
+
+    // Read instructions from userspace
+    let mut raw_insns = vec![UserSeccompInsn::default(); len];
+    let raw_bytes = unsafe {
+        core::slice::from_raw_parts_mut(raw_insns.as_mut_ptr() as *mut u8, total)
+    };
+    copy_from_user(raw_bytes, insn_ptr as *const u8)?;
+
+    // Decode default action
+    let default_action = decode_user_action(prog.default_action, 0)?;
+
+    // Translate all instructions
+    let mut program = Vec::with_capacity(len);
+    for insn in raw_insns.iter() {
+        program.push(translate_user_insn(insn)?);
+    }
+
+    // Create and validate filter
+    seccomp::SeccompFilter::new(program, default_action, filter_flags)
+        .map_err(seccomp_error_to_syscall)
+}
+
+/// Get current seccomp mode for PR_GET_SECCOMP
+fn current_seccomp_mode(state: &seccomp::SeccompState) -> usize {
+    if state.filters.is_empty() {
+        return SECCOMP_MODE_DISABLED;
+    }
+
+    // Check if it's strict mode (only the strict filter installed)
+    let strict_id = seccomp::strict_filter().id;
+    if state.filters.len() == 1 {
+        if let Some(filter) = state.filters.first() {
+            if filter.id == strict_id {
+                return SECCOMP_MODE_STRICT;
+            }
+        }
+    }
+
+    SECCOMP_MODE_FILTER
+}
+
+/// sys_seccomp - Install seccomp filter or strict mode
+///
+/// # Arguments
+/// * `op` - Operation (SECCOMP_SET_MODE_STRICT or SECCOMP_SET_MODE_FILTER)
+/// * `flags` - Filter flags (SeccompFlags bits)
+/// * `args` - For FILTER mode, pointer to UserSeccompProg
+///
+/// # Security
+/// - Filters can only be added, never removed (one-way sandboxing)
+/// - Installing a filter automatically sets no_new_privs
+/// - Filters are inherited across fork/clone
+fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
+    match op {
+        SECCOMP_SET_MODE_STRICT => {
+            // Strict mode requires no flags or args
+            if flags != 0 || args != 0 {
+                return Err(SyscallError::EINVAL);
+            }
+
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let filter = seccomp::strict_filter();
+
+            let mut proc = proc_arc.lock();
+            // Installing any filter sets no_new_privs (sticky, one-way)
+            proc.seccomp_state.no_new_privs = true;
+            proc.seccomp_state.add_filter(filter);
+
+            println!("[sys_seccomp] PID={} installed STRICT mode", pid);
+            Ok(0)
+        }
+        SECCOMP_SET_MODE_FILTER => {
+            // Load and validate the filter from userspace
+            let filter = load_user_seccomp_filter(flags, args)?;
+
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let mut proc = proc_arc.lock();
+
+            // Installing filter sets no_new_privs (sticky, one-way)
+            proc.seccomp_state.no_new_privs = true;
+
+            // If LOG flag is set, enable violation logging
+            if filter.flags.contains(seccomp::SeccompFlags::LOG) {
+                proc.seccomp_state.log_violations = true;
+            }
+
+            proc.seccomp_state.add_filter(filter);
+
+            println!(
+                "[sys_seccomp] PID={} installed FILTER mode (total filters: {})",
+                pid,
+                proc.seccomp_state.filters.len()
+            );
+            Ok(0)
+        }
+        _ => Err(SyscallError::EINVAL),
+    }
+}
+
+/// sys_prctl - Process control operations
+///
+/// Implements seccomp and no_new_privs related prctl operations:
+/// - PR_SET_NO_NEW_PRIVS: Set the sticky no_new_privs flag
+/// - PR_GET_NO_NEW_PRIVS: Check if no_new_privs is set
+/// - PR_GET_SECCOMP: Get current seccomp mode
+/// - PR_SET_SECCOMP: Set seccomp mode (alternative to sys_seccomp)
+///
+/// # Arguments
+/// * `option` - prctl operation code
+/// * `arg2-arg5` - Operation-specific arguments
+fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> SyscallResult {
+    match option {
+        PR_SET_NO_NEW_PRIVS => {
+            // arg2 must be 1 to set, 0 is invalid (can't unset)
+            if arg2 != 1 {
+                return Err(SyscallError::EINVAL);
+            }
+
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let mut proc = proc_arc.lock();
+            proc.seccomp_state.no_new_privs = true;
+
+            println!("[sys_prctl] PID={} set NO_NEW_PRIVS", pid);
+            Ok(0)
+        }
+        PR_GET_NO_NEW_PRIVS => {
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let proc = proc_arc.lock();
+            Ok(proc.seccomp_state.no_new_privs as usize)
+        }
+        PR_GET_SECCOMP => {
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let proc = proc_arc.lock();
+            Ok(current_seccomp_mode(&proc.seccomp_state))
+        }
+        PR_SET_SECCOMP => {
+            // prctl(PR_SET_SECCOMP, mode, filter_ptr, 0, 0)
+            // Extra args (arg4/arg5) must be zero
+            if _arg4 != 0 || _arg5 != 0 {
+                return Err(SyscallError::EINVAL);
+            }
+
+            // Delegate to sys_seccomp based on mode
+            // Note: prctl doesn't support flags, so we always pass 0
+            let mode = arg2 as u32;
+            match mode {
+                SECCOMP_SET_MODE_STRICT => {
+                    // Strict mode requires arg3=0
+                    if arg3 != 0 {
+                        return Err(SyscallError::EINVAL);
+                    }
+                    sys_seccomp(SECCOMP_SET_MODE_STRICT, 0, 0)
+                }
+                SECCOMP_SET_MODE_FILTER => {
+                    // arg3 is pointer to filter prog
+                    // prctl interface doesn't support flags (use sys_seccomp directly for flags)
+                    sys_seccomp(SECCOMP_SET_MODE_FILTER, 0, arg3)
+                }
+                _ => Err(SyscallError::EINVAL),
+            }
+        }
+        _ => {
+            // Other prctl options not implemented
+            Err(SyscallError::EINVAL)
+        }
+    }
 }
 
 // ============================================================================

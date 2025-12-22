@@ -5,6 +5,7 @@ use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, v
 use core::any::Any;
 use mm::memory::FrameAllocator;
 use mm::page_table;
+use seccomp::{PledgeState, SeccompState};
 use spin::Mutex;
 use x86_64::{
     registers::control::{Cr3, Cr3Flags},
@@ -423,6 +424,15 @@ pub struct Process {
 
     /// robust_list 长度
     pub robust_list_len: usize,
+
+    // ========== Seccomp/Pledge 沙箱 ==========
+    /// Seccomp 过滤器状态
+    /// 包含 BPF 过滤器栈和 no_new_privs 标志
+    pub seccomp_state: SeccompState,
+
+    /// Pledge 状态（可选）
+    /// 如果设置，表示进程使用 OpenBSD 风格的 pledge 沙箱
+    pub pledge_state: Option<PledgeState>,
 }
 
 impl Process {
@@ -473,6 +483,9 @@ impl Process {
             set_child_tid: 0,
             robust_list_head: 0,
             robust_list_len: 0,
+            // Seccomp/Pledge 沙箱 (默认无限制)
+            seccomp_state: SeccompState::new(),
+            pledge_state: None,
         }
     }
 
@@ -845,6 +858,96 @@ pub fn set_current_umask(new_mask: u16) -> Option<u16> {
     let old = proc.umask;
     proc.umask = new_mask & 0o777; // 只保留权限位
     Some(old)
+}
+
+// ========== Seccomp/Pledge 沙箱访问 ==========
+
+use seccomp::SeccompVerdict;
+
+/// 评估当前进程的 seccomp 过滤器
+///
+/// 在系统调用分发前调用此函数检查 seccomp 过滤器和 pledge 限制。
+///
+/// # Arguments
+/// * `syscall_nr` - 系统调用号
+/// * `args` - 系统调用参数数组 (6 个参数)
+///
+/// # Returns
+/// 返回 seccomp 评估结果:
+/// - `SeccompAction::Allow` - 允许执行
+/// - `SeccompAction::Kill` - 终止进程
+/// - `SeccompAction::Errno(e)` - 返回错误码
+/// - `SeccompAction::Trap` - 触发 SIGSYS
+/// - `SeccompAction::Log` - 记录日志但允许执行
+pub fn evaluate_seccomp(syscall_nr: u64, args: &[u64; 6]) -> SeccompVerdict {
+    let pid = match current_pid() {
+        Some(p) => p,
+        None => return SeccompVerdict::allow(),
+    };
+
+    let table = PROCESS_TABLE.lock();
+    let slot = match table.get(pid) {
+        Some(s) => s,
+        None => return SeccompVerdict::allow(),
+    };
+    let proc = match slot.as_ref() {
+        Some(p) => p.lock(),
+        None => return SeccompVerdict::allow(),
+    };
+
+    // First check pledge if set
+    if let Some(ref pledge) = proc.pledge_state {
+        if !pledge.allows(syscall_nr) {
+            return SeccompVerdict::kill(0);
+        }
+    }
+
+    // Then evaluate seccomp filters
+    if proc.seccomp_state.has_filters() {
+        proc.seccomp_state.evaluate(syscall_nr, args)
+    } else {
+        SeccompVerdict::allow()
+    }
+}
+
+/// 检查当前进程是否启用了 seccomp
+pub fn has_seccomp_enabled() -> bool {
+    let pid = match current_pid() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let table = PROCESS_TABLE.lock();
+    let slot = match table.get(pid) {
+        Some(s) => s,
+        None => return false,
+    };
+    let proc = match slot.as_ref() {
+        Some(p) => p.lock(),
+        None => return false,
+    };
+
+    proc.seccomp_state.has_filters() || proc.pledge_state.is_some()
+}
+
+/// 检查当前进程是否设置了 no_new_privs
+pub fn has_no_new_privs() -> bool {
+    let pid = match current_pid() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let table = PROCESS_TABLE.lock();
+    let slot = match table.get(pid) {
+        Some(s) => s,
+        None => return false,
+    };
+    let proc = match slot.as_ref() {
+        Some(p) => p.lock(),
+        None => return false,
+    };
+
+    proc.seccomp_state.no_new_privs
 }
 
 /// 激活指定的地址空间

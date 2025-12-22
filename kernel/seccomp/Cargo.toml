@@ -1,0 +1,19 @@
+[package]
+name = "seccomp"
+version = "0.1.0"
+edition = "2021"
+description = "Seccomp/Pledge syscall filtering for Zero-OS"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+spin = "0.9"
+bitflags = "2.4"
+
+# Cross-crate dependencies
+drivers = { path = "../drivers" }
+audit = { path = "../audit" }
+
+[features]
+default = []

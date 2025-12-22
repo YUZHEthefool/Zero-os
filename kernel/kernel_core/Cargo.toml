@@ -15,3 +15,4 @@ mm = { path = "../mm" }
 xmas-elf = "0.9"
 cpu_local = { path = "../cpu_local" }
 audit = { path = "../audit" }
+seccomp = { path = "../seccomp" }

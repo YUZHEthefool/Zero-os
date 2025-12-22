@@ -1,0 +1,21 @@
+[package]
+name = "cap"
+version = "0.1.0"
+edition = "2021"
+description = "Capability-based access control subsystem for Zero-OS"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+spin = "0.9"
+bitflags = "2.4"
+x86_64 = "0.15"
+
+# Cross-crate dependencies (within kernel workspace)
+kernel_core = { path = "../kernel_core" }
+ipc = { path = "../ipc" }
+drivers = { path = "../drivers" }
+
+[features]
+default = []

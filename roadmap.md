@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2025-12-20
+**Last Updated:** 2025-12-21
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -10,14 +10,16 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ## Executive Summary
 
-### Current Status: Phase 6.2 Complete (Thread Support)
+### Current Status: Phase A In Progress (Security Foundation)
 
-Zero-OS has completed foundational kernel development with strong security focus:
+Zero-OS has completed foundational kernel development and is now building security infrastructure:
 - **24 security audits** with 111/138 issues fixed (80%)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions
-- **Security hardening**: W^X, SMEP/SMAP/UMIP, hash-chained audit
+- **Security hardening**: W^X, SMEP/SMAP/UMIP, SHA-256 hash-chained audit
+- **Phase A**: ~80% complete (Usercopy ✅, Spectre ✅, SMP-stubs ✅, KASLR/Audit partial)
+- **Phase B**: Scaffolded (Cap/LSM/Seccomp types exist, NOT integrated)
 
 ### Gap Analysis vs Linux Kernel
 
@@ -153,53 +155,58 @@ Zero-OS has completed foundational kernel development with strong security focus
 
 ## Future Phases (Security-First Order)
 
-### Phase A: Security Foundation [NEXT]
+### Phase A: Security Foundation [IN PROGRESS]
 
 **Goal**: Establish minimum trusted base before adding features.
 
 **Priority**: Critical
 **Dependencies**: None (current baseline)
+**Status**: ~80% Complete
 
-#### A.1 Usercopy API Hardening
+#### A.1 Usercopy API Hardening ✅ COMPLETE
 
-- [ ] Unified `copy_from_user` / `copy_to_user` with SMAP guard
-- [ ] Path string copy with length limits
-- [ ] Alignment and bounds validation
-- [ ] STAC/CLAC wrapper for all user memory access
+- [x] Unified `copy_from_user` / `copy_to_user` with SMAP guard (kernel/kernel_core/usercopy.rs)
+- [x] Path string copy with length limits (`strncpy_from_user` with MAX_PATH)
+- [x] Alignment and bounds validation (range checks, canonical address validation)
+- [x] STAC/CLAC wrapper for all user memory access (`with_user_access!` macro)
 
-#### A.2 Syscall Coverage
+#### A.2 Syscall Coverage (Partial)
 
-- [ ] Eliminate all ENOSYS returns for defined syscalls
-- [ ] Proper error code semantics
-- [ ] User-space signal handler infrastructure
+- [ ] Eliminate all ENOSYS returns for defined syscalls (many still return ENOSYS)
+- [x] Proper error code semantics (errno constants defined)
+- [x] User-space signal handler infrastructure (signal dispatch in place)
 
-#### A.3 Audit Enhancement
+#### A.3 Audit Enhancement (Partial)
 
-- [ ] Upgrade hash chain to SHA-256/HMAC
-- [ ] Overflow handling policy (drop oldest/block/alert)
-- [ ] Read-only export interface with capability gate
+- [x] Upgrade hash chain to SHA-256 (FNV-1a → SHA-256, domain separation)
+- [x] Overflow handling policy (drop oldest with `dropped` counter)
+- [ ] Read-only export interface with capability gate (export exists but lacks cap gate)
 - [ ] Persistent flush hook (for future storage)
+- [ ] HMAC support (placeholder exists, not implemented)
 
-#### A.4 KASLR/KPTI Preparation
+#### A.4 KASLR/KPTI Preparation (Partial)
 
-- [ ] Linker script layering for randomization
-- [ ] KASLR slide reservation
-- [ ] KPTI dual page table skeleton (single-core stub)
-- [ ] PCID support detection
+- [x] Linker script layering for randomization (KernelLayout struct with slide field)
+- [x] KASLR slide reservation (with_slide() constructor ready)
+- [x] KPTI dual page table skeleton (KptiContext with user_cr3/kernel_cr3)
+- [ ] PCID support detection (field exists, not detected at boot)
+- [ ] Actual KASLR slide application (layout remains fixed)
 
-#### A.5 Spectre/Meltdown Hardening
+#### A.5 Spectre/Meltdown Hardening ✅ COMPLETE
 
-- [x] Context switch IBPB on untrusted transition
-- [x] RSB stuffing stub (spectre.rs)
-- [ ] Retpoline build option verification
-- [x] SWAPGS fence beyond syscall stub (syscall.rs CVE-2019-1125)
+- [x] Context switch IBPB on untrusted transition (issue_ibpb/try_ibpb)
+- [x] RSB stuffing (spectre.rs rsb_fill with 32 entries)
+- [x] IBRS/STIBP/SSBD detection and enablement (init() enables all supported)
+- [x] Retpoline build option (cfg feature gate)
+- [x] SWAPGS fence (CVE-2019-1125 mitigated in syscall.rs)
+- [x] VulnerabilityInfo detection (reads IA32_ARCH_CAPABILITIES)
 
-#### A.6 SMP-Ready Interfaces (Stubs)
+#### A.6 SMP-Ready Interfaces (Stubs) ✅ COMPLETE
 
-- [x] Per-CPU data structure abstraction (cpu_local crate)
-- [x] IPI type definitions (arch/ipi.rs - TLB, resched, profile, halt, panic)
-- [x] TLB shootdown API (mm/tlb_shootdown.rs - single-core)
-- [x] Lock ordering documentation (sched/lock_ordering.rs)
+- [x] Per-CPU data structure abstraction (kernel/cpu_local with CpuLocal<T>)
+- [x] IPI type definitions (arch/ipi.rs - 5 types with vectors 0xFB-0xFF)
+- [x] TLB shootdown API (mm/tlb_shootdown.rs - single-core with assert_single_core_mode)
+- [x] Lock ordering documentation (sched/lock_ordering.rs - 9 levels documented)
 
 **Security Requirements**:
 - W^X/NX/SMEP/SMAP/UMIP enabled by default
@@ -215,20 +222,21 @@ Zero-OS has completed foundational kernel development with strong security focus
 
 ---
 
-### Phase B: Capability & MAC Framework
+### Phase B: Capability & MAC Framework [SCAFFOLDED]
 
 **Goal**: Unified object capability model + LSM hooks + syscall filtering.
 
 **Priority**: Critical
 **Dependencies**: Phase A
+**Status**: Infrastructure scaffolded, NOT integrated into syscall/process paths
 
-#### B.1 Capability System
+#### B.1 Capability System (Scaffolded - kernel/cap/)
 
 ```rust
-// Design specification
-pub struct CapId(u64);  // idx(32) | gen(32)
+// Implemented in kernel/cap/types.rs
+pub struct CapId(u64);  // idx(32) | gen(32) ✅
 
-pub enum CapObject {
+pub enum CapObject {  // ✅ Defined
     Endpoint(Arc<Endpoint>),
     File(Arc<File>),
     Socket(Arc<Socket>),
@@ -239,7 +247,7 @@ pub enum CapObject {
 }
 
 bitflags! {
-    pub struct CapRights: u64 {
+    pub struct CapRights: u64 {  // ✅ Defined
         const READ      = 1 << 0;
         const WRITE     = 1 << 1;
         const EXEC      = 1 << 2;
@@ -254,24 +262,29 @@ bitflags! {
 }
 ```
 
-- [ ] Per-process CapTable with generation counter
-- [ ] CapId allocation/lookup/revocation
+- [x] CapId structure with generation counter (types.rs)
+- [x] CapObject enum with all variants (types.rs)
+- [x] CapRights bitflags (types.rs)
+- [x] CapEntry with rights and object (types.rs)
+- [x] CapTable with allocate/lookup/revoke (lib.rs)
+- [ ] **Integration**: fd_table -> CapId (NOT connected to syscalls)
+- [ ] **Integration**: Process CapTable field (NOT in PCB)
 - [ ] Delegation with rights restriction
-- [ ] fd_table -> CapId integration
 - [ ] O_PATH/CLOEXEC/CLOFORK semantics
 
-#### B.2 LSM Hook Infrastructure
+#### B.2 LSM Hook Infrastructure (Scaffolded - kernel/lsm/)
 
-**Hook Points**:
-- Syscall: enter/exit
-- Process: fork/exec/exit/setuid
-- VFS: lookup/open/create/mmap/chmod/mount
-- IPC: mq send/recv, pipe, futex, shm
-- Signal: send_signal, ptrace
-- Network: socket/bind/connect/send/recv
+**Hook Points Defined**:
+- Syscall: enter/exit ✅
+- Process: fork/exec/exit/setuid ✅
+- VFS: lookup/open/create/mmap/chmod/mount ✅
+- IPC: mq send/recv, pipe, futex, shm ✅
+- Signal: send_signal, ptrace ✅
+- Network: socket/bind/connect/send/recv ✅
 
 ```rust
-trait LsmPolicy: Send + Sync {
+// Implemented in kernel/lsm/lib.rs
+trait LsmPolicy: Send + Sync {  // ✅ Trait defined
     fn syscall_enter(&self, ctx: &SyscallCtx) -> Result<()>;
     fn file_open(&self, task: &Task, inode: &Inode, flags: OpenFlags) -> Result<()>;
     fn ipc_send(&self, task: &Task, ep: &Endpoint, bytes: usize) -> Result<()>;
@@ -279,23 +292,34 @@ trait LsmPolicy: Send + Sync {
 }
 ```
 
-- [ ] Hook point infrastructure
-- [ ] Policy registration API
-- [ ] Default permissive policy
+- [x] LsmPolicy trait with all hooks (lib.rs)
+- [x] LsmContext wrapper (lib.rs)
+- [x] DefaultPolicy (permissive) (policy.rs)
+- [x] Hook registration infrastructure (lib.rs)
+- [ ] **Integration**: Hooks NOT called from syscall dispatch
+- [ ] **Integration**: Hooks NOT called from VFS operations
 - [ ] Build-time feature gate
 
-#### B.3 Seccomp/Pledge
+#### B.3 Seccomp/Pledge (Scaffolded - kernel/seccomp/)
 
-- [ ] Per-process filter storage
-- [ ] sys_seccomp implementation
-- [ ] BPF-like or simplified predicate rules
+- [x] SeccompFilter structure (types.rs)
+- [x] SeccompRule with syscall matching (types.rs)
+- [x] SeccompAction enum (Allow/Log/Errno/Trap/Kill) (types.rs)
+- [x] PledgePromise enum (Stdio/Rpath/Wpath/etc.) (types.rs)
+- [x] Filter evaluation logic (lib.rs)
+- [ ] **Integration**: Per-process filter storage NOT in PCB
+- [ ] **Integration**: sys_seccomp NOT implemented
 - [ ] Fork inheritance policy
 
-#### B.4 Audit Integration
+#### B.4 Audit Integration (Scaffolded)
 
-- [ ] Every hook emits CapId/uid/gid/label/path/socket
-- [ ] MAC decision logging
-- [ ] Capability use tracking
+- [x] AuditSecurityClass enum (Lsm/Seccomp/Capability) (audit/lib.rs)
+- [x] emit_lsm_denial helper function (audit/lib.rs)
+- [x] emit_seccomp_violation helper function (audit/lib.rs)
+- [x] emit_capability_event helper function (audit/lib.rs)
+- [ ] **Integration**: Helpers NOT called from actual security paths
+- [ ] MAC decision logging from real denials
+- [ ] Capability use tracking from real operations
 
 **Security Requirements**:
 - Default-allow policy initially
@@ -629,7 +653,8 @@ See [qa-2025-12-20.md](qa-2025-12-20.md) for latest audit report.
 | 0.4.x | 2025-12-15/16 | Phase 5: VFS, security hardening |
 | 0.5.x | 2025-12-17/18 | Phase 6.1: Ring 3, SYSCALL/SYSRET |
 | **0.6.x** | **2025-12-20** | **Phase 6.2: Thread/Clone, security fixes** |
-| 0.7.0 | TBD | Phase A: Security foundation |
+| **0.6.5** | **2025-12-21** | **Phase A: Security foundation (~80%), Phase B scaffolded** |
+| 0.7.0 | TBD | Phase A: Security foundation complete |
 | 0.8.0 | TBD | Phase B: Capability/MAC |
 | 0.9.0 | TBD | Phase C: Storage |
 | 0.10.0 | TBD | Phase D: Network |

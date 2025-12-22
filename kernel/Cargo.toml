@@ -31,6 +31,9 @@ kernel_core = { path = "kernel_core" }
 security = { path = "security" }
 vfs = { path = "vfs" }
 audit = { path = "audit" }
+cap = { path = "cap" }
+lsm = { path = "lsm" }
+seccomp = { path = "seccomp" }
 
 # 暂时移除 crossbeam-queue，或确保正确配置
 # crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }

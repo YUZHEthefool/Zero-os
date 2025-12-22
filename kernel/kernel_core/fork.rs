@@ -200,6 +200,13 @@ fn fork_inner(
         child.fs_base = parent.fs_base;
         child.gs_base = parent.gs_base;
 
+        // 继承 Seccomp/Pledge 沙箱状态
+        // - SeccompState.filters: Vec<Arc<SeccompFilter>> 通过 Arc 共享，避免深拷贝
+        // - no_new_privs: 粘滞标志，一旦设置不可清除，必须继承
+        // - pledge_state: 包含 promises 和 exec_promises（exec 后生效）
+        child.seccomp_state = parent.seccomp_state.clone();
+        child.pledge_state = parent.pledge_state.clone();
+
         // 复制线程支持状态
         // 【注意】fork 创建的是新进程，不是线程
         // - tid/tgid 设为子进程 pid（Process::new 已处理）

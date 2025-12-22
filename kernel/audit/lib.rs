@@ -135,6 +135,92 @@ pub enum AuditOutcome {
 }
 
 // ============================================================================
+// Security Event Encoding (Phase B.4)
+// ============================================================================
+
+/// Security-specific classification for `AuditKind::Security` events.
+///
+/// Stored in `args[0]` to distinguish between different security subsystems.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuditSecurityClass {
+    /// LSM hook denied an operation.
+    Lsm = 1,
+    /// Seccomp/Pledge filter blocked a syscall.
+    Seccomp = 2,
+    /// Capability lifecycle or use.
+    Capability = 3,
+}
+
+/// LSM denial reason code (stored in `args[2]`).
+///
+/// Provides more detail on why an LSM hook denied an operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuditLsmReason {
+    /// Generic policy decision (default).
+    Policy = 1,
+    /// Operation required a capability that was missing.
+    MissingCapability = 2,
+    /// Integrity/label validation failed.
+    Integrity = 3,
+    /// DAC permission check failed.
+    DacDenied = 4,
+    /// MAC policy blocked the operation.
+    MacDenied = 5,
+    /// Internal policy failure (misconfiguration or bug).
+    Internal = 254,
+    /// Other/unspecified reason.
+    Unknown = 255,
+}
+
+/// Normalized seccomp actions for audit reporting (`args[3]`).
+///
+/// Matches the seccomp::SeccompAction enum for consistent logging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuditSeccompAction {
+    /// Syscall was allowed.
+    Allow = 0,
+    /// Syscall was logged but allowed.
+    Log = 1,
+    /// Syscall returned errno.
+    Errno = 2,
+    /// Syscall caused SIGSYS trap.
+    Trap = 3,
+    /// Syscall caused process termination.
+    Kill = 4,
+}
+
+/// Capability operations tracked by audit (`args[1]`).
+///
+/// Used to distinguish different capability lifecycle events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuditCapOperation {
+    /// Capability allocated to process.
+    Allocate = 1,
+    /// Capability revoked.
+    Revoke = 2,
+    /// Capability delegated to another process.
+    Delegate = 3,
+    /// Capability used for an operation.
+    Use = 4,
+    /// Capability lookup failed (invalid/stale).
+    LookupFailed = 5,
+}
+
+/// Argument layout for security events (shared across SecurityClass variants).
+///
+/// - `args[0]`: AuditSecurityClass discriminant
+/// - `args[1..6]`: Class-specific details
+pub const AUDIT_SECURITY_ARG_CLASS: usize = 0;
+pub const AUDIT_SECURITY_ARG_DETAIL0: usize = 1;
+pub const AUDIT_SECURITY_ARG_DETAIL1: usize = 2;
+pub const AUDIT_SECURITY_ARG_DETAIL2: usize = 3;
+pub const AUDIT_SECURITY_ARG_DETAIL3: usize = 4;
+
+// ============================================================================
 // Subject and Object Types
 // ============================================================================
 
@@ -916,6 +1002,191 @@ pub fn emit(
             Err(AuditError::Uninitialized)
         }
     })
+}
+
+// ============================================================================
+// Security Event Helpers (Phase B.4)
+// ============================================================================
+
+/// Emit an audit record for an LSM denial.
+///
+/// # Arguments
+///
+/// * `subject` - The process that attempted the operation
+/// * `object` - The target of the operation (file, process, etc.)
+/// * `hook` - Name of the LSM hook that denied (e.g., "file_open", "task_fork")
+/// * `reason` - Why the hook denied the operation
+/// * `errno` - Error number returned to user space
+/// * `timestamp` - Event timestamp
+///
+/// # Args Layout
+///
+/// - `args[0]` = `AuditSecurityClass::Lsm`
+/// - `args[1]` = FNV-1a hash of the hook name
+/// - `args[2]` = `AuditLsmReason`
+#[inline]
+pub fn emit_lsm_denial(
+    subject: AuditSubject,
+    object: AuditObject,
+    hook: &str,
+    reason: AuditLsmReason,
+    errno: i32,
+    timestamp: u64,
+) -> Result<(), AuditError> {
+    let hook_hash = hash_bytes(hook.as_bytes());
+    let args = [
+        AuditSecurityClass::Lsm as u64,
+        hook_hash,
+        reason as u64,
+    ];
+
+    emit(
+        AuditKind::Security,
+        AuditOutcome::Denied,
+        subject,
+        object,
+        &args,
+        errno,
+        timestamp,
+    )
+}
+
+/// Emit an audit record for a seccomp/pledge violation.
+///
+/// # Arguments
+///
+/// * `subject` - The process that attempted the syscall
+/// * `syscall_nr` - System call number that was blocked
+/// * `filter_id` - Identifier of the filter that blocked (hash or index)
+/// * `action` - The action taken (Kill, Errno, Trap, Log)
+/// * `errno` - Error number (for Errno action) or 0
+/// * `timestamp` - Event timestamp
+///
+/// # Args Layout
+///
+/// - `args[0]` = `AuditSecurityClass::Seccomp`
+/// - `args[1]` = syscall number
+/// - `args[2]` = filter identifier
+/// - `args[3]` = `AuditSeccompAction`
+///
+/// # Note
+///
+/// The outcome is determined by the action:
+/// - Kill/Trap/Errno → Denied
+/// - Log → Info (syscall is allowed but logged)
+/// - Allow → Success (not typically audited)
+#[inline]
+pub fn emit_seccomp_violation(
+    subject: AuditSubject,
+    syscall_nr: u64,
+    filter_id: u64,
+    action: AuditSeccompAction,
+    errno: i32,
+    timestamp: u64,
+) -> Result<(), AuditError> {
+    let args = [
+        AuditSecurityClass::Seccomp as u64,
+        syscall_nr,
+        filter_id,
+        action as u64,
+    ];
+
+    // Determine outcome based on action
+    let outcome = match action {
+        AuditSeccompAction::Log => AuditOutcome::Info,
+        AuditSeccompAction::Allow => AuditOutcome::Success,
+        _ => AuditOutcome::Denied,
+    };
+
+    emit(
+        AuditKind::Security,
+        outcome,
+        subject,
+        AuditObject::None,
+        &args,
+        errno,
+        timestamp,
+    )
+}
+
+/// Emit an audit record for capability lifecycle/use.
+///
+/// # Arguments
+///
+/// * `outcome` - Success (for allocate/delegate) or Denied (for failed lookup)
+/// * `subject` - The process performing the operation
+/// * `cap_id` - The capability ID involved
+/// * `op` - The operation type (Allocate, Revoke, Delegate, Use)
+/// * `target_pid` - For delegation, the target process
+/// * `errno` - Error number (0 for success)
+/// * `timestamp` - Event timestamp
+///
+/// # Args Layout
+///
+/// - `args[0]` = `AuditSecurityClass::Capability`
+/// - `args[1]` = `AuditCapOperation`
+/// - `args[2]` = target pid (or 0)
+#[inline]
+pub fn emit_capability_event(
+    outcome: AuditOutcome,
+    subject: AuditSubject,
+    cap_id: u64,
+    op: AuditCapOperation,
+    target_pid: Option<u32>,
+    errno: i32,
+    timestamp: u64,
+) -> Result<(), AuditError> {
+    let args = [
+        AuditSecurityClass::Capability as u64,
+        op as u64,
+        target_pid.unwrap_or(0) as u64,
+    ];
+
+    emit(
+        AuditKind::Security,
+        outcome,
+        subject,
+        AuditObject::Capability { cap_id },
+        &args,
+        errno,
+        timestamp,
+    )
+}
+
+/// Emit an audit record for a security policy allow decision.
+///
+/// This is used for "log-only" filters or when verbose security auditing
+/// is enabled. Captures allowed operations for security monitoring.
+///
+/// # Arguments
+///
+/// * `subject` - The process performing the operation
+/// * `hook` - Name of the LSM hook or "seccomp" for filter passes
+/// * `syscall_nr` - System call number (0 if not applicable)
+/// * `timestamp` - Event timestamp
+#[inline]
+pub fn emit_security_allow(
+    subject: AuditSubject,
+    hook: &str,
+    syscall_nr: u64,
+    timestamp: u64,
+) -> Result<(), AuditError> {
+    let hook_hash = hash_bytes(hook.as_bytes());
+    let args = [
+        AuditSecurityClass::Lsm as u64,
+        hook_hash,
+        syscall_nr,
+    ];
+
+    emit(
+        AuditKind::Security,
+        AuditOutcome::Success,
+        subject,
+        AuditObject::None,
+        &args,
+        0,
+        timestamp,
+    )
 }
 
 /// Take a snapshot of the audit log (drains all buffered events)

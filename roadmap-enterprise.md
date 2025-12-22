@@ -1,7 +1,7 @@
 # Zero-OS Enterprise Security Kernel Roadmap
 
-**Version:** 3.0
-**Last Updated:** 2025-12-20
+**Version:** 3.1
+**Last Updated:** 2025-12-21
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
 This document extends the Zero-OS development roadmap toward an **enterprise-grade secure server kernel**, with detailed gap analysis against Linux and a security-first implementation plan.
@@ -19,7 +19,7 @@ Zero-OS aims to be an enterprise-grade server kernel with:
 - **Secure IPC**: Capability-based access control for all kernel objects
 - **Compliance Ready**: Comprehensive audit logging with tamper evidence
 
-### Current Status (2025-12-20)
+### Current Status (2025-12-21)
 
 | Component | Status | Security Level |
 |-----------|--------|----------------|
@@ -32,9 +32,15 @@ Zero-OS aims to be an enterprise-grade server kernel with:
 | VFS | Complete | DAC permissions (owner/group/other/umask) |
 | Audit | Complete | SHA-256 hash-chained syscall logging |
 | User Mode (Ring 3) | Complete | SYSCALL/SYSRET, IRETQ entry |
+| Usercopy API | Complete | SMAP guards (STAC/CLAC), bounds validation |
+| Spectre/Meltdown | Complete | IBRS/IBPB/STIBP/SSBD/RSB stuffing |
+| KASLR/KPTI | Partial | Infrastructure ready, not applied |
+| SMP-Ready Stubs | Complete | Per-CPU, IPI, TLB shootdown APIs |
+| Capability System | Scaffolded | Types defined, NOT integrated |
+| LSM Hooks | Scaffolded | Traits defined, NOT integrated |
+| Seccomp/Pledge | Scaffolded | Types defined, NOT integrated |
 | Network | Not started | - |
 | SMP | Not started | - |
-| Security Framework | Partial | Audit only (no MAC/LSM/full Capabilities) |
 
 ### Security Audit Summary
 
@@ -195,15 +201,16 @@ Phase G (Production Readiness)
 
 ## Part IV: Detailed Phase Specifications
 
-### Phase A: Security Foundation
+### Phase A: Security Foundation [~80% COMPLETE]
 
 **Duration Estimate**: 2-4 weeks
 **Blocking**: All subsequent phases
+**Status**: A.1 ✅, A.3 (Spectre) ✅, A.6 ✅ | A.2/A.3(Audit)/A.4 Partial
 
-#### A.1 Usercopy API (Critical)
+#### A.1 Usercopy API (Critical) ✅ COMPLETE
 
-**Current State**: Partial implementation with SMAP support
-**Target**: Complete, audited usercopy with all edge cases
+**Current State**: Fully implemented with SMAP support
+**Location**: kernel/kernel_core/usercopy.rs
 
 ```rust
 // API specification
@@ -240,21 +247,22 @@ pub fn strncpy_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<usize, Errn
 | Time | time, sleep | Partial |
 | Network | socket, bind, connect... | ENOSYS (Phase D) |
 
-#### A.3 Spectre/Meltdown Hardening
+#### A.3 Spectre/Meltdown Hardening ✅ COMPLETE
 
 **Current State**: Complete mitigation suite implemented
-**Target**: Complete mitigation suite ✓
+**Location**: kernel/security/spectre.rs
 
-| Mitigation | Status | Action |
-|------------|--------|--------|
-| IBRS | Done | Enabled if supported |
-| IBPB | Done | Used on context switch |
-| STIBP | Done | Enabled if supported |
-| SSBD | Done | Enabled if supported |
-| RSB stuffing | Done | Implemented in spectre.rs |
-| Retpoline | Build option | Verify in CI |
-| KPTI skeleton | Done | Infrastructure in kaslr.rs |
-| SWAPGS fence | Done | CVE-2019-1125 mitigated in syscall.rs |
+| Mitigation | Status | Details |
+|------------|--------|---------|
+| IBRS | ✅ Done | Enabled if supported via IA32_SPEC_CTRL |
+| IBPB | ✅ Done | issue_ibpb()/try_ibpb() on context switch |
+| STIBP | ✅ Done | Enabled if supported |
+| SSBD | ✅ Done | Enabled if supported |
+| RSB stuffing | ✅ Done | rsb_fill() with 32 entries |
+| Retpoline | ✅ Done | cfg!(feature = "retpoline") build option |
+| KPTI skeleton | ✅ Done | Infrastructure in kaslr.rs |
+| SWAPGS fence | ✅ Done | CVE-2019-1125 mitigated in syscall.rs |
+| VulnerabilityInfo | ✅ Done | Reads IA32_ARCH_CAPABILITIES MSR |
 
 #### A.4 KASLR/KPTI Preparation
 
@@ -284,18 +292,16 @@ User-mode page table:        Kernel-mode page table:
 
 ---
 
-### Phase B: Capability & MAC Framework
+### Phase B: Capability & MAC Framework [SCAFFOLDED]
 
 **Duration Estimate**: 4-6 weeks
 **Blocking**: Storage and Network phases
+**Status**: Types and infrastructure defined, NOT integrated into syscall/process paths
 
-#### B.1 Unified Capability System
+#### B.1 Unified Capability System (Scaffolded - kernel/cap/)
 
-**Design Goals**:
-- Every kernel object is a capability
-- Every operation requires capability check
-- Capabilities are non-forgeable (generation counter)
-- Delegation with rights restriction
+**Current State**: Types and CapTable defined, not wired to syscalls
+**Location**: kernel/cap/lib.rs, kernel/cap/types.rs
 
 **CapId Structure**:
 ```
@@ -357,7 +363,21 @@ bitflags! {
 }
 ```
 
-#### B.2 LSM Hook Infrastructure
+#### B.2 LSM Hook Infrastructure (Scaffolded - kernel/lsm/)
+
+**Current State**: LsmPolicy trait and hooks defined, not called from syscalls
+**Location**: kernel/lsm/lib.rs, kernel/lsm/policy.rs
+
+**Implemented**:
+- [x] LsmPolicy trait with all hook methods
+- [x] DefaultPolicy (permissive)
+- [x] LsmContext wrapper
+- [x] Hook registration infrastructure
+
+**NOT Integrated**:
+- [ ] Hooks not called from syscall dispatch
+- [ ] Hooks not called from VFS operations
+- [ ] Build-time feature gate
 
 **Hook Categories**:
 
@@ -399,7 +419,22 @@ pub trait LsmPolicy: Send + Sync {
 }
 ```
 
-#### B.3 Seccomp/Pledge
+#### B.3 Seccomp/Pledge (Scaffolded - kernel/seccomp/)
+
+**Current State**: Types defined, not integrated into process lifecycle
+**Location**: kernel/seccomp/lib.rs, kernel/seccomp/types.rs
+
+**Implemented**:
+- [x] SeccompFilter structure with rules
+- [x] SeccompRule with syscall matching
+- [x] SeccompAction enum (Allow/Log/Errno/Trap/Kill)
+- [x] PledgePromise enum
+- [x] Filter evaluation logic
+
+**NOT Integrated**:
+- [ ] Per-process filter storage not in PCB
+- [ ] sys_seccomp syscall not implemented
+- [ ] Fork inheritance not wired
 
 **Design Options**:
 1. **BPF-based** (like Linux seccomp-bpf): Flexible but complex

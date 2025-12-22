@@ -35,6 +35,10 @@ pub use process::{
     remove_supplementary_group,
     set_current_supplementary_groups,
     set_current_umask,
+    // Seccomp/Pledge support
+    evaluate_seccomp,
+    has_no_new_privs,
+    has_seccomp_enabled,
     // DAC support
     Credentials,
     FileDescriptor,
