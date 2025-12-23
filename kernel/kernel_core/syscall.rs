@@ -14,6 +14,7 @@ use crate::process::{
 };
 use crate::usercopy::UserAccessGuard;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem;
@@ -25,6 +26,9 @@ use audit::{AuditKind, AuditObject, AuditOutcome, AuditSubject};
 
 // Seccomp/Pledge syscall filtering
 extern crate seccomp;
+
+// LSM hook infrastructure
+extern crate lsm;
 
 /// 最大参数数量（防止恶意用户传递过多参数）
 const MAX_ARG_COUNT: usize = 256;
@@ -99,6 +103,62 @@ struct UserSeccompProg {
     default_action: u32,
     /// Pointer to instruction array
     filter: u64, // Using u64 instead of *const for safe Copy
+}
+
+// ============================================================================
+// Linux ABI struct definitions for new syscalls
+// ============================================================================
+
+/// AT_FDCWD sentinel for *at() syscalls (openat, fstatat, etc.)
+const AT_FDCWD: i32 = -100;
+
+/// struct timeval (Linux ABI)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct TimeVal {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+/// struct timespec (Linux ABI)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct TimeSpec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// struct utsname (Linux ABI, fixed-size strings)
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UtsName {
+    sysname: [u8; 65],
+    nodename: [u8; 65],
+    release: [u8; 65],
+    version: [u8; 65],
+    machine: [u8; 65],
+}
+
+impl Default for UtsName {
+    fn default() -> Self {
+        Self {
+            sysname: [0; 65],
+            nodename: [0; 65],
+            release: [0; 65],
+            version: [0; 65],
+            machine: [0; 65],
+        }
+    }
+}
+
+/// Linux dirent64 layout for getdents64 syscall
+#[repr(C)]
+struct LinuxDirent64 {
+    d_ino: u64,
+    d_off: i64,
+    d_reclen: u16,
+    d_type: u8,
+    // followed by name bytes + '\0'
 }
 
 // ============================================================================
@@ -301,7 +361,9 @@ pub enum SyscallError {
     EMFILE = -24,  // 进程打开文件过多
     ENOTTY = -25,  // 不是终端设备
     EPIPE = -32,   // 管道破裂
+    ERANGE = -34,  // 结果超出范围
     ENOSYS = -38,  // 功能未实现
+    ENOTEMPTY = -39, // 目录非空
 }
 
 impl SyscallError {
@@ -417,6 +479,50 @@ pub type VfsStatCallback = fn(&str) -> Result<VfsStat, SyscallError>;
 /// file_ops_ref 是通过 as_any 获取的引用
 pub type VfsLseekCallback = fn(&dyn core::any::Any, i64, i32) -> Result<u64, SyscallError>;
 
+/// VFS 创建文件/目录回调类型
+///
+/// 由 vfs 模块注册，处理文件和目录创建
+/// 参数: (path, mode, is_dir) -> () 或错误
+pub type VfsCreateCallback = fn(&str, u32, bool) -> Result<(), SyscallError>;
+
+/// VFS 删除文件/目录回调类型
+///
+/// 由 vfs 模块注册，处理文件和目录删除
+/// 参数: (path) -> () 或错误
+pub type VfsUnlinkCallback = fn(&str) -> Result<(), SyscallError>;
+
+/// VFS 读取目录项回调类型
+///
+/// 由 vfs 模块注册，处理目录内容读取
+/// 参数: (fd, buf) -> 返回实际读取的目录项列表
+pub type VfsReaddirCallback = fn(i32) -> Result<alloc::vec::Vec<DirEntry>, SyscallError>;
+
+/// VFS 截断文件回调类型
+///
+/// 由 vfs 模块注册，处理文件截断操作
+/// 参数: (fd, length) -> () 或错误
+pub type VfsTruncateCallback = fn(i32, u64) -> Result<(), SyscallError>;
+
+/// 文件类型枚举(本地定义避免循环依赖)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    Regular,
+    Directory,
+    CharDevice,
+    BlockDevice,
+    Symlink,
+    Fifo,
+    Socket,
+}
+
+/// 目录项结构(本地定义避免循环依赖)
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub name: alloc::string::String,
+    pub ino: u64,
+    pub file_type: FileType,
+}
+
 /// VFS 文件状态信息
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -456,6 +562,14 @@ lazy_static::lazy_static! {
     static ref VFS_STAT_CALLBACK: spin::Mutex<Option<VfsStatCallback>> = spin::Mutex::new(None);
     /// VFS lseek 回调
     static ref VFS_LSEEK_CALLBACK: spin::Mutex<Option<VfsLseekCallback>> = spin::Mutex::new(None);
+    /// VFS 创建回调
+    static ref VFS_CREATE_CALLBACK: spin::Mutex<Option<VfsCreateCallback>> = spin::Mutex::new(None);
+    /// VFS 删除回调
+    static ref VFS_UNLINK_CALLBACK: spin::Mutex<Option<VfsUnlinkCallback>> = spin::Mutex::new(None);
+    /// VFS 读取目录回调
+    static ref VFS_READDIR_CALLBACK: spin::Mutex<Option<VfsReaddirCallback>> = spin::Mutex::new(None);
+    /// VFS 截断回调
+    static ref VFS_TRUNCATE_CALLBACK: spin::Mutex<Option<VfsTruncateCallback>> = spin::Mutex::new(None);
 }
 
 /// 注册管道创建回调
@@ -496,6 +610,41 @@ pub fn register_vfs_stat_callback(cb: VfsStatCallback) {
 /// 注册 VFS lseek 回调
 pub fn register_vfs_lseek_callback(cb: VfsLseekCallback) {
     *VFS_LSEEK_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 VFS 创建回调
+pub fn register_vfs_create_callback(cb: VfsCreateCallback) {
+    *VFS_CREATE_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 VFS 删除回调
+pub fn register_vfs_unlink_callback(cb: VfsUnlinkCallback) {
+    *VFS_UNLINK_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 VFS 读取目录回调
+pub fn register_vfs_readdir_callback(cb: VfsReaddirCallback) {
+    *VFS_READDIR_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 VFS 截断回调
+pub fn register_vfs_truncate_callback(cb: VfsTruncateCallback) {
+    *VFS_TRUNCATE_CALLBACK.lock() = Some(cb);
+}
+
+// ============================================================================
+// VFS 辅助函数
+// ============================================================================
+
+/// S_IFDIR 常量 - 目录类型标识
+const S_IFDIR: u32 = 0o040000;
+/// S_IFMT 常量 - 文件类型掩码
+const S_IFMT: u32 = 0o170000;
+
+/// 检查 mode 是否表示目录
+#[inline]
+fn is_directory_mode(mode: u32) -> bool {
+    (mode & S_IFMT) == S_IFDIR
 }
 
 /// 用户空间地址上界
@@ -778,6 +927,66 @@ fn get_audit_subject() -> AuditSubject {
     }
 }
 
+// ============================================================================
+// LSM Integration Helpers
+// ============================================================================
+
+/// Map LSM errors to syscall errno values.
+#[inline]
+fn lsm_error_to_syscall(err: lsm::LsmError) -> SyscallError {
+    match err {
+        lsm::LsmError::Denied => SyscallError::EPERM,
+        lsm::LsmError::Internal => SyscallError::EPERM,
+    }
+}
+
+/// Build an LSM ProcessCtx from current process state.
+/// Returns None if no current process is available.
+#[inline]
+fn lsm_current_process_ctx() -> Option<lsm::ProcessCtx> {
+    lsm::ProcessCtx::from_current()
+}
+
+/// Build an LSM ProcessCtx from a locked Process struct.
+#[inline]
+fn lsm_process_ctx_from(proc: &crate::process::Process) -> lsm::ProcessCtx {
+    lsm::ProcessCtx::new(
+        proc.pid,
+        proc.tgid,
+        proc.uid,
+        proc.gid,
+        proc.euid,
+        proc.egid,
+    )
+}
+
+/// Enforce task_fork LSM hook after fork/clone succeeds.
+/// On denial, cleans up the child process and returns EPERM.
+fn enforce_lsm_task_fork(parent_pid: ProcessId, child_pid: ProcessId) -> Result<(), SyscallError> {
+    let parent_arc = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
+    let child_arc = get_process(child_pid).ok_or(SyscallError::ESRCH)?;
+
+    let (parent_ctx, child_ctx) = {
+        let parent = parent_arc.lock();
+        let child = child_arc.lock();
+        (lsm_process_ctx_from(&parent), lsm_process_ctx_from(&child))
+    };
+
+    if let Err(err) = lsm::hook_task_fork(&parent_ctx, &child_ctx) {
+        // Rollback: remove child from parent's children list and terminate
+        if let Some(parent) = get_process(parent_pid) {
+            let mut parent = parent.lock();
+            parent.children.retain(|&pid| pid != child_pid);
+        }
+        // Use exit code 128 + signal (SIGSYS=31) to indicate security termination
+        terminate_process(child_pid, 128 + 31);
+        cleanup_zombie(child_pid);
+        return Err(lsm_error_to_syscall(err));
+    }
+
+    Ok(())
+}
+
 /// 系统调用分发器
 ///
 /// 根据系统调用号和参数执行相应的系统调用
@@ -880,6 +1089,19 @@ pub fn syscall_dispatcher(
         }
     }
 
+    // LSM hook: check syscall entry with security policy
+    // Build context before dispatch; on denial, return EPERM
+    let lsm_ctx = lsm::SyscallCtx::from_current(syscall_num, &args);
+    if let Some(ref ctx) = lsm_ctx {
+        if let Err(err) = lsm::hook_syscall_enter(ctx) {
+            // LSM denied the syscall - call exit hook and return error
+            let errno = lsm_error_to_syscall(err);
+            let ret = errno.as_i64();
+            let _ = lsm::hook_syscall_exit(ctx, ret as isize);
+            return ret;
+        }
+    }
+
     let result = match syscall_num {
         // 进程管理
         56 => sys_clone(arg0, arg1 as *mut u8, arg2 as *mut i32, arg3 as *mut i32, arg4),
@@ -896,6 +1118,10 @@ pub fn syscall_dispatcher(
         39 => sys_getpid(),
         186 => sys_gettid(),
         110 => sys_getppid(),
+        102 => sys_getuid(),
+        107 => sys_geteuid(),
+        104 => sys_getgid(),
+        108 => sys_getegid(),
         218 => sys_set_tid_address(arg0 as *mut i32),
         273 => sys_set_robust_list(arg0 as *const u8, arg1 as usize),
         62 => sys_kill(arg0 as ProcessId, arg1 as i32),
@@ -904,13 +1130,32 @@ pub fn syscall_dispatcher(
         0 => sys_read(arg0 as i32, arg1 as *mut u8, arg2 as usize),
         1 => sys_write(arg0 as i32, arg1 as *const u8, arg2 as usize),
         2 => sys_open(arg0 as *const u8, arg1 as i32, arg2 as u32),
+        257 => sys_openat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as u32),
         3 => sys_close(arg0 as i32),
         4 => sys_stat(arg0 as *const u8, arg1 as *mut VfsStat),
         5 => sys_fstat(arg0 as i32, arg1 as *mut VfsStat),
+        6 => sys_lstat(arg0 as *const u8, arg1 as *mut VfsStat),
+        262 => sys_fstatat(arg0 as i32, arg1 as *const u8, arg2 as *mut VfsStat, arg3 as i32),
         8 => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32),
         16 => sys_ioctl(arg0 as i32, arg1, arg2),
         20 => sys_writev(arg0 as i32, arg1 as *const Iovec, arg2 as usize),
         22 => sys_pipe(arg0 as *mut i32),
+        32 => sys_dup(arg0 as i32),
+        33 => sys_dup2(arg0 as i32, arg1 as i32),
+        292 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as i32),
+        77 => sys_ftruncate(arg0 as i32, arg1 as i64),
+        217 => sys_getdents64(arg0 as i32, arg1 as *mut u8, arg2 as usize),
+
+        // 文件系统操作
+        21 => sys_access(arg0 as *const u8, arg1 as i32),
+        79 => sys_getcwd(arg0 as *mut u8, arg1 as usize),
+        80 => sys_chdir(arg0 as *const u8),
+        83 => sys_mkdir(arg0 as *const u8, arg1 as u32),
+        84 => sys_rmdir(arg0 as *const u8),
+        87 => sys_unlink(arg0 as *const u8),
+        90 => sys_chmod(arg0 as *const u8, arg1 as u32),
+        91 => sys_fchmod(arg0 as i32, arg1 as u32),
+        95 => sys_umask(arg0 as u32),
 
         // 内存管理
         12 => sys_brk(arg0 as usize),
@@ -934,6 +1179,13 @@ pub fn syscall_dispatcher(
         // 安全/沙箱 (Seccomp/Prctl)
         157 => sys_prctl(arg0 as i32, arg1, arg2, arg3, arg4),
         317 => sys_seccomp(arg0 as u32, arg1 as u32, arg2),
+
+        // 时间相关
+        35 => sys_nanosleep(arg0 as *const TimeSpec, arg1 as *mut TimeSpec),
+        96 => sys_gettimeofday(arg0 as *mut TimeVal, arg1 as usize),
+
+        // 系统信息
+        63 => sys_uname(arg0 as *mut UtsName),
 
         // 其他
         24 => sys_yield(),
@@ -961,6 +1213,15 @@ pub fn syscall_dispatcher(
         timestamp,
     );
 
+    // LSM hook: notify security policy of syscall exit
+    if let Some(ref ctx) = lsm_ctx {
+        let ret = match &result {
+            Ok(val) => *val as isize,
+            Err(e) => e.as_i64() as isize,
+        };
+        let _ = lsm::hook_syscall_exit(ctx, ret);
+    }
+
     // 在返回用户态前检查是否需要调度
     // 这是定时器中断设置的 NEED_RESCHED 标志的主要消费点
     crate::reschedule_if_needed();
@@ -978,6 +1239,11 @@ pub fn syscall_dispatcher(
 /// sys_exit - 终止当前进程
 fn sys_exit(exit_code: i32) -> SyscallResult {
     if let Some(pid) = current_pid() {
+        // LSM hook: notify policy of process exit (informational, doesn't block)
+        if let Some(exit_ctx) = lsm_current_process_ctx() {
+            let _ = lsm::hook_task_exit(&exit_ctx, exit_code);
+        }
+
         terminate_process(pid, exit_code);
         println!("Process {} exited with code {}", pid, exit_code);
 
@@ -1009,12 +1275,15 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
 
 /// sys_fork - 创建子进程
 fn sys_fork() -> SyscallResult {
-    if current_pid().is_none() {
-        return Err(SyscallError::ESRCH);
-    }
+    let parent_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+
     // 调用真正的 fork 实现（包含 COW 支持）
     match crate::fork::sys_fork() {
-        Ok(child_pid) => Ok(child_pid),
+        Ok(child_pid) => {
+            // LSM hook: check if policy allows this fork
+            enforce_lsm_task_fork(parent_pid, child_pid)?;
+            Ok(child_pid)
+        }
         Err(_) => Err(SyscallError::ENOMEM),
     }
 }
@@ -1193,9 +1462,9 @@ fn sys_clone(
         // 不共享地址空间：使用 COW fork
         match crate::fork::sys_fork() {
             Ok(child_pid) => {
-                // fork 成功，直接返回（fork 已处理所有复制）
-                // 但我们需要应用其他 clone flags
+                // fork 成功，执行 LSM 检查
                 // 这种情况很少见（clone 不带 CLONE_VM 通常就是 fork）
+                enforce_lsm_task_fork(parent_pid, child_pid)?;
                 return Ok(child_pid);
             }
             Err(_) => return Err(SyscallError::ENOMEM),
@@ -1360,6 +1629,23 @@ fn sys_clone(
             }
         }
 
+        // 克隆能力表（CLONE_THREAD 时共享，否则克隆并过滤 CLOFORK）
+        //
+        // 对于线程（CLONE_THREAD），共享父进程的能力表（通过 Arc）
+        // 对于进程（无 CLONE_THREAD），使用 clone_for_fork() 过滤 CLOFORK 条目
+        //
+        // 注意：与 fd_table 不同，cap_table 使用 Arc 包装，天然支持共享
+        if flags & CLONE_THREAD != 0 {
+            // 线程：共享父进程的能力表
+            let parent = parent_arc.lock();
+            child.cap_table = parent.cap_table.clone();
+        } else if flags & CLONE_FILES != 0 {
+            // 非线程但共享文件：克隆能力表并过滤 CLOFORK
+            let parent = parent_arc.lock();
+            child.cap_table = Arc::new(parent.cap_table.clone_for_fork());
+        }
+        // 否则保持 child 的默认空能力表（由 Process::new 创建）
+
         // 设置进程状态为就绪
         child.state = ProcessState::Ready;
     }
@@ -1375,6 +1661,10 @@ fn sys_clone(
         let tid_bytes = (child_pid as i32).to_ne_bytes();
         copy_to_user(child_tid as *mut u8, &tid_bytes)?;
     }
+
+    // LSM hook: check if policy allows this fork/clone
+    // Must be BEFORE scheduler notification to prevent denied child from running
+    enforce_lsm_task_fork(parent_pid, child_pid)?;
 
     // 将子进程添加到调度器（通过回调，避免循环依赖）
     if let Some(child_arc) = get_process(child_pid) {
@@ -1442,6 +1732,20 @@ fn sys_exec(
     // 复制 argv 和 envp 到内核
     let argv_vec = copy_user_str_array(argv)?;
     let envp_vec = copy_user_str_array(envp)?;
+
+    // LSM hook: check if policy allows this exec
+    // Use path hash from first argv element (program name) for policy check
+    let path_hash = argv_vec
+        .first()
+        .and_then(|bytes| core::str::from_utf8(bytes).ok())
+        .map(|s| audit::hash_path(s))
+        .unwrap_or(0);
+
+    if let Some(exec_ctx) = lsm_current_process_ctx() {
+        if let Err(err) = lsm::hook_task_exec(&exec_ctx, path_hash) {
+            return Err(lsm_error_to_syscall(err));
+        }
+    }
 
     // 创建新的地址空间
     let (_new_pml4_frame, new_memory_space) =
@@ -1697,6 +2001,13 @@ fn sys_exec(
 
         // Seccomp 过滤器在 exec 后保持不变（Linux 语义）
         // no_new_privs 仍然有效，防止特权提升
+
+        // 应用 CLOEXEC 能力：撤销带有 CLOEXEC 标志的能力条目
+        //
+        // 新加载的程序不应继承标记为 CLOEXEC 的能力，这与文件描述符
+        // 的 CLOEXEC 语义一致。apply_cloexec() 会将这些条目撤销并
+        // 返回到空闲列表，同时递增生成计数器防止旧 CapId 被复用。
+        proc.cap_table.apply_cloexec();
 
         proc.state = ProcessState::Ready;
 
@@ -2329,6 +2640,29 @@ fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
             .to_string()
     };
 
+    // LSM hook: check file create permission if O_CREAT is set
+    let open_flags = flags as u32;
+    let path_hash = audit::hash_path(&path_str);
+
+    if let Some(proc_ctx) = lsm_current_process_ctx() {
+        // Check create permission first (if O_CREAT)
+        if open_flags & lsm::OpenFlags::O_CREAT != 0 {
+            // Get parent directory inode and name hash
+            let (parent_hash, name_hash) = match path_str.rfind('/') {
+                Some(0) => (audit::hash_path("/"), audit::hash_path(&path_str[1..])),
+                Some(idx) => (
+                    audit::hash_path(&path_str[..idx]),
+                    audit::hash_path(&path_str[idx + 1..]),
+                ),
+                None => (audit::hash_path("."), path_hash),
+            };
+
+            if let Err(err) = lsm::hook_file_create(&proc_ctx, parent_hash, name_hash, mode & 0o7777) {
+                return Err(lsm_error_to_syscall(err));
+            }
+        }
+    }
+
     // 获取 VFS 回调
     let open_fn = {
         let callback = VFS_OPEN_CALLBACK.lock();
@@ -2337,6 +2671,16 @@ fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
 
     // 调用 VFS 打开文件
     let file_ops = open_fn(&path_str, flags as u32, mode)?;
+
+    // LSM hook: check file open permission
+    // This is after VFS open to have file metadata, but before fd allocation
+    // If denied, file_ops will be dropped (closed) automatically
+    if let Some(proc_ctx) = lsm_current_process_ctx() {
+        let file_ctx = lsm::FileCtx::new(path_hash, mode, path_hash);
+        if let Err(err) = lsm::hook_file_open(&proc_ctx, path_hash, lsm::OpenFlags(open_flags), &file_ctx) {
+            return Err(lsm_error_to_syscall(err));
+        }
+    }
 
     // 分配文件描述符并存入 fd_table
     let fd = {
@@ -3700,6 +4044,588 @@ fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> SyscallResult {
     copy_to_user(buf, &tmp)?;
 
     Ok(count)
+}
+
+// ============================================================================
+// 用户/组ID系统调用
+// ============================================================================
+
+/// sys_getuid - 获取真实用户ID
+fn sys_getuid() -> SyscallResult {
+    let creds = crate::process::current_credentials().ok_or(SyscallError::EPERM)?;
+    Ok(creds.uid as usize)
+}
+
+/// sys_geteuid - 获取有效用户ID
+fn sys_geteuid() -> SyscallResult {
+    let creds = crate::process::current_credentials().ok_or(SyscallError::EPERM)?;
+    Ok(creds.euid as usize)
+}
+
+/// sys_getgid - 获取真实组ID
+fn sys_getgid() -> SyscallResult {
+    let creds = crate::process::current_credentials().ok_or(SyscallError::EPERM)?;
+    Ok(creds.gid as usize)
+}
+
+/// sys_getegid - 获取有效组ID
+fn sys_getegid() -> SyscallResult {
+    let creds = crate::process::current_credentials().ok_or(SyscallError::EPERM)?;
+    Ok(creds.egid as usize)
+}
+
+// ============================================================================
+// 文件系统附加系统调用
+// ============================================================================
+
+/// sys_getcwd - 获取当前工作目录
+///
+/// 当前实现返回固定值"/"，因为PCB未跟踪工作目录。
+fn sys_getcwd(buf: *mut u8, size: usize) -> SyscallResult {
+    if buf.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    if size < 2 {
+        return Err(SyscallError::ERANGE);
+    }
+
+    // 当前工作目录固定为根目录
+    let cwd = b"/\0";
+    copy_to_user(buf, cwd)?;
+    Ok(cwd.len())
+}
+
+/// sys_chdir - 更改当前工作目录
+///
+/// 当前实现仅验证路径存在，但不真正更改工作目录。
+fn sys_chdir(path: *const u8) -> SyscallResult {
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // 复制路径
+    let path_bytes = crate::usercopy::copy_user_cstring(path)
+        .map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes)
+        .map_err(|_| SyscallError::EINVAL)?;
+
+    // 通过回调获取stat并验证路径存在且是目录
+    let stat_fn = VFS_STAT_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
+    let stat = stat_fn(path_str)?;
+    if !is_directory_mode(stat.mode) {
+        return Err(SyscallError::ENOTDIR);
+    }
+
+    // TODO: 将cwd存储在PCB中
+    Ok(0)
+}
+
+/// sys_mkdir - 创建目录
+fn sys_mkdir(path: *const u8, mode: u32) -> SyscallResult {
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let path_bytes = crate::usercopy::copy_user_cstring(path)
+        .map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes)
+        .map_err(|_| SyscallError::EINVAL)?;
+
+    // LSM hook: check mkdir permission
+    if let Some(proc_ctx) = lsm_current_process_ctx() {
+        let (parent_hash, name_hash) = match path_str.rfind('/') {
+            Some(0) => (audit::hash_path("/"), audit::hash_path(&path_str[1..])),
+            Some(idx) => (
+                audit::hash_path(&path_str[..idx]),
+                audit::hash_path(&path_str[idx + 1..]),
+            ),
+            None => (audit::hash_path("."), audit::hash_path(path_str)),
+        };
+        if let Err(err) = lsm::hook_file_mkdir(&proc_ctx, parent_hash, name_hash, mode & 0o7777) {
+            return Err(lsm_error_to_syscall(err));
+        }
+    }
+
+    // 通过回调创建目录
+    let create_fn = VFS_CREATE_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
+    create_fn(path_str, mode & 0o7777, true)?;
+    Ok(0)
+}
+
+/// sys_rmdir - 删除空目录
+fn sys_rmdir(path: *const u8) -> SyscallResult {
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let path_bytes = crate::usercopy::copy_user_cstring(path)
+        .map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes)
+        .map_err(|_| SyscallError::EINVAL)?;
+
+    // 通过回调检查是否为目录
+    let stat_fn = VFS_STAT_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
+    let stat = stat_fn(path_str)?;
+    if !is_directory_mode(stat.mode) {
+        return Err(SyscallError::ENOTDIR);
+    }
+
+    // LSM hook: check rmdir permission
+    if let Some(proc_ctx) = lsm_current_process_ctx() {
+        let (parent_hash, name_hash) = match path_str.rfind('/') {
+            Some(0) => (audit::hash_path("/"), audit::hash_path(&path_str[1..])),
+            Some(idx) => (
+                audit::hash_path(&path_str[..idx]),
+                audit::hash_path(&path_str[idx + 1..]),
+            ),
+            None => (audit::hash_path("."), audit::hash_path(path_str)),
+        };
+        if let Err(err) = lsm::hook_file_rmdir(&proc_ctx, parent_hash, name_hash) {
+            return Err(lsm_error_to_syscall(err));
+        }
+    }
+
+    // 通过回调删除目录
+    let unlink_fn = VFS_UNLINK_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
+    unlink_fn(path_str)?;
+    Ok(0)
+}
+
+/// sys_unlink - 删除文件
+fn sys_unlink(path: *const u8) -> SyscallResult {
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let path_bytes = crate::usercopy::copy_user_cstring(path)
+        .map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes)
+        .map_err(|_| SyscallError::EINVAL)?;
+
+    // 不允许删除目录 (应使用rmdir)
+    let stat_fn = VFS_STAT_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
+    if let Ok(stat) = stat_fn(path_str) {
+        if is_directory_mode(stat.mode) {
+            return Err(SyscallError::EISDIR);
+        }
+    }
+
+    // LSM hook: check unlink permission
+    if let Some(proc_ctx) = lsm_current_process_ctx() {
+        let (parent_hash, name_hash) = match path_str.rfind('/') {
+            Some(0) => (audit::hash_path("/"), audit::hash_path(&path_str[1..])),
+            Some(idx) => (
+                audit::hash_path(&path_str[..idx]),
+                audit::hash_path(&path_str[idx + 1..]),
+            ),
+            None => (audit::hash_path("."), audit::hash_path(path_str)),
+        };
+        if let Err(err) = lsm::hook_file_unlink(&proc_ctx, parent_hash, name_hash) {
+            return Err(lsm_error_to_syscall(err));
+        }
+    }
+
+    // 通过回调删除文件
+    let unlink_fn = VFS_UNLINK_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
+    unlink_fn(path_str)?;
+    Ok(0)
+}
+
+/// sys_access - 检查文件访问权限
+///
+/// mode: R_OK(4) | W_OK(2) | X_OK(1) | F_OK(0)
+fn sys_access(path: *const u8, mode: i32) -> SyscallResult {
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let path_bytes = crate::usercopy::copy_user_cstring(path)
+        .map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes)
+        .map_err(|_| SyscallError::EINVAL)?;
+
+    // 通过回调获取文件状态
+    let stat_fn = VFS_STAT_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
+    let stat = stat_fn(path_str)?;
+
+    // F_OK(0) - 仅检查文件是否存在
+    if mode == 0 {
+        return Ok(0);
+    }
+
+    // 获取当前进程凭证
+    let euid = crate::current_euid().unwrap_or(0);
+    let egid = crate::current_egid().unwrap_or(0);
+    let sup_groups = crate::current_supplementary_groups().unwrap_or_default();
+
+    // root用户拥有所有权限
+    if euid == 0 {
+        return Ok(0);
+    }
+
+    // 计算权限位
+    let perm_bits = if euid == stat.uid {
+        (stat.mode >> 6) & 0o7
+    } else if egid == stat.gid || sup_groups.iter().any(|&g| g == stat.gid) {
+        (stat.mode >> 3) & 0o7
+    } else {
+        stat.mode & 0o7
+    };
+
+    let need_read = (mode & 4) != 0;
+    let need_write = (mode & 2) != 0;
+    let need_exec = (mode & 1) != 0;
+
+    let ok = (!need_read || (perm_bits & 0o4) != 0)
+        && (!need_write || (perm_bits & 0o2) != 0)
+        && (!need_exec || (perm_bits & 0o1) != 0);
+
+    if ok {
+        Ok(0)
+    } else {
+        Err(SyscallError::EACCES)
+    }
+}
+
+/// sys_lstat - 获取符号链接状态
+///
+/// 当前VFS不支持符号链接，等同于stat。
+fn sys_lstat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
+    sys_stat(path, statbuf)
+}
+
+/// sys_fstatat - 相对路径stat
+///
+/// 当前仅支持AT_FDCWD或绝对路径。
+fn sys_fstatat(dirfd: i32, path: *const u8, statbuf: *mut VfsStat, _flags: i32) -> SyscallResult {
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // 检查路径是否为绝对路径
+    let first_byte = unsafe { *path };
+
+    if dirfd != AT_FDCWD && first_byte != b'/' {
+        // 相对路径 + 非AT_FDCWD: 暂不支持
+        return Err(SyscallError::ENOSYS);
+    }
+
+    sys_stat(path, statbuf)
+}
+
+/// sys_openat - 相对路径打开文件
+///
+/// 当前仅支持AT_FDCWD或绝对路径。
+fn sys_openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -> SyscallResult {
+    if path.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let first_byte = unsafe { *path };
+
+    if dirfd != AT_FDCWD && first_byte != b'/' {
+        return Err(SyscallError::ENOSYS);
+    }
+
+    sys_open(path, flags, mode)
+}
+
+// ============================================================================
+// 文件描述符操作系统调用
+// ============================================================================
+
+/// sys_dup - 复制文件描述符
+fn sys_dup(oldfd: i32) -> SyscallResult {
+    if oldfd < 0 {
+        return Err(SyscallError::EBADF);
+    }
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let mut proc = proc_arc.lock();
+
+    let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
+    let cloned = src.clone_box();
+
+    let newfd = proc.allocate_fd(cloned).ok_or(SyscallError::EMFILE)?;
+    Ok(newfd as usize)
+}
+
+/// sys_dup2 - 复制文件描述符到指定位置
+fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
+    if oldfd < 0 || newfd < 0 {
+        return Err(SyscallError::EBADF);
+    }
+
+    if oldfd == newfd {
+        // 验证oldfd有效
+        let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+        let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+        let proc = proc_arc.lock();
+        proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
+        return Ok(newfd as usize);
+    }
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let mut proc = proc_arc.lock();
+
+    let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
+    let cloned = src.clone_box();
+
+    // 如果newfd已打开，先关闭它
+    proc.fd_table.remove(&newfd);
+    proc.fd_table.insert(newfd, cloned);
+
+    Ok(newfd as usize)
+}
+
+/// sys_dup3 - 复制文件描述符(带flags)
+///
+/// flags: O_CLOEXEC(0x80000)
+fn sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> SyscallResult {
+    if oldfd < 0 || newfd < 0 {
+        return Err(SyscallError::EBADF);
+    }
+
+    if oldfd == newfd {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // 仅接受O_CLOEXEC标志
+    const O_CLOEXEC: i32 = 0x80000;
+    if flags & !O_CLOEXEC != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let mut proc = proc_arc.lock();
+
+    let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
+    let cloned = src.clone_box();
+
+    proc.fd_table.remove(&newfd);
+    proc.fd_table.insert(newfd, cloned);
+
+    // TODO: 如果flags包含O_CLOEXEC，标记fd为close-on-exec
+
+    Ok(newfd as usize)
+}
+
+/// sys_ftruncate - 截断文件
+fn sys_ftruncate(fd: i32, length: i64) -> SyscallResult {
+    if fd < 0 {
+        return Err(SyscallError::EBADF);
+    }
+    if length < 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // 通过回调执行截断
+    let truncate_fn = VFS_TRUNCATE_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
+    truncate_fn(fd, length as u64)?;
+    Ok(0)
+}
+
+/// sys_chmod - 修改文件权限
+///
+/// 当前VFS不支持chmod操作。
+fn sys_chmod(_path: *const u8, _mode: u32) -> SyscallResult {
+    // VFS trait未提供chmod方法
+    Err(SyscallError::ENOSYS)
+}
+
+/// sys_fchmod - 修改文件权限(通过fd)
+///
+/// 当前VFS不支持chmod操作。
+fn sys_fchmod(_fd: i32, _mode: u32) -> SyscallResult {
+    Err(SyscallError::ENOSYS)
+}
+
+/// sys_umask - 设置文件创建掩码
+fn sys_umask(mask: u32) -> SyscallResult {
+    let old = crate::set_current_umask((mask & 0o777) as u16)
+        .ok_or(SyscallError::ESRCH)?;
+    Ok(old as usize)
+}
+
+/// sys_getdents64 - 读取目录项
+fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
+    if fd < 0 {
+        return Err(SyscallError::EBADF);
+    }
+    if dirp.is_null() || count == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // 通过回调读取目录项
+    let readdir_fn = VFS_READDIR_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
+    let entries = readdir_fn(fd)?;
+
+    // 构建dirent64结构
+    let mut written = 0usize;
+    let header_size = core::mem::size_of::<LinuxDirent64>();
+
+    for entry in entries {
+        let name_bytes = entry.name.as_bytes();
+        let reclen = ((header_size + name_bytes.len() + 1 + 7) / 8) * 8; // 8字节对齐
+
+        if written + reclen > count {
+            break;
+        }
+
+        let d_type = match entry.file_type {
+            FileType::Regular => 8,     // DT_REG
+            FileType::Directory => 4,   // DT_DIR
+            FileType::CharDevice => 2,  // DT_CHR
+            FileType::BlockDevice => 6, // DT_BLK
+            FileType::Symlink => 10,    // DT_LNK
+            FileType::Fifo => 1,        // DT_FIFO
+            FileType::Socket => 12,     // DT_SOCK
+        };
+
+        // 构建dirent结构到临时缓冲区
+        let mut buf = vec![0u8; reclen];
+        let dirent = LinuxDirent64 {
+            d_ino: entry.ino,
+            d_off: (written + reclen) as i64,
+            d_reclen: reclen as u16,
+            d_type,
+        };
+
+        // 复制header
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                &dirent as *const _ as *const u8,
+                buf.as_mut_ptr(),
+                header_size,
+            );
+        }
+
+        // 复制文件名
+        buf[header_size..header_size + name_bytes.len()].copy_from_slice(name_bytes);
+        buf[header_size + name_bytes.len()] = 0; // NUL terminator
+
+        // 复制到用户空间
+        copy_to_user(unsafe { dirp.add(written) }, &buf)?;
+        written += reclen;
+    }
+
+    Ok(written)
+}
+
+// ============================================================================
+// 时间系统调用
+// ============================================================================
+
+/// sys_nanosleep - 高精度睡眠
+///
+/// 当前使用忙等待实现，未来应使用定时器。
+fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> SyscallResult {
+    if req.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let mut ts = TimeSpec::default();
+    let ts_bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            &mut ts as *mut TimeSpec as *mut u8,
+            core::mem::size_of::<TimeSpec>(),
+        )
+    };
+    crate::usercopy::copy_from_user_safe(ts_bytes, req as *const u8)
+        .map_err(|_| SyscallError::EFAULT)?;
+
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // 计算睡眠时间(毫秒)
+    let total_ms = (ts.tv_sec as u64)
+        .saturating_mul(1000)
+        .saturating_add((ts.tv_nsec / 1_000_000) as u64);
+
+    // 忙等待实现
+    let start = crate::time::get_ticks();
+    while crate::time::get_ticks().saturating_sub(start) < total_ms {
+        core::hint::spin_loop();
+    }
+
+    // 如果提供了rem，设置为0
+    if !rem.is_null() {
+        let zero = TimeSpec { tv_sec: 0, tv_nsec: 0 };
+        let zero_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &zero as *const TimeSpec as *const u8,
+                core::mem::size_of::<TimeSpec>(),
+            )
+        };
+        crate::usercopy::copy_to_user_safe(rem as *mut u8, zero_bytes)
+            .map_err(|_| SyscallError::EFAULT)?;
+    }
+
+    Ok(0)
+}
+
+/// sys_gettimeofday - 获取当前时间
+fn sys_gettimeofday(tv: *mut TimeVal, _tz: usize) -> SyscallResult {
+    if tv.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let ms = crate::time::current_timestamp_ms();
+    let timeval = TimeVal {
+        tv_sec: (ms / 1000) as i64,
+        tv_usec: ((ms % 1000) * 1000) as i64,
+    };
+
+    let tv_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &timeval as *const TimeVal as *const u8,
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+    crate::usercopy::copy_to_user_safe(tv as *mut u8, tv_bytes)
+        .map_err(|_| SyscallError::EFAULT)?;
+
+    Ok(0)
+}
+
+// ============================================================================
+// 系统信息系统调用
+// ============================================================================
+
+/// sys_uname - 获取系统信息
+fn sys_uname(buf: *mut UtsName) -> SyscallResult {
+    if buf.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    fn fill_field(target: &mut [u8; 65], src: &str) {
+        let bytes = src.as_bytes();
+        let len = bytes.len().min(64);
+        target[..len].copy_from_slice(&bytes[..len]);
+        target[len] = 0;
+    }
+
+    let mut uts = UtsName::default();
+    fill_field(&mut uts.sysname, "Zero-OS");
+    fill_field(&mut uts.nodename, "zero-node");
+    fill_field(&mut uts.release, "0.6.5");
+    fill_field(&mut uts.version, "Security Foundation Phase A");
+    fill_field(&mut uts.machine, "x86_64");
+
+    let uts_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &uts as *const UtsName as *const u8,
+            core::mem::size_of::<UtsName>(),
+        )
+    };
+    crate::usercopy::copy_to_user_safe(buf as *mut u8, uts_bytes)
+        .map_err(|_| SyscallError::EFAULT)?;
+
+    Ok(0)
 }
 
 /// 系统调用统计

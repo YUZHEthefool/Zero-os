@@ -16,3 +16,5 @@ xmas-elf = "0.9"
 cpu_local = { path = "../cpu_local" }
 audit = { path = "../audit" }
 seccomp = { path = "../seccomp" }
+cap = { path = "../cap" }
+lsm = { path = "../lsm" }

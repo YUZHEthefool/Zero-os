@@ -710,5 +710,110 @@ pub fn register_syscall_callbacks() {
     kernel_core::register_vfs_open_callback(vfs_open_callback);
     kernel_core::register_vfs_stat_callback(vfs_stat_callback);
     kernel_core::register_vfs_lseek_callback(vfs_lseek_callback);
+    kernel_core::register_vfs_create_callback(vfs_create_callback);
+    kernel_core::register_vfs_unlink_callback(vfs_unlink_callback);
+    kernel_core::register_vfs_readdir_callback(vfs_readdir_callback);
+    kernel_core::register_vfs_truncate_callback(vfs_truncate_callback);
     println!("VFS syscall callbacks registered");
+}
+
+/// VFS create callback for syscall registration
+///
+/// Called by sys_mkdir to create directories
+fn vfs_create_callback(path: &str, mode: u32, is_dir: bool) -> Result<(), SyscallError> {
+    let file_mode = if is_dir {
+        FileMode::directory((mode & 0o7777) as u16)
+    } else {
+        FileMode::regular((mode & 0o7777) as u16)
+    };
+
+    VFS.create(path, file_mode)
+        .map(|_| ())
+        .map_err(fs_error_to_syscall)
+}
+
+/// VFS unlink callback for syscall registration
+///
+/// Called by sys_unlink/sys_rmdir to delete files/directories
+fn vfs_unlink_callback(path: &str) -> Result<(), SyscallError> {
+    VFS.unlink(path).map_err(fs_error_to_syscall)
+}
+
+/// VFS readdir callback for syscall registration
+///
+/// Called by sys_getdents64 to read directory entries
+fn vfs_readdir_callback(fd: i32) -> Result<alloc::vec::Vec<kernel_core::DirEntry>, SyscallError> {
+    use kernel_core::current_pid;
+    use kernel_core::get_process;
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let proc = proc_arc.lock();
+
+    let handle = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+
+    // Downcast to FileHandle
+    let file_handle = handle
+        .as_any()
+        .downcast_ref::<FileHandle>()
+        .ok_or(SyscallError::ENOTDIR)?;
+
+    if !file_handle.inode.is_dir() {
+        return Err(SyscallError::ENOTDIR);
+    }
+
+    // Read all directory entries
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        match file_handle.inode.readdir(offset) {
+            Ok(Some((next, entry))) => {
+                // Convert VFS DirEntry to kernel_core DirEntry
+                let file_type = match entry.file_type {
+                    crate::types::FileType::Regular => kernel_core::FileType::Regular,
+                    crate::types::FileType::Directory => kernel_core::FileType::Directory,
+                    crate::types::FileType::CharDevice => kernel_core::FileType::CharDevice,
+                    crate::types::FileType::BlockDevice => kernel_core::FileType::BlockDevice,
+                    crate::types::FileType::Symlink => kernel_core::FileType::Symlink,
+                    crate::types::FileType::Fifo => kernel_core::FileType::Fifo,
+                    crate::types::FileType::Socket => kernel_core::FileType::Socket,
+                };
+                entries.push(kernel_core::DirEntry {
+                    name: entry.name,
+                    ino: entry.ino,
+                    file_type,
+                });
+                offset = next;
+            }
+            Ok(None) => break,
+            Err(e) => return Err(fs_error_to_syscall(e)),
+        }
+    }
+
+    Ok(entries)
+}
+
+/// VFS truncate callback for syscall registration
+///
+/// Called by sys_ftruncate to truncate a file
+fn vfs_truncate_callback(fd: i32, length: u64) -> Result<(), SyscallError> {
+    use kernel_core::current_pid;
+    use kernel_core::get_process;
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let proc = proc_arc.lock();
+
+    let handle = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+
+    // Downcast to FileHandle
+    let file_handle = handle
+        .as_any()
+        .downcast_ref::<FileHandle>()
+        .ok_or(SyscallError::ENOSYS)?;
+
+    file_handle
+        .inode
+        .truncate(length)
+        .map_err(fs_error_to_syscall)
 }

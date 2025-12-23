@@ -13,8 +13,8 @@ bitflags = "2.4"
 x86_64 = "0.15"
 
 # Cross-crate dependencies (within kernel workspace)
-kernel_core = { path = "../kernel_core" }
-ipc = { path = "../ipc" }
+# Note: kernel_core removed to avoid cyclic dependency
+# ProcessId and FileOps are defined locally in types.rs
 drivers = { path = "../drivers" }
 
 [features]

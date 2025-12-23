@@ -181,6 +181,12 @@ fn fork_inner(
             child.fd_table.insert(fd, desc.clone_box());
         }
 
+        // 克隆能力表（尊重 CLOFORK 标志）
+        //
+        // clone_for_fork() 会过滤掉带有 CLOFORK 标志的能力条目，
+        // 并保持生成计数器的单调性以防止 wrap 攻击。
+        child.cap_table = Arc::new(parent.cap_table.clone_for_fork());
+
         child.time_slice = parent.time_slice;
         child.cpu_time = 0;
 

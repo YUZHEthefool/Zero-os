@@ -1,27 +1,21 @@
 //! KASLR/KPTI Infrastructure for Zero-OS
 //!
 //! This module provides the infrastructure for Kernel Address Space Layout
-//! Randomization (KASLR) and Kernel Page Table Isolation (KPTI).
+//! Randomization (KASLR), Kernel Page Table Isolation (KPTI), and PCID support.
 //!
-//! # Phase A.4 Preparation
+//! # Current Implementation (Phase A.4)
 //!
-//! This is the preparation phase. Full implementation deferred to later phases:
-//! - KASLR slide generation: Phase A.5
-//! - Dual page tables: Phase B
-//! - CR3 flips in syscall: Phase B
-//!
-//! # Current Status
-//!
-//! - KernelLayout: Provides runtime kernel location info (currently fixed)
+//! - PCID detection and CR4.PCIDE enablement
+//! - KASLR slide generation (2 MiB aligned, 0-512 MiB range)
+//! - KernelLayout: Provides runtime kernel location info
 //! - KPTI stubs: No-op hooks for future CR3 switching
-//! - BootInfo extensions: Fields for KASLR (with zero/default values)
 //!
 //! # Design
 //!
 //! ```text
-//! KASLR (future):
+//! KASLR:
 //! +------------------+
-//! | Randomized Slide | (boot-time, from RDRAND)
+//! | Randomized Slide | (boot-time, from RDRAND via CSPRNG)
 //! +------------------+
 //! | Kernel Text      | 0xffffffff80000000 + slide
 //! +------------------+
@@ -36,14 +30,50 @@
 //! | Trampoline only  |  | Full kernel      |
 //! +------------------+  +------------------+
 //! ```
+//!
+//! # Note on Runtime KASLR
+//!
+//! The kernel is loaded at a fixed physical address by the bootloader.
+//! Full KASLR would require bootloader cooperation to randomize the load
+//! address. The current implementation generates and stores a slide value
+//! that can be used for:
+//! - Future bootloader integration
+//! - Runtime address randomization experiments
+//! - ASLR for dynamically loaded kernel modules
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use spin::Mutex;
+use x86_64::registers::control::{Cr4, Cr4Flags};
+
+use crate::rng;
 
 /// Whether KASLR is enabled (future: set by bootloader)
 static KASLR_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Whether KPTI is enabled (future: set during init)
 static KPTI_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether PCID is enabled (set during init if CPU supports it)
+static PCID_ENABLED: AtomicBool = AtomicBool::new(false);
+
+// ============================================================================
+// KASLR Configuration Constants
+// ============================================================================
+
+/// Maximum randomized slide: 512 MiB
+///
+/// This must fit within the high-half kernel address space and leave
+/// room for the kernel image, heap, and stack areas.
+const KASLR_MAX_SLIDE: u64 = 512 * 1024 * 1024;
+
+/// Slide granularity: 2 MiB (huge page alignment)
+///
+/// Using 2 MiB alignment allows the kernel to use huge pages for
+/// better TLB efficiency and simplifies page table management.
+const KASLR_SLIDE_GRANULARITY: u64 = 2 * 1024 * 1024;
+
+/// Global kernel layout (updated during init)
+static KERNEL_LAYOUT: Mutex<KernelLayout> = Mutex::new(KernelLayout::fixed());
 
 // ============================================================================
 // Kernel Layout
@@ -173,7 +203,7 @@ impl KernelLayout {
             bss_size: 0,
             heap_start: 0xffffffff80200000 + slide,
             heap_size: 1 * 1024 * 1024,
-            phys_offset: 0,
+            phys_offset: PHYSICAL_MEMORY_OFFSET,
         }
     }
 
@@ -397,15 +427,10 @@ pub fn is_kpti_enabled() -> bool {
 
 /// Get the current kernel layout
 ///
-/// Returns the fixed layout for now; will return randomized layout
-/// when KASLR is enabled.
+/// Returns the global kernel layout, which may include a KASLR slide
+/// if KASLR was enabled during initialization.
 pub fn get_kernel_layout() -> KernelLayout {
-    if is_kaslr_enabled() {
-        // Future: return layout with applied slide
-        KernelLayout::fixed()
-    } else {
-        KernelLayout::fixed()
-    }
+    *KERNEL_LAYOUT.lock()
 }
 
 /// Enable KASLR (called by bootloader/early init)
@@ -429,6 +454,140 @@ pub fn enable_kaslr() {
 #[allow(dead_code)]
 pub fn enable_kpti() {
     KPTI_ENABLED.store(true, Ordering::SeqCst);
+}
+
+// ============================================================================
+// PCID Detection and Enablement
+// ============================================================================
+
+/// Execute CPUID leaf 1 to get feature flags
+///
+/// Returns (eax, ebx, ecx, edx) where:
+/// - ecx[17] = PCID support
+/// - ecx[30] = RDRAND support
+/// - edx[13] = PGE (Global Pages) support
+fn cpuid_leaf1() -> (u32, u32, u32, u32) {
+    let eax: u32;
+    let ebx: u32;
+    let ecx: u32;
+    let edx: u32;
+
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "mov {ebx_out:e}, ebx",
+            "pop rbx",
+            out("eax") eax,
+            ebx_out = out(reg) ebx,
+            out("ecx") ecx,
+            out("edx") edx,
+            options(nomem, nostack)
+        );
+    }
+
+    (eax, ebx, ecx, edx)
+}
+
+/// Check if PCID is supported (CPUID.01H:ECX[17])
+///
+/// PCID (Process Context Identifiers) allows the CPU to maintain TLB
+/// entries tagged with a process ID, reducing TLB flushes on context switch.
+fn pcid_supported() -> bool {
+    let (_, _, ecx, _) = cpuid_leaf1();
+    (ecx & (1 << 17)) != 0
+}
+
+/// Check if Global Pages are supported (CPUID.01H:EDX[13])
+///
+/// PGE is a prerequisite for PCID on some implementations.
+fn pge_supported() -> bool {
+    let (_, _, _, edx) = cpuid_leaf1();
+    (edx & (1 << 13)) != 0
+}
+
+/// Enable PCID by setting CR4.PCIDE if CPU supports it
+///
+/// Returns true if PCID was successfully enabled.
+///
+/// # Prerequisites
+///
+/// - CPU must support PCID (CPUID.01H:ECX[17])
+/// - CPU must support PGE (CPUID.01H:EDX[13])
+fn enable_pcid_if_supported() -> bool {
+    if !pcid_supported() {
+        return false;
+    }
+
+    // Read current CR4
+    let mut cr4 = Cr4::read();
+
+    // Enable PGE (Global Pages) - often a prerequisite for PCID
+    if pge_supported() && !cr4.contains(Cr4Flags::PAGE_GLOBAL) {
+        cr4.insert(Cr4Flags::PAGE_GLOBAL);
+    }
+
+    // Enable PCID
+    if !cr4.contains(Cr4Flags::PCID) {
+        cr4.insert(Cr4Flags::PCID);
+        unsafe { Cr4::write(cr4) };
+    }
+
+    // Verify PCID is now enabled
+    let new_cr4 = Cr4::read();
+    let enabled = new_cr4.contains(Cr4Flags::PCID);
+    PCID_ENABLED.store(enabled, Ordering::SeqCst);
+    enabled
+}
+
+/// Check if PCID is currently enabled
+#[inline]
+pub fn is_pcid_enabled() -> bool {
+    PCID_ENABLED.load(Ordering::Relaxed)
+}
+
+// ============================================================================
+// KASLR Slide Generation
+// ============================================================================
+
+/// Convert a slot number to a KASLR slide value
+///
+/// Ensures the slide is 2 MiB aligned and within the maximum range.
+fn slide_from_slot(slot: u64) -> u64 {
+    let max_slots = KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY;
+    let bounded_slot = slot % (max_slots + 1);
+    bounded_slot * KASLR_SLIDE_GRANULARITY
+}
+
+/// Generate a random KASLR slide using the CSPRNG
+///
+/// Returns 0 on failure (KASLR will be disabled).
+fn generate_kaslr_slide() -> u64 {
+    let max_slots = KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY;
+
+    match rng::random_range(max_slots + 1) {
+        Ok(slot) => slide_from_slot(slot),
+        Err(_) => {
+            // RNG failure - fall back to no KASLR
+            0
+        }
+    }
+}
+
+/// Apply a KASLR slide to the global kernel layout
+///
+/// If slide is 0, KASLR is disabled and the fixed layout is used.
+fn apply_kaslr_slide(slide: u64) {
+    let mut layout = KERNEL_LAYOUT.lock();
+
+    if slide != 0 {
+        *layout = KernelLayout::with_slide(slide);
+        KASLR_ENABLED.store(true, Ordering::SeqCst);
+    } else {
+        *layout = KernelLayout::fixed();
+        KASLR_ENABLED.store(false, Ordering::SeqCst);
+    }
 }
 
 // ============================================================================
@@ -488,8 +647,22 @@ impl TrampolineDesc {
 /// Currently just logs status; will perform actual initialization
 /// when features are implemented.
 pub fn init() {
-    println!("  KASLR: {} (infrastructure ready)",
-        if is_kaslr_enabled() { "enabled" } else { "disabled" });
+    // Step 1: Enable PCID if CPU supports it
+    let pcid_enabled = enable_pcid_if_supported();
+
+    // Step 2: Generate and apply KASLR slide
+    // Note: The kernel is already loaded at a fixed address. The slide is
+    // generated and stored for future use (e.g., bootloader integration,
+    // module loading). Full KASLR would require bootloader cooperation.
+    let slide = generate_kaslr_slide();
+    apply_kaslr_slide(slide);
+
+    // Report status
+    println!("  PCID: {}",
+        if pcid_enabled { "enabled" } else { "unsupported/disabled" });
+    println!("  KASLR: {} (slide: 0x{:x})",
+        if is_kaslr_enabled() { "enabled" } else { "disabled" },
+        slide);
     println!("  KPTI: {} (stubs installed)",
         if is_kpti_enabled() { "enabled" } else { "disabled" });
 }
@@ -540,5 +713,46 @@ mod tests {
         let ctx = KptiContext::dual(0x12345000, 0x67890000, 1);
         assert_ne!(ctx.user_cr3, ctx.kernel_cr3);
         assert!(ctx.has_kpti());
+    }
+
+    #[test]
+    fn test_slide_from_slot_alignment() {
+        // Test that slides are properly aligned to 2 MiB
+        for slot in 0..10 {
+            let slide = slide_from_slot(slot);
+            assert_eq!(slide % KASLR_SLIDE_GRANULARITY, 0,
+                "Slide 0x{:x} should be 2 MiB aligned", slide);
+            assert!(slide <= KASLR_MAX_SLIDE,
+                "Slide 0x{:x} should be <= max 0x{:x}", slide, KASLR_MAX_SLIDE);
+        }
+    }
+
+    #[test]
+    fn test_slide_from_slot_wraps() {
+        // Test that slot values beyond max wrap correctly
+        let max_slots = KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY;
+        let slide = slide_from_slot(max_slots + 10);
+        assert!(slide <= KASLR_MAX_SLIDE,
+            "Wrapped slide 0x{:x} should be <= max 0x{:x}", slide, KASLR_MAX_SLIDE);
+        assert_eq!(slide % KASLR_SLIDE_GRANULARITY, 0,
+            "Wrapped slide should still be aligned");
+    }
+
+    #[test]
+    fn test_slide_zero_is_valid() {
+        // Slot 0 should produce slide 0 (no KASLR)
+        let slide = slide_from_slot(0);
+        assert_eq!(slide, 0);
+    }
+
+    #[test]
+    fn test_slide_granularity() {
+        // Verify constants are correct
+        assert_eq!(KASLR_SLIDE_GRANULARITY, 2 * 1024 * 1024); // 2 MiB
+        assert_eq!(KASLR_MAX_SLIDE, 512 * 1024 * 1024); // 512 MiB
+
+        // Max slots should be 256 (512 MiB / 2 MiB)
+        let max_slots = KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY;
+        assert_eq!(max_slots, 256);
     }
 }

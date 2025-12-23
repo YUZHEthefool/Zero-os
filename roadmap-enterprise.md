@@ -36,9 +36,9 @@ Zero-OS aims to be an enterprise-grade server kernel with:
 | Spectre/Meltdown | Complete | IBRS/IBPB/STIBP/SSBD/RSB stuffing |
 | KASLR/KPTI | Partial | Infrastructure ready, not applied |
 | SMP-Ready Stubs | Complete | Per-CPU, IPI, TLB shootdown APIs |
-| Capability System | Scaffolded | Types defined, NOT integrated |
-| LSM Hooks | Scaffolded | Traits defined, NOT integrated |
-| Seccomp/Pledge | Scaffolded | Types defined, NOT integrated |
+| Capability System | Complete | CapTable in PCB, CLOEXEC/CLOFORK |
+| LSM Hooks | Complete | Wired to syscall/process/VFS paths |
+| Seccomp/Pledge | Complete | evaluate_seccomp in dispatcher, sys_seccomp |
 | Network | Not started | - |
 | SMP | Not started | - |
 
@@ -70,9 +70,9 @@ Zero-OS aims to be an enterprise-grade server kernel with:
 | Category | Linux | Zero-OS | Priority |
 |----------|-------|---------|----------|
 | **SMP/Multi-core** | 256+ CPUs, NUMA | Single-core | High (Phase E) |
-| **Security Framework** | LSM + multiple policies | None | Critical (Phase B) |
-| **Capability System** | POSIX caps (CAP_*) | IPC-only | Critical (Phase B) |
-| **Syscall Filtering** | seccomp-bpf | None | Critical (Phase B) |
+| **Security Framework** | LSM + multiple policies | LSM hooks wired | Done (Phase B) |
+| **Capability System** | POSIX caps (CAP_*) | CapTable + CLOEXEC/CLOFORK | Done (Phase B) |
+| **Syscall Filtering** | seccomp-bpf | seccomp + pledge | Done (Phase B) |
 | **Namespaces** | pid/mnt/net/ipc/user/cgroup | None | Medium (Phase F) |
 | **Cgroups** | v2 unified hierarchy | None | Medium (Phase F) |
 | **Network Stack** | Full TCP/IP + netfilter | None | High (Phase D) |
@@ -94,11 +94,11 @@ Zero-OS aims to be an enterprise-grade server kernel with:
 | KASLR | Yes | No | Phase A planned |
 | KPTI | Yes | No | Phase A planned |
 | Stack Canaries | Yes | Partial | Rust has some |
-| Spectre v1 | mitigated | Basic | IBRS/IBPB/STIBP |
-| Spectre v2 | retpoline/IBRS | Basic | Needs RSB stuffing |
+| Spectre v1 | mitigated | **Yes** | IBRS/IBPB/STIBP |
+| Spectre v2 | retpoline/IBRS | **Yes** | RSB stuffing done |
 | Meltdown | KPTI | No | Phase A planned |
-| seccomp-bpf | Yes | No | Phase B planned |
-| LSM (SELinux/AppArmor) | Yes | No | Phase B planned |
+| seccomp-bpf | Yes | **Yes** | Integrated in dispatcher |
+| LSM (SELinux/AppArmor) | Yes | **Yes** | Hooks wired to syscall/VFS |
 | Audit subsystem | Yes | **Yes** | Hash-chained |
 | Integrity (IMA/EVM) | Yes | No | Phase C planned |
 
@@ -112,7 +112,7 @@ Zero-OS aims to be an enterprise-grade server kernel with:
 |---------|------|-------------------|-----|
 | **Malicious Tenant** | Escape container, access other data | Address space isolation | Namespace/cgroup |
 | **Remote Attacker** | Network exploitation | N/A (no network) | Full stack needed |
-| **Compromised Process** | Privilege escalation | SMAP/SMEP, Ring 3 | MAC/LSM needed |
+| **Compromised Process** | Privilege escalation | SMAP/SMEP, Ring 3, LSM | Namespace isolation |
 | **Insider** | Data exfiltration | DAC permissions | MAC needed |
 | **Supply Chain** | Malicious code | None | Code signing needed |
 
@@ -292,15 +292,15 @@ User-mode page table:        Kernel-mode page table:
 
 ---
 
-### Phase B: Capability & MAC Framework [SCAFFOLDED]
+### Phase B: Capability & MAC Framework [COMPLETE]
 
 **Duration Estimate**: 4-6 weeks
 **Blocking**: Storage and Network phases
-**Status**: Types and infrastructure defined, NOT integrated into syscall/process paths
+**Status**: Integrated into syscall/process/VFS paths
 
-#### B.1 Unified Capability System (Scaffolded - kernel/cap/)
+#### B.1 Unified Capability System (Complete - kernel/cap/)
 
-**Current State**: Types and CapTable defined, not wired to syscalls
+**Current State**: CapTable integrated into PCB with CLOEXEC/CLOFORK semantics
 **Location**: kernel/cap/lib.rs, kernel/cap/types.rs
 
 **CapId Structure**:
@@ -363,9 +363,9 @@ bitflags! {
 }
 ```
 
-#### B.2 LSM Hook Infrastructure (Scaffolded - kernel/lsm/)
+#### B.2 LSM Hook Infrastructure (Complete - kernel/lsm/)
 
-**Current State**: LsmPolicy trait and hooks defined, not called from syscalls
+**Current State**: Hooks wired to syscall dispatcher, process ops, and VFS paths
 **Location**: kernel/lsm/lib.rs, kernel/lsm/policy.rs
 
 **Implemented**:
@@ -373,11 +373,10 @@ bitflags! {
 - [x] DefaultPolicy (permissive)
 - [x] LsmContext wrapper
 - [x] Hook registration infrastructure
-
-**NOT Integrated**:
-- [ ] Hooks not called from syscall dispatch
-- [ ] Hooks not called from VFS operations
-- [ ] Build-time feature gate
+- [x] Hooks called from syscall_dispatcher (enter/exit)
+- [x] Hooks called from fork/clone/exec/exit
+- [x] Hooks called from VFS operations (open, create, mkdir, rmdir, unlink)
+- [x] Audit integration for denials
 
 **Hook Categories**:
 
@@ -419,9 +418,9 @@ pub trait LsmPolicy: Send + Sync {
 }
 ```
 
-#### B.3 Seccomp/Pledge (Scaffolded - kernel/seccomp/)
+#### B.3 Seccomp/Pledge (Complete - kernel/seccomp/)
 
-**Current State**: Types defined, not integrated into process lifecycle
+**Current State**: Integrated into syscall dispatcher with full lifecycle support
 **Location**: kernel/seccomp/lib.rs, kernel/seccomp/types.rs
 
 **Implemented**:
@@ -430,11 +429,11 @@ pub trait LsmPolicy: Send + Sync {
 - [x] SeccompAction enum (Allow/Log/Errno/Trap/Kill)
 - [x] PledgePromise enum
 - [x] Filter evaluation logic
-
-**NOT Integrated**:
-- [ ] Per-process filter storage not in PCB
-- [ ] sys_seccomp syscall not implemented
-- [ ] Fork inheritance not wired
+- [x] evaluate_seccomp called in syscall_dispatcher
+- [x] sys_seccomp syscall implemented
+- [x] sys_prctl for seccomp modes
+- [x] Seccomp state inheritance in fork/clone
+- [x] notify_violation audit integration
 
 **Design Options**:
 1. **BPF-based** (like Linux seccomp-bpf): Flexible but complex

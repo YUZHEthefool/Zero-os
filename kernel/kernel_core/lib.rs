@@ -23,18 +23,22 @@ pub use fork::{create_fresh_address_space, sys_fork, ForkError, ForkResult, PAGE
 pub use process::{
     add_supplementary_group,
     allocate_kernel_stack,
+    current_cap_table,
     current_credentials,
     current_egid,
     current_euid,
+    current_pid,
     current_supplementary_groups,
     current_umask,
     free_address_space,
     free_kernel_stack,
+    get_process,
     kernel_stack_slot,
     register_ipc_cleanup,
     remove_supplementary_group,
     set_current_supplementary_groups,
     set_current_umask,
+    with_current_cap_table,
     // Seccomp/Pledge support
     evaluate_seccomp,
     has_no_new_privs,
@@ -49,6 +53,11 @@ pub use process::{
     MAX_FD,
     NGROUPS_MAX,
 };
+// Re-export capability types for convenience
+pub use cap::{
+    CapEntry, CapError, CapFlags, CapId, CapObject, CapRights, CapTable,
+    EndpointId, NamespaceId, Shm, Socket, Timer,
+};
 pub use scheduler_hook::{
     force_reschedule, on_scheduler_tick, register_resched_callback, register_timer_callback,
     request_resched_from_irq, reschedule_if_needed,
@@ -60,8 +69,10 @@ pub use signal::{
 pub use syscall::{
     register_fd_close_callback, register_fd_read_callback, register_fd_write_callback,
     register_futex_callback, register_pipe_callback, register_syscall_frame_callback,
-    register_vfs_lseek_callback, register_vfs_open_callback, register_vfs_stat_callback,
-    wake_stdin_waiters, SyscallError, SyscallFrame, VfsStat,
+    register_vfs_create_callback, register_vfs_lseek_callback, register_vfs_open_callback,
+    register_vfs_readdir_callback, register_vfs_stat_callback, register_vfs_truncate_callback,
+    register_vfs_unlink_callback, wake_stdin_waiters, DirEntry, FileType, SyscallError,
+    SyscallFrame, VfsStat,
 };
 pub use time::{current_timestamp_ms, get_ticks, on_timer_tick};
 pub use usercopy::{
@@ -74,8 +85,36 @@ pub use usercopy::{
     USER_SPACE_TOP,
 };
 
+// ============================================================================
+// LSM Context Provider Adapters
+// ============================================================================
+
+/// Adapter: Get current PID for LSM
+fn lsm_get_pid() -> Option<lsm::ProcessId> {
+    current_pid()
+}
+
+/// Adapter: Get current credentials for LSM
+fn lsm_get_credentials() -> Option<lsm::Credentials> {
+    current_credentials().map(|c| lsm::Credentials {
+        uid: c.uid,
+        gid: c.gid,
+        euid: c.euid,
+        egid: c.egid,
+    })
+}
+
+/// Adapter: Get current ticks for LSM
+fn lsm_get_ticks() -> u64 {
+    get_ticks()
+}
+
 pub fn init() {
     process::init(); // 必须最先初始化，确保 BOOT_CR3 被缓存
     time::init();
+
+    // Register LSM context providers (must be after process::init)
+    lsm::register_context_provider(lsm_get_pid, lsm_get_credentials, lsm_get_ticks);
+
     println!("Kernel core module initialized");
 }

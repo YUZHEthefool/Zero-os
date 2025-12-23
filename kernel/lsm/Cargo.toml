@@ -11,10 +11,12 @@ path = "lib.rs"
 spin = "0.9"
 
 # Cross-crate dependencies
+# Note: kernel_core and vfs removed to avoid cyclic dependencies
+# ProcessId, Credentials, and OpenFlags are defined locally
+# Callbacks are used to get current process context
 cap = { path = "../cap" }
-kernel_core = { path = "../kernel_core" }
-vfs = { path = "../vfs" }
 audit = { path = "../audit" }
+drivers = { path = "../drivers" }
 
 [features]
 default = []

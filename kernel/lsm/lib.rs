@@ -29,6 +29,12 @@
 //! - `lsm` feature enabled: Hooks call the active policy
 //! - `lsm` feature disabled: All hooks return Ok(()) (no overhead)
 //!
+//! # Callback Pattern
+//!
+//! To avoid cyclic dependencies with kernel_core, this module uses a callback
+//! pattern for getting current process context. Call `register_context_provider()`
+//! during kernel initialization.
+//!
 //! # Usage
 //!
 //! ```rust,ignore
@@ -45,23 +51,134 @@
 
 extern crate alloc;
 
+#[macro_use]
+extern crate drivers;
+
 use cap::{CapId, CapRights};
-#[cfg(feature = "lsm")]
 use core::sync::atomic::{AtomicPtr, Ordering};
-use kernel_core::process::ProcessId;
-use vfs::OpenFlags;
+use spin::Mutex;
 
 // Audit integration (only when LSM feature is enabled)
 #[cfg(feature = "lsm")]
-use audit::{
-    emit_lsm_denial, AuditLsmReason, AuditObject, AuditSubject,
-};
-#[cfg(feature = "lsm")]
-use kernel_core::time::get_ticks;
+use audit::{emit_lsm_denial, AuditLsmReason, AuditObject, AuditSubject};
 
 pub mod policy;
 
 pub use policy::{DenyAllPolicy, LsmError, LsmPolicy, LsmResult, PermissivePolicy};
+
+// ============================================================================
+// Local Type Definitions (to avoid cyclic dependency with kernel_core/vfs)
+// ============================================================================
+
+/// Process identifier type (matches kernel_core::ProcessId)
+pub type ProcessId = usize;
+
+/// Process credentials (matches kernel_core::Credentials)
+#[derive(Debug, Clone, Copy)]
+pub struct Credentials {
+    pub uid: u32,
+    pub gid: u32,
+    pub euid: u32,
+    pub egid: u32,
+}
+
+/// Open flags for file operations (simplified from vfs::OpenFlags)
+#[derive(Debug, Clone, Copy)]
+pub struct OpenFlags(pub u32);
+
+impl OpenFlags {
+    /// Read-only flag
+    pub const O_RDONLY: u32 = 0;
+    /// Write-only flag
+    pub const O_WRONLY: u32 = 1;
+    /// Read-write flag
+    pub const O_RDWR: u32 = 2;
+    /// Create if not exists
+    pub const O_CREAT: u32 = 0o100;
+    /// Exclusive create
+    pub const O_EXCL: u32 = 0o200;
+    /// Truncate
+    pub const O_TRUNC: u32 = 0o1000;
+    /// Append
+    pub const O_APPEND: u32 = 0o2000;
+
+    #[inline]
+    pub fn is_readable(&self) -> bool {
+        (self.0 & 3) != Self::O_WRONLY
+    }
+
+    #[inline]
+    pub fn is_writable(&self) -> bool {
+        (self.0 & 3) != Self::O_RDONLY
+    }
+
+    #[inline]
+    pub fn raw(&self) -> u32 {
+        self.0
+    }
+}
+
+// ============================================================================
+// Context Provider Callbacks
+// ============================================================================
+
+/// Callback type for getting current process ID
+pub type GetPidCallback = fn() -> Option<ProcessId>;
+
+/// Callback type for getting current process credentials
+pub type GetCredentialsCallback = fn() -> Option<Credentials>;
+
+/// Callback type for getting current tick count (for timestamps)
+pub type GetTicksCallback = fn() -> u64;
+
+/// Context provider state
+struct ContextProvider {
+    get_pid: Option<GetPidCallback>,
+    get_credentials: Option<GetCredentialsCallback>,
+    get_ticks: Option<GetTicksCallback>,
+}
+
+static CONTEXT_PROVIDER: Mutex<ContextProvider> = Mutex::new(ContextProvider {
+    get_pid: None,
+    get_credentials: None,
+    get_ticks: None,
+});
+
+/// Register callbacks for getting current process context.
+///
+/// Must be called during kernel initialization before LSM hooks are used.
+pub fn register_context_provider(
+    get_pid: GetPidCallback,
+    get_credentials: GetCredentialsCallback,
+    get_ticks: GetTicksCallback,
+) {
+    let mut provider = CONTEXT_PROVIDER.lock();
+    provider.get_pid = Some(get_pid);
+    provider.get_credentials = Some(get_credentials);
+    provider.get_ticks = Some(get_ticks);
+}
+
+/// Get current process ID using registered callback
+#[inline]
+fn current_pid() -> Option<ProcessId> {
+    let provider = CONTEXT_PROVIDER.lock();
+    provider.get_pid.and_then(|f| f())
+}
+
+/// Get current credentials using registered callback
+#[inline]
+fn current_credentials() -> Option<Credentials> {
+    let provider = CONTEXT_PROVIDER.lock();
+    provider.get_credentials.and_then(|f| f())
+}
+
+/// Get current tick count using registered callback
+#[cfg(feature = "lsm")]
+#[inline]
+fn get_ticks() -> u64 {
+    let provider = CONTEXT_PROVIDER.lock();
+    provider.get_ticks.map(|f| f()).unwrap_or(0)
+}
 
 // ============================================================================
 // Hook Context Types
@@ -93,8 +210,8 @@ pub struct SyscallCtx {
 impl SyscallCtx {
     /// Create a syscall context from current process state.
     pub fn from_current(syscall_nr: u64, args: &[u64; 6]) -> Option<Self> {
-        let creds = kernel_core::current_credentials()?;
-        let pid = kernel_core::process::current_pid()?;
+        let creds = current_credentials()?;
+        let pid = current_pid()?;
 
         Some(Self {
             pid,
@@ -132,8 +249,8 @@ pub struct ProcessCtx {
 impl ProcessCtx {
     /// Create a process context from current process state.
     pub fn from_current() -> Option<Self> {
-        let creds = kernel_core::current_credentials()?;
-        let pid = kernel_core::process::current_pid()?;
+        let creds = current_credentials()?;
+        let pid = current_pid()?;
 
         Some(Self {
             pid,

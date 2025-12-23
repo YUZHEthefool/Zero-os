@@ -2,6 +2,7 @@ use crate::fork::PAGE_REF_COUNT;
 use crate::signal::PendingSignals;
 use crate::time;
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
+use cap::CapTable;
 use core::any::Any;
 use mm::memory::FrameAllocator;
 use mm::page_table;
@@ -359,6 +360,16 @@ pub struct Process {
     /// fd 0/1/2 分别保留给 stdin/stdout/stderr，新分配从 3 开始
     pub fd_table: BTreeMap<i32, FileDescriptor>,
 
+    /// 能力表（Capability Table，管理进程持有的能力）
+    ///
+    /// 每个进程拥有独立的能力表。能力表中的条目（CapEntry）包含：
+    /// - 对内核对象（文件、端点、Socket 等）的引用
+    /// - 权限掩码（只读、读写、执行等）
+    /// - 标志（CLOEXEC、CLOFORK 等）
+    ///
+    /// 使用 Arc 包装以支持 fork 时的高效克隆。
+    pub cap_table: Arc<CapTable>,
+
     /// 退出码
     pub exit_code: Option<i32>,
 
@@ -460,6 +471,7 @@ impl Process {
             mmap_regions: BTreeMap::new(),
             next_mmap_addr: DEFAULT_MMAP_BASE,
             fd_table: BTreeMap::new(),
+            cap_table: Arc::new(CapTable::new()),
             exit_code: None,
             waiting_child: None,
             children: Vec::new(),
@@ -858,6 +870,51 @@ pub fn set_current_umask(new_mask: u16) -> Option<u16> {
     let old = proc.umask;
     proc.umask = new_mask & 0o777; // 只保留权限位
     Some(old)
+}
+
+// ========== 能力表访问 ==========
+
+/// 获取当前进程的能力表（CapTable）
+///
+/// 返回能力表的 Arc 克隆，调用者可以直接使用 CapTable 的方法
+/// （如 allocate、lookup、revoke、delegate 等）进行操作。
+///
+/// # Returns
+///
+/// 如果当前有运行中的进程，返回 Some(Arc<CapTable>)；
+/// 如果在内核线程中调用（无当前进程），返回 None。
+pub fn current_cap_table() -> Option<Arc<CapTable>> {
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let proc = slot.as_ref()?.lock();
+    Some(proc.cap_table.clone())
+}
+
+/// 对当前进程的能力表执行操作
+///
+/// 提供一个便捷的方式来对能力表执行操作，而无需手动获取 Arc。
+///
+/// # Arguments
+///
+/// * `f` - 接受 &CapTable 引用的闭包
+///
+/// # Returns
+///
+/// 如果当前有运行中的进程，返回闭包的返回值；否则返回 None。
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let can_write = with_current_cap_table(|table| {
+///     table.check_rights(cap_id, CapRights::WRITE).unwrap_or(false)
+/// });
+/// ```
+pub fn with_current_cap_table<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&CapTable) -> R,
+{
+    current_cap_table().map(|table| f(&table))
 }
 
 // ========== Seccomp/Pledge 沙箱访问 ==========

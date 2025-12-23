@@ -73,7 +73,7 @@ pub mod types;
 
 pub use types::{
     CapEntry, CapError, CapFlags, CapId, CapObject, CapRights,
-    EndpointId, NamespaceId, Shm, Socket, Timer,
+    EndpointId, FileOps, NamespaceId, ProcessId, Shm, Socket, Timer,
 };
 
 // ============================================================================
@@ -462,12 +462,13 @@ pub fn init() {
 mod tests {
     use super::*;
     use alloc::sync::Arc;
+    use types::FileOps;
 
     // Mock FileOps for testing
     struct MockFile;
 
-    impl kernel_core::FileOps for MockFile {
-        fn clone_box(&self) -> alloc::boxed::Box<dyn kernel_core::FileOps> {
+    impl FileOps for MockFile {
+        fn clone_box(&self) -> alloc::boxed::Box<dyn FileOps> {
             alloc::boxed::Box::new(MockFile)
         }
         fn as_any(&self) -> &dyn core::any::Any {

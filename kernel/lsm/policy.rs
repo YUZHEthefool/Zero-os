@@ -26,9 +26,8 @@ extern crate alloc;
 use core::fmt;
 
 use cap::{CapId, CapRights};
-use vfs::OpenFlags;
 
-use crate::{FileCtx, IpcCtx, NetCtx, ProcessCtx, SignalCtx, SyscallCtx};
+use crate::{FileCtx, IpcCtx, NetCtx, OpenFlags, ProcessCtx, SignalCtx, SyscallCtx};
 
 // ============================================================================
 // LSM Result and Error Types

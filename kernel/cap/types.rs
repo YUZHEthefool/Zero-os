@@ -18,11 +18,38 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::any::Any;
 use core::fmt;
 
-use kernel_core::process::ProcessId;
-use kernel_core::FileOps;
+// ============================================================================
+// Local Type Definitions (to avoid cyclic dependency with kernel_core)
+// ============================================================================
+
+/// Process identifier type (matches kernel_core::ProcessId)
+pub type ProcessId = usize;
+
+/// File operations trait (matches kernel_core::FileOps)
+///
+/// This is a local definition to avoid cyclic dependency with kernel_core.
+/// The trait must be implemented identically in kernel_core for interop.
+pub trait FileOps: Send + Sync {
+    /// Clone this file descriptor (for fork)
+    fn clone_box(&self) -> Box<dyn FileOps>;
+
+    /// Get Any reference for downcasting
+    fn as_any(&self) -> &dyn Any;
+
+    /// Get type name (for debugging)
+    fn type_name(&self) -> &'static str;
+}
+
+impl fmt::Debug for dyn FileOps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FileOps({})", self.type_name())
+    }
+}
 
 // ============================================================================
 // Namespace Identifier
@@ -195,6 +222,10 @@ bitflags::bitflags! {
         // Special rights (bits 30-31)
         const BYPASS_DAC  = 1 << 30;
         const BYPASS_MAC  = 1 << 31;
+
+        // Audit/logging rights (bit 40)
+        /// Permission to read/export audit logs via audit::snapshot()
+        const AUDIT_READ  = 1 << 40;
 
         // Convenience combinations
         const RW          = Self::READ.bits() | Self::WRITE.bits();
