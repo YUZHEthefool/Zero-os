@@ -4,6 +4,7 @@ use crate::time;
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
 use cap::CapTable;
 use core::any::Any;
+use lsm::ProcessCtx as LsmProcessCtx;  // R25-7 FIX: Import LSM for task_exit hook
 use mm::memory::FrameAllocator;
 use mm::page_table;
 use seccomp::{PledgeState, SeccompState};
@@ -691,6 +692,25 @@ pub fn current_pid() -> Option<ProcessId> {
     *CURRENT_PID.lock()
 }
 
+/// R25-6 FIX: Get the size of a thread group (number of tasks sharing the same tgid).
+///
+/// Returns the count of active threads in the thread group identified by tgid.
+/// Used to detect multi-threaded processes for seccomp TSYNC enforcement.
+pub fn thread_group_size(tgid: ProcessId) -> usize {
+    let table = PROCESS_TABLE.lock();
+    table
+        .iter()
+        .filter(|slot| {
+            if let Some(p) = slot {
+                let p = p.lock();
+                p.tgid == tgid && p.state != ProcessState::Zombie && p.state != ProcessState::Terminated
+            } else {
+                false
+            }
+        })
+        .count()
+}
+
 /// 设置当前进程ID
 pub fn set_current_pid(pid: Option<ProcessId>) {
     *CURRENT_PID.lock() = pid;
@@ -961,7 +981,17 @@ pub fn evaluate_seccomp(syscall_nr: u64, args: &[u64; 6]) -> SeccompVerdict {
 
     // Then evaluate seccomp filters
     if proc.seccomp_state.has_filters() {
-        proc.seccomp_state.evaluate(syscall_nr, args)
+        let mut verdict = proc.seccomp_state.evaluate(syscall_nr, args);
+
+        // R25-5 FIX: Honor log_violations flag
+        // When log_violations is set, convert Allow to Log for auditing
+        if proc.seccomp_state.log_violations {
+            if matches!(verdict.action, seccomp::SeccompAction::Allow) {
+                verdict.action = seccomp::SeccompAction::Log;
+            }
+        }
+
+        verdict
     } else {
         SeccompVerdict::allow()
     }
@@ -1118,6 +1148,11 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         let clear_child_tid: u64;
         let tgid: ProcessId;
         let memory_space: usize;
+        // R25-7 FIX: Save credentials for LSM exit hook
+        let lsm_uid: u32;
+        let lsm_gid: u32;
+        let lsm_euid: u32;
+        let lsm_egid: u32;
 
         {
             let mut proc = process.lock();
@@ -1132,7 +1167,17 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             memory_space = proc.memory_space;
             // 清除 clear_child_tid 避免重复处理
             proc.clear_child_tid = 0;
+            // R25-7 FIX: Capture credentials before releasing lock
+            lsm_uid = proc.uid;
+            lsm_gid = proc.gid;
+            lsm_euid = proc.euid;
+            lsm_egid = proc.egid;
         }
+
+        // R25-7 FIX: Call LSM task_exit hook for forced terminations (kill/seccomp paths)
+        // This ensures policy can track ALL process exits, not just normal sys_exit
+        let lsm_ctx = LsmProcessCtx::new(pid, tgid, lsm_uid, lsm_gid, lsm_euid, lsm_egid);
+        let _ = lsm::hook_task_exit(&lsm_ctx, exit_code);
 
         println!("Process {} terminated with exit code {}", pid, exit_code);
 

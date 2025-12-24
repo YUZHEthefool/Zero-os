@@ -118,6 +118,12 @@ fn current_pid_raw() -> usize {
 /// the AC flag. This prevents the bug where nested guard drops would clear AC
 /// prematurely (e.g., when `copy_user_str_array` calls `copy_user_cstring`).
 ///
+/// # Interrupt Safety (R25-10 fix)
+///
+/// The outermost guard disables interrupts before executing STAC and restores
+/// them after CLAC. This prevents interrupt handlers from running with the AC
+/// flag set, which could allow unintended access to user memory.
+///
 /// # Safety
 ///
 /// This guard should only be used around intentional user memory accesses
@@ -128,6 +134,9 @@ pub struct UserAccessGuard {
     smap_active: bool,
     /// CPU this guard was created on (per-CPU depth must be balanced on same CPU)
     cpu_id: usize,
+    /// Whether interrupts were enabled when the guard was created (R25-10 fix)
+    /// Only meaningful for the outermost guard (when smap_active && is_outermost)
+    interrupts_were_enabled: bool,
 }
 
 impl UserAccessGuard {
@@ -135,18 +144,30 @@ impl UserAccessGuard {
     ///
     /// # Nesting Behavior
     ///
-    /// - First guard (depth 0→1): Executes STAC to disable SMAP
-    /// - Nested guards (depth >1): Only increments counter, no STAC
+    /// - First guard (depth 0→1): Disables interrupts, executes STAC to disable SMAP
+    /// - Nested guards (depth >1): Only increments counter, no STAC/interrupt change
+    ///
+    /// # R25-10 Fix
+    ///
+    /// Interrupts are disabled before STAC to prevent interrupt handlers from
+    /// running with AC=1 (user access allowed).
     #[inline]
     pub fn new() -> Self {
         let cpu_id = current_cpu_id();
         let smap_active = Cr4::read().contains(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION);
+        let mut interrupts_were_enabled = false;
 
         if smap_active {
             // Only execute STAC when this is the outermost guard (depth 0→1)
             // V-5 fix: Use per-CPU depth counter
             let prev_depth = SMAP_GUARD_DEPTH.with(|d| d.fetch_add(1, Ordering::SeqCst));
             if prev_depth == 0 {
+                // R25-10 FIX: Disable interrupts before setting AC flag
+                // This prevents interrupt handlers from running with user access allowed
+                interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
+                if interrupts_were_enabled {
+                    x86_64::instructions::interrupts::disable();
+                }
                 // Set AC flag to allow supervisor access to user pages
                 unsafe {
                     core::arch::asm!("stac", options(nostack, nomem));
@@ -157,6 +178,7 @@ impl UserAccessGuard {
         UserAccessGuard {
             smap_active,
             cpu_id,
+            interrupts_were_enabled,
         }
     }
 }
@@ -172,8 +194,13 @@ impl Drop for UserAccessGuard {
     ///
     /// # Nesting Behavior
     ///
-    /// - Outermost guard (depth 1→0): Executes CLAC to re-enable SMAP
-    /// - Inner guards (depth >1): Only decrements counter, no CLAC
+    /// - Outermost guard (depth 1→0): Executes CLAC to re-enable SMAP, restores interrupts
+    /// - Inner guards (depth >1): Only decrements counter, no CLAC/interrupt change
+    ///
+    /// # R25-10 Fix
+    ///
+    /// Interrupts are restored after CLAC to maintain the interrupt-disabled window
+    /// around the AC=1 period.
     #[inline]
     fn drop(&mut self) {
         // Detect CPU migration which would cause per-CPU depth imbalance
@@ -194,6 +221,11 @@ impl Drop for UserAccessGuard {
                 // Clear AC flag to restore SMAP protection
                 unsafe {
                     core::arch::asm!("clac", options(nostack, nomem));
+                }
+                // R25-10 FIX: Restore interrupts after clearing AC flag
+                // Only if they were enabled when we started
+                if self.interrupts_were_enabled {
+                    x86_64::instructions::interrupts::enable();
                 }
             }
         }

@@ -646,23 +646,27 @@ impl TrampolineDesc {
 ///
 /// Currently just logs status; will perform actual initialization
 /// when features are implemented.
+///
+/// # R25-11 Fix
+///
+/// Until bootloader cooperation enables actual kernel relocation,
+/// KASLR is always disabled and reported as such. The slide value
+/// is set to 0 to prevent KernelLayout from containing incorrect addresses.
 pub fn init() {
     // Step 1: Enable PCID if CPU supports it
     let pcid_enabled = enable_pcid_if_supported();
 
-    // Step 2: Generate and apply KASLR slide
-    // Note: The kernel is already loaded at a fixed address. The slide is
-    // generated and stored for future use (e.g., bootloader integration,
-    // module loading). Full KASLR would require bootloader cooperation.
-    let slide = generate_kaslr_slide();
+    // R25-11 FIX: KASLR is not actually implemented - kernel runs at fixed address
+    // Do NOT generate a slide value or report as enabled until bootloader supports relocation
+    // Previously this generated a slide and stored it in KernelLayout, but the kernel
+    // was never actually relocated, causing the layout to contain incorrect addresses.
+    let slide = 0;  // KASLR disabled until bootloader supports relocation
     apply_kaslr_slide(slide);
 
-    // Report status
+    // Report status (accurately reflect disabled state)
     println!("  PCID: {}",
         if pcid_enabled { "enabled" } else { "unsupported/disabled" });
-    println!("  KASLR: {} (slide: 0x{:x})",
-        if is_kaslr_enabled() { "enabled" } else { "disabled" },
-        slide);
+    println!("  KASLR: disabled (requires bootloader support)");
     println!("  KPTI: {} (stubs installed)",
         if is_kpti_enabled() { "enabled" } else { "disabled" });
 }

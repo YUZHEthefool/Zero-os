@@ -639,7 +639,13 @@ pub fn hook_task_setuid(task: &ProcessCtx, new_uid: u32, new_gid: u32) -> LsmRes
 pub fn hook_task_setresuid(task: &ProcessCtx, ruid: u32, euid: u32, suid: u32) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().task_setresuid(task, ruid, euid, suid)
+        let res = policy().task_setresuid(task, ruid, euid, suid);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "task_setresuid", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -653,7 +659,13 @@ pub fn hook_task_setresuid(task: &ProcessCtx, ruid: u32, euid: u32, suid: u32) -
 pub fn hook_task_setgroups(task: &ProcessCtx, groups: &[u32]) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().task_setgroups(task, groups)
+        let res = policy().task_setgroups(task, groups);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "task_setgroups", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -667,7 +679,13 @@ pub fn hook_task_setgroups(task: &ProcessCtx, groups: &[u32]) -> LsmResult {
 pub fn hook_task_prctl(task: &ProcessCtx, option: i32, arg2: u64) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().task_prctl(task, option, arg2)
+        let res = policy().task_prctl(task, option, arg2);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "task_prctl", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -681,7 +699,13 @@ pub fn hook_task_prctl(task: &ProcessCtx, option: i32, arg2: u64) -> LsmResult {
 pub fn hook_task_cap_modify(task: &ProcessCtx, cap_id: CapId, op: u32) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().task_cap_modify(task, cap_id, op)
+        let res = policy().task_cap_modify(task, cap_id, op);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "task_cap_modify", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -695,7 +719,14 @@ pub fn hook_task_cap_modify(task: &ProcessCtx, cap_id: CapId, op: u32) -> LsmRes
 pub fn hook_file_lookup(task: &ProcessCtx, parent_inode: u64, name_hash: u64) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().file_lookup(task, parent_inode, name_hash)
+        let res = policy().file_lookup(task, parent_inode, name_hash);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Path { inode: parent_inode, mode: 0, path_hash: name_hash };
+            emit_denial_audit(subject, object, "file_lookup", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -844,7 +875,14 @@ pub fn hook_file_rename(
 ) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().file_rename(task, old_parent, old_name_hash, new_parent, new_name_hash)
+        let res = policy().file_rename(task, old_parent, old_name_hash, new_parent, new_name_hash);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Path { inode: old_parent, mode: 0, path_hash: old_name_hash };
+            emit_denial_audit(subject, object, "file_rename", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -858,7 +896,14 @@ pub fn hook_file_rename(
 pub fn hook_file_link(task: &ProcessCtx, inode: u64, new_parent: u64, name_hash: u64) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().file_link(task, inode, new_parent, name_hash)
+        let res = policy().file_link(task, inode, new_parent, name_hash);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Path { inode, mode: 0, path_hash: name_hash };
+            emit_denial_audit(subject, object, "file_link", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -872,7 +917,14 @@ pub fn hook_file_link(task: &ProcessCtx, inode: u64, new_parent: u64, name_hash:
 pub fn hook_file_symlink(task: &ProcessCtx, parent_inode: u64, name_hash: u64, target_hash: u64) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().file_symlink(task, parent_inode, name_hash, target_hash)
+        let res = policy().file_symlink(task, parent_inode, name_hash, target_hash);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Path { inode: parent_inode, mode: 0, path_hash: name_hash };
+            emit_denial_audit(subject, object, "file_symlink", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -886,7 +938,14 @@ pub fn hook_file_symlink(task: &ProcessCtx, parent_inode: u64, name_hash: u64, t
 pub fn hook_file_mkdir(task: &ProcessCtx, parent_inode: u64, name_hash: u64, mode: u32) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().file_mkdir(task, parent_inode, name_hash, mode)
+        let res = policy().file_mkdir(task, parent_inode, name_hash, mode);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Path { inode: parent_inode, mode, path_hash: name_hash };
+            emit_denial_audit(subject, object, "file_mkdir", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -900,7 +959,14 @@ pub fn hook_file_mkdir(task: &ProcessCtx, parent_inode: u64, name_hash: u64, mod
 pub fn hook_file_rmdir(task: &ProcessCtx, parent_inode: u64, name_hash: u64) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().file_rmdir(task, parent_inode, name_hash)
+        let res = policy().file_rmdir(task, parent_inode, name_hash);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Path { inode: parent_inode, mode: 0, path_hash: name_hash };
+            emit_denial_audit(subject, object, "file_rmdir", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -914,7 +980,14 @@ pub fn hook_file_rmdir(task: &ProcessCtx, parent_inode: u64, name_hash: u64) -> 
 pub fn hook_file_truncate(task: &ProcessCtx, inode: u64, size: u64) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().file_truncate(task, inode, size)
+        let res = policy().file_truncate(task, inode, size);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Path { inode, mode: 0, path_hash: 0 };
+            emit_denial_audit(subject, object, "file_truncate", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -928,7 +1001,14 @@ pub fn hook_file_truncate(task: &ProcessCtx, inode: u64, size: u64) -> LsmResult
 pub fn hook_file_permission(task: &ProcessCtx, inode: u64, access_mask: u32) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().file_permission(task, inode, access_mask)
+        let res = policy().file_permission(task, inode, access_mask);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Path { inode, mode: access_mask, path_hash: 0 };
+            emit_denial_audit(subject, object, "file_permission", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -948,7 +1028,14 @@ pub fn hook_file_mount(
 ) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().file_mount(task, source_hash, target_hash, fstype_hash, flags)
+        let res = policy().file_mount(task, source_hash, target_hash, fstype_hash, flags);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Path { inode: 0, mode: 0, path_hash: target_hash };
+            emit_denial_audit(subject, object, "file_mount", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -962,7 +1049,14 @@ pub fn hook_file_mount(
 pub fn hook_file_umount(task: &ProcessCtx, target_hash: u64, flags: u64) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().file_umount(task, target_hash, flags)
+        let res = policy().file_umount(task, target_hash, flags);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Path { inode: 0, mode: 0, path_hash: target_hash };
+            emit_denial_audit(subject, object, "file_umount", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -976,7 +1070,13 @@ pub fn hook_file_umount(task: &ProcessCtx, target_hash: u64, flags: u64) -> LsmR
 pub fn hook_ipc_send(task: &ProcessCtx, ctx: &IpcCtx) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().ipc_send(task, ctx)
+        let res = policy().ipc_send(task, ctx);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "ipc_send", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -990,7 +1090,13 @@ pub fn hook_ipc_send(task: &ProcessCtx, ctx: &IpcCtx) -> LsmResult {
 pub fn hook_ipc_recv(task: &ProcessCtx, ctx: &IpcCtx) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().ipc_recv(task, ctx)
+        let res = policy().ipc_recv(task, ctx);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "ipc_recv", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -1004,7 +1110,13 @@ pub fn hook_ipc_recv(task: &ProcessCtx, ctx: &IpcCtx) -> LsmResult {
 pub fn hook_ipc_pipe(task: &ProcessCtx) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().ipc_pipe(task)
+        let res = policy().ipc_pipe(task);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "ipc_pipe", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -1018,7 +1130,14 @@ pub fn hook_ipc_pipe(task: &ProcessCtx) -> LsmResult {
 pub fn hook_ipc_futex(task: &ProcessCtx, addr: usize, op: u32) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().ipc_futex(task, addr, op)
+        let res = policy().ipc_futex(task, addr, op);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Memory { vaddr: addr as u64, size: 0, prot: 0 };
+            emit_denial_audit(subject, object, "ipc_futex", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -1032,7 +1151,14 @@ pub fn hook_ipc_futex(task: &ProcessCtx, addr: usize, op: u32) -> LsmResult {
 pub fn hook_ipc_shm(task: &ProcessCtx, shm_id: u64, size: usize, rights: CapRights) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().ipc_shm(task, shm_id, size, rights)
+        let res = policy().ipc_shm(task, shm_id, size, rights);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Memory { vaddr: 0, size: size as u64, prot: 0 };
+            emit_denial_audit(subject, object, "ipc_shm", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -1149,7 +1275,13 @@ pub fn hook_net_connect(task: &ProcessCtx, ctx: &NetCtx) -> LsmResult {
 pub fn hook_net_listen(task: &ProcessCtx, ctx: &NetCtx, backlog: u32) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().net_listen(task, ctx, backlog)
+        let res = policy().net_listen(task, ctx, backlog);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "net_listen", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -1163,7 +1295,13 @@ pub fn hook_net_listen(task: &ProcessCtx, ctx: &NetCtx, backlog: u32) -> LsmResu
 pub fn hook_net_accept(task: &ProcessCtx, ctx: &NetCtx) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().net_accept(task, ctx)
+        let res = policy().net_accept(task, ctx);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "net_accept", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -1177,7 +1315,13 @@ pub fn hook_net_accept(task: &ProcessCtx, ctx: &NetCtx) -> LsmResult {
 pub fn hook_net_setsockopt(task: &ProcessCtx, ctx: &NetCtx, level: i32, optname: i32) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().net_setsockopt(task, ctx, level, optname)
+        let res = policy().net_setsockopt(task, ctx, level, optname);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "net_setsockopt", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -1191,7 +1335,13 @@ pub fn hook_net_setsockopt(task: &ProcessCtx, ctx: &NetCtx, level: i32, optname:
 pub fn hook_net_send(task: &ProcessCtx, ctx: &NetCtx, bytes: usize) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().net_send(task, ctx, bytes)
+        let res = policy().net_send(task, ctx, bytes);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "net_send", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -1205,7 +1355,13 @@ pub fn hook_net_send(task: &ProcessCtx, ctx: &NetCtx, bytes: usize) -> LsmResult
 pub fn hook_net_recv(task: &ProcessCtx, ctx: &NetCtx, bytes: usize) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().net_recv(task, ctx, bytes)
+        let res = policy().net_recv(task, ctx, bytes);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "net_recv", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {
@@ -1219,7 +1375,13 @@ pub fn hook_net_recv(task: &ProcessCtx, ctx: &NetCtx, bytes: usize) -> LsmResult
 pub fn hook_net_shutdown(task: &ProcessCtx, ctx: &NetCtx, how: i32) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
-        policy().net_shutdown(task, ctx, how)
+        let res = policy().net_shutdown(task, ctx, how);
+        // R25-3 FIX: Add denial audit
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "net_shutdown", err);
+        }
+        res
     }
     #[cfg(not(feature = "lsm"))]
     {

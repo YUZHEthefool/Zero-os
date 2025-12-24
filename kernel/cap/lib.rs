@@ -354,11 +354,13 @@ impl CapTableInner {
             new_idx
         };
 
-        // Allocate a generation counter
+        // R25-2 FIX: Fail on generation exhaustion instead of wrapping
+        // This prevents use-after-free regression after ~4 billion allocations
         let generation = self.next_generation;
-        self.next_generation = self.next_generation.wrapping_add(1);
+        self.next_generation = self.next_generation.checked_add(1)
+            .ok_or(CapError::GenerationExhausted)?;
+        // Skip 0 if we somehow reach it (defensive, should not happen with checked_add)
         if self.next_generation == 0 {
-            // Skip 0 to keep INVALID semantics
             self.next_generation = 1;
         }
 
@@ -421,11 +423,16 @@ impl CapTableInner {
             return Err(CapError::DelegationDenied);
         }
 
-        // Create new entry with restricted rights
+        // R25-1 FIX: Enforce source restrictions on delegated capability
+        // Source flags (CLOEXEC, CLOFORK, O_PATH, NOXFER) must be inherited to prevent
+        // privilege escalation via flag stripping attacks
+        let enforced_flags = flags | source_entry.flags;
+
+        // Create new entry with restricted rights and enforced flags
         let new_entry = CapEntry::with_flags(
             source_entry.object,
             source_entry.rights.restrict(rights_mask),
-            flags,
+            enforced_flags,
         );
 
         // Allocate a new slot for the delegated capability

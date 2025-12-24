@@ -6,6 +6,7 @@
 //! - Global file operations (open, stat, etc.)
 //! - Syscall callback registration
 //! - DAC (Discretionary Access Control) permission enforcement
+//! - LSM (Linux Security Module) hook integration (R25-9 fix)
 
 use crate::devfs::DevFs;
 use crate::ramfs::RamFs;
@@ -21,6 +22,23 @@ use kernel_core::{
     FileOps, SyscallError, VfsStat,
 };
 use spin::RwLock;
+
+// R25-9 FIX: Import LSM hooks for MAC enforcement
+use lsm::{FileCtx as LsmFileCtx, OpenFlags as LsmOpenFlags, ProcessCtx as LsmProcessCtx};
+
+/// Simple FNV-1a 64-bit hash for path hashing in LSM contexts
+/// R25-9 FIX: Used to generate path hashes for LSM hooks
+#[inline]
+fn hash_path(path: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut h = OFFSET;
+    for b in path.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
 
 /// Check if current process has required access permissions on a file
 ///
@@ -330,6 +348,14 @@ impl Vfs {
         // 3. If egid == file group, check group bits (0o070)
         // 4. Otherwise, check other bits (0o007)
         let stat = inode.stat()?;
+
+        // R25-9 FIX: Call LSM hook before DAC check for MAC enforcement
+        if let Some(task) = LsmProcessCtx::from_current() {
+            let file_ctx = LsmFileCtx::new(stat.ino, stat.mode.to_raw(), hash_path(&path));
+            lsm::hook_file_open(&task, stat.ino, LsmOpenFlags(flags.0), &file_ctx)
+                .map_err(|_| FsError::PermDenied)?;
+        }
+
         if !check_access_permission(&stat, flags.is_readable(), flags.is_writable(), false) {
             return Err(FsError::PermDenied);
         }
@@ -412,6 +438,18 @@ impl Vfs {
         let sanitized = strip_suid_sgid_if_needed(masked, mode.is_dir());
         let masked_mode = FileMode::new(mode.file_type, sanitized);
 
+        // R25-9 FIX: Call LSM hook before creating file/directory
+        if let Some(task) = LsmProcessCtx::from_current() {
+            let name_hash = hash_path(filename);
+            if masked_mode.is_dir() {
+                lsm::hook_file_mkdir(&task, parent_stat.ino, name_hash, masked_mode.to_raw())
+                    .map_err(|_| FsError::PermDenied)?;
+            } else {
+                lsm::hook_file_create(&task, parent_stat.ino, name_hash, masked_mode.to_raw())
+                    .map_err(|_| FsError::PermDenied)?;
+            }
+        }
+
         // Create the entry with sanitized permissions
         fs.create(&parent, filename, masked_mode)
     }
@@ -452,6 +490,18 @@ impl Vfs {
                 if euid != child_stat.uid && euid != parent_stat.uid {
                     return Err(FsError::PermDenied);
                 }
+            }
+        }
+
+        // R25-9 FIX: Call LSM hook before unlinking file/directory
+        if let Some(task) = LsmProcessCtx::from_current() {
+            let name_hash = hash_path(filename);
+            if child.is_dir() {
+                lsm::hook_file_rmdir(&task, parent_stat.ino, name_hash)
+                    .map_err(|_| FsError::PermDenied)?;
+            } else {
+                lsm::hook_file_unlink(&task, parent_stat.ino, name_hash)
+                    .map_err(|_| FsError::PermDenied)?;
             }
         }
 

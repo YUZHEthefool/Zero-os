@@ -1018,7 +1018,7 @@ pub fn syscall_dispatcher(
 
     match verdict.action {
         seccomp::SeccompAction::Kill => {
-            // Kill process with SIGSYS - audit the violation
+            // R25-4 FIX: Kill process with SIGSYS semantics - audit and terminate
             if let Some(creds) = crate::current_credentials() {
                 if let Some(pid) = crate::process::current_pid() {
                     seccomp::notify_violation(
@@ -1029,14 +1029,15 @@ pub fn syscall_dispatcher(
                         &verdict,
                         timestamp,
                     );
+                    // Actually terminate the process (SIGSYS exit code: 128 + 31)
+                    crate::process::terminate_process(pid, 128 + 31);
+                    crate::process::cleanup_zombie(pid);
                 }
             }
-            // For now, just return -EPERM and let the process handle it
-            // TODO: Actually terminate with signal delivery
             return SyscallError::EPERM as i64;
         }
         seccomp::SeccompAction::Trap => {
-            // Trigger SIGSYS trap - audit the violation
+            // R25-4 FIX: Trap treated as fatal until SIGSYS delivery is implemented
             if let Some(creds) = crate::current_credentials() {
                 if let Some(pid) = crate::process::current_pid() {
                     seccomp::notify_violation(
@@ -1047,9 +1048,11 @@ pub fn syscall_dispatcher(
                         &verdict,
                         timestamp,
                     );
+                    // Terminate with SIGSYS semantics until proper signal delivery exists
+                    crate::process::terminate_process(pid, 128 + 31);
+                    crate::process::cleanup_zombie(pid);
                 }
             }
-            // TODO: Implement SIGSYS delivery
             return SyscallError::EPERM as i64;
         }
         seccomp::SeccompAction::Errno(e) => {
@@ -1639,12 +1642,12 @@ fn sys_clone(
             // 线程：共享父进程的能力表
             let parent = parent_arc.lock();
             child.cap_table = parent.cap_table.clone();
-        } else if flags & CLONE_FILES != 0 {
-            // 非线程但共享文件：克隆能力表并过滤 CLOFORK
+        } else {
+            // R25-8 FIX: 非线程情况（包括CLONE_FILES和默认进程语义）
+            // 都必须继承能力表并过滤 CLOFORK 条目
             let parent = parent_arc.lock();
             child.cap_table = Arc::new(parent.cap_table.clone_for_fork());
         }
-        // 否则保持 child 的默认空能力表（由 Process::new 创建）
 
         // 设置进程状态为就绪
         child.state = ProcessState::Ready;
@@ -3636,6 +3639,19 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             let pid = current_pid().ok_or(SyscallError::ESRCH)?;
             let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
             let mut proc = proc_arc.lock();
+
+            // R25-6 FIX: Reject seccomp in multi-threaded processes without TSYNC
+            // This prevents security bypass where only one thread is sandboxed
+            let thread_count = crate::process::thread_group_size(proc.tgid);
+            let tsync_requested = flags & seccomp::SeccompFlags::TSYNC.bits() != 0;
+            if thread_count > 1 && !tsync_requested {
+                // Multi-threaded but TSYNC not requested - refuse partial sandboxing
+                println!(
+                    "[sys_seccomp] PID={} REJECTED: {} threads but TSYNC not requested",
+                    pid, thread_count
+                );
+                return Err(SyscallError::EPERM);
+            }
 
             // Installing filter sets no_new_privs (sticky, one-way)
             proc.seccomp_state.no_new_privs = true;

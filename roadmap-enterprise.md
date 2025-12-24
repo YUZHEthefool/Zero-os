@@ -1,7 +1,7 @@
 # Zero-OS Enterprise Security Kernel Roadmap
 
-**Version:** 3.1
-**Last Updated:** 2025-12-21
+**Version:** 3.2
+**Last Updated:** 2025-12-23
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
 This document extends the Zero-OS development roadmap toward an **enterprise-grade secure server kernel**, with detailed gap analysis against Linux and a security-first implementation plan.
@@ -19,7 +19,7 @@ Zero-OS aims to be an enterprise-grade server kernel with:
 - **Secure IPC**: Capability-based access control for all kernel objects
 - **Compliance Ready**: Comprehensive audit logging with tamper evidence
 
-### Current Status (2025-12-21)
+### Current Status (2025-12-23)
 
 | Component | Status | Security Level |
 |-----------|--------|----------------|
@@ -32,22 +32,30 @@ Zero-OS aims to be an enterprise-grade server kernel with:
 | VFS | Complete | DAC permissions (owner/group/other/umask) |
 | Audit | Complete | SHA-256 hash-chained syscall logging |
 | User Mode (Ring 3) | Complete | SYSCALL/SYSRET, IRETQ entry |
-| Usercopy API | Complete | SMAP guards (STAC/CLAC), bounds validation |
+| Usercopy API | Partial | SMAP guards (STAC/CLAC) - interrupt window issue (R25-10) |
 | Spectre/Meltdown | Complete | IBRS/IBPB/STIBP/SSBD/RSB stuffing |
-| KASLR/KPTI | Partial | Infrastructure ready, not applied |
+| KASLR/KPTI | Partial | Infrastructure ready, not applied (R25-11) |
 | SMP-Ready Stubs | Complete | Per-CPU, IPI, TLB shootdown APIs |
-| Capability System | Complete | CapTable in PCB, CLOEXEC/CLOFORK |
-| LSM Hooks | Complete | Wired to syscall/process/VFS paths |
-| Seccomp/Pledge | Complete | evaluate_seccomp in dispatcher, sys_seccomp |
+| Capability System | **In Progress** | CapTable in PCB - R25-1 **FIXED**, R25-8 **FIXED** |
+| LSM Hooks | **In Progress** | R25-9 **FIXED** (VFS integration), R25-3 pending (audit gaps) |
+| Seccomp/Pledge | **In Progress** | R25-4 **FIXED** (Kill terminates), R25-6 **FIXED** (TSYNC required) |
 | Network | Not started | - |
 | SMP | Not started | - |
 
+**Note**: Round 25 fixes in progress. 6 of 11 issues fixed. See qa-2025-12-23.md for details.
+
 ### Security Audit Summary
 
-- **Total Audits**: 24 rounds
-- **Issues Identified**: 138
-- **Issues Fixed**: 111 (80%)
-- **Open Issues**: 27 (mostly SMP-related, deferred)
+- **Total Audits**: 25 rounds
+- **Issues Identified**: 149
+- **Issues Fixed**: 117 (78%)
+- **Open Issues**: 32 (5 pending from Round 25)
+
+**Round 25 Status** (2025-12-23):
+- R25-4 (CRITICAL): SeccompAction::Kill now terminates process - **FIXED**
+- R25-9 (CRITICAL): VFS manager now calls LSM hooks - **FIXED**
+- R25-1, R25-6, R25-7, R25-8 (HIGH): **FIXED**
+- R25-2, R25-3, R25-5, R25-10, R25-11: Pending
 
 ---
 
@@ -70,9 +78,9 @@ Zero-OS aims to be an enterprise-grade server kernel with:
 | Category | Linux | Zero-OS | Priority |
 |----------|-------|---------|----------|
 | **SMP/Multi-core** | 256+ CPUs, NUMA | Single-core | High (Phase E) |
-| **Security Framework** | LSM + multiple policies | LSM hooks wired | Done (Phase B) |
-| **Capability System** | POSIX caps (CAP_*) | CapTable + CLOEXEC/CLOFORK | Done (Phase B) |
-| **Syscall Filtering** | seccomp-bpf | seccomp + pledge | Done (Phase B) |
+| **Security Framework** | LSM + multiple policies | LSM hooks exist but **VFS bypasses** | **Partial** (Phase B fix needed) |
+| **Capability System** | POSIX caps (CAP_*) | CapTable exists but **delegation/clone gaps** | **Partial** (Phase B fix needed) |
+| **Syscall Filtering** | seccomp-bpf | seccomp exists but **Kill broken, TSYNC missing** | **Partial** (Phase B fix needed) |
 | **Namespaces** | pid/mnt/net/ipc/user/cgroup | None | Medium (Phase F) |
 | **Cgroups** | v2 unified hierarchy | None | Medium (Phase F) |
 | **Network Stack** | Full TCP/IP + netfilter | None | High (Phase D) |

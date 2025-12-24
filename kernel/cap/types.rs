@@ -494,6 +494,10 @@ pub enum CapError {
 
     /// Invalid operation for this object type.
     InvalidOperation,
+
+    /// Generation counter exhausted after 2^32 allocations (R25-2 fix).
+    /// This is a fatal condition - the capability table can no longer be used safely.
+    GenerationExhausted,
 }
 
 impl fmt::Display for CapError {
@@ -505,6 +509,7 @@ impl fmt::Display for CapError {
             CapError::NoCurrentProcess => write!(f, "no current process context"),
             CapError::DelegationDenied => write!(f, "capability delegation denied"),
             CapError::InvalidOperation => write!(f, "invalid operation for object type"),
+            CapError::GenerationExhausted => write!(f, "capability generation counter exhausted"),
         }
     }
 }
