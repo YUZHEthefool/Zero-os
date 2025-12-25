@@ -1,15 +1,9 @@
 [package]
-name = "vfs"
+name = "block"
 version = "0.1.0"
 edition = "2021"
-
-[lib]
-path = "lib.rs"
 
 [dependencies]
 spin = "0.9"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
-kernel_core = { path = "../kernel_core" }
 drivers = { path = "../drivers" }
-lsm = { path = "../lsm" }
-block = { path = "../block" }

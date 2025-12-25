@@ -77,6 +77,11 @@ impl FileMode {
         Self::new(FileType::CharDevice, perm)
     }
 
+    /// Create mode for block device with given permissions
+    pub const fn block_device(perm: u16) -> Self {
+        Self::new(FileType::BlockDevice, perm)
+    }
+
     /// Convert to raw st_mode value
     pub fn to_raw(&self) -> u32 {
         self.file_type.to_mode_bits() | (self.perm as u32)

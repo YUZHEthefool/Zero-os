@@ -417,4 +417,34 @@ mod tests {
         let prog = vec![SeccompInsn::Ret(SeccompAction::Allow)];
         assert!(SeccompFilter::new(prog, SeccompAction::Allow, SeccompFlags::empty()).is_ok());
     }
+
+    #[test]
+    fn test_pledge_rpath_blocks_write_and_create() {
+        let state = PledgeState::new(PledgePromises::RPATH);
+        let mut args = [0u64; 6];
+
+        // O_RDONLY should be allowed with rpath
+        args[1] = 0; // flags
+        assert!(state.allows(2, &args)); // SYS_OPEN
+
+        // O_WRONLY should be denied without wpath/cpath
+        args[1] = 1; // O_WRONLY
+        assert!(!state.allows(2, &args));
+
+        // O_CREAT should be denied without cpath/tmppath
+        args[1] = 0o100; // O_CREAT
+        assert!(!state.allows(2, &args));
+    }
+
+    #[test]
+    fn test_pledge_prot_exec_requires_promise() {
+        const PROT_EXEC: u64 = 0x4;
+        let vm_only = PledgeState::new(PledgePromises::VM);
+        let vm_with_exec = PledgeState::new(PledgePromises::VM | PledgePromises::PROT_EXEC);
+
+        // mprotect with PROT_EXEC should be denied without prot_exec promise
+        let args = [0u64, 0, PROT_EXEC, 0, 0, 0];
+        assert!(!vm_only.allows(10, &args)); // SYS_MPROTECT
+        assert!(vm_with_exec.allows(10, &args));
+    }
 }

@@ -8,6 +8,8 @@ use bit_vec::BitVec;
 use spin::Mutex;
 use x86_64::{structures::paging::PhysFrame, PhysAddr};
 
+use crate::oom_killer;
+
 /// 最大阶数（2^MAX_ORDER * PAGE_SIZE = 最大连续分配大小）
 const MAX_ORDER: usize = 11; // 2^11 * 4KB = 8MB
 /// 页面大小（4KB）
@@ -299,6 +301,9 @@ pub fn init_buddy_allocator(base_addr: PhysAddr, size: usize) {
 ///
 /// # Returns
 /// 成功返回物理帧，失败返回 None
+///
+/// # OOM Handling
+/// 如果分配失败，会触发 OOM killer 尝试回收内存，然后重试一次
 pub fn alloc_physical_pages(count: usize) -> Option<PhysFrame> {
     // 处理无效输入：count=0 时直接返回 None
     if count == 0 {
@@ -306,7 +311,24 @@ pub fn alloc_physical_pages(count: usize) -> Option<PhysFrame> {
     }
 
     let order = count.next_power_of_two().trailing_zeros() as usize;
+    // Buddy allocator 实际分配的页数（向上取整到 2 的幂）
+    let pages_needed = 1usize << order;
 
+    // 第一次尝试分配
+    let result = BUDDY_ALLOCATOR
+        .lock()
+        .as_mut()
+        .and_then(|allocator| allocator.alloc_pages(order));
+
+    if result.is_some() {
+        return result;
+    }
+
+    // 分配失败，触发 OOM killer 尝试回收内存
+    // 使用实际需要的页数（向上取整后），而非原始请求
+    oom_killer::on_allocation_failure(pages_needed);
+
+    // OOM 处理后重试一次
     BUDDY_ALLOCATOR
         .lock()
         .as_mut()

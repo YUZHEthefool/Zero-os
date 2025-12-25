@@ -52,6 +52,8 @@ pub use process::{
     KSTACK_STRIDE,
     MAX_FD,
     NGROUPS_MAX,
+    // OOM killer support
+    register_oom_callbacks,
 };
 // Re-export capability types for convenience
 pub use cap::{
@@ -115,6 +117,21 @@ pub fn init() {
 
     // Register LSM context providers (must be after process::init)
     lsm::register_context_provider(lsm_get_pid, lsm_get_credentials, lsm_get_ticks);
+
+    // R26-4 FIX: Register audit snapshot authorizer
+    // Allow root (euid == 0) to access audit logs
+    // Future: Could also check for CAP_AUDIT_READ capability
+    audit::register_snapshot_authorizer(|| {
+        if let Some(creds) = current_credentials() {
+            if creds.euid == 0 {
+                return Ok(());
+            }
+        }
+        Err(audit::AuditError::AccessDenied)
+    });
+
+    // Register OOM killer callbacks (must be after mm initialization)
+    process::register_oom_callbacks();
 
     println!("Kernel core module initialized");
 }

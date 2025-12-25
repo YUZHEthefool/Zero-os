@@ -407,6 +407,17 @@ pub struct Process {
     /// 新建文件的权限 = mode & !umask
     pub umask: u16,
 
+    // ========== OOM Killer 支持 ==========
+    /// Nice 值 (-20 到 19)
+    /// 负值表示更高优先级，正值表示更低优先级
+    /// 对于 OOM killer：nice 值越高越容易被杀
+    pub nice: i32,
+
+    /// OOM 分数调整值 (-1000 到 1000)
+    /// -1000 表示完全免疫 OOM killer
+    /// 正值增加被杀概率，负值降低被杀概率
+    pub oom_score_adj: i32,
+
     // ========== 堆管理 (brk) ==========
     /// 堆起始地址（ELF bss 段末尾，页对齐）
     pub brk_start: usize,
@@ -445,6 +456,10 @@ pub struct Process {
     /// Pledge 状态（可选）
     /// 如果设置，表示进程使用 OpenBSD 风格的 pledge 沙箱
     pub pledge_state: Option<PledgeState>,
+
+    /// R26-3: 标记当前是否正在安装 seccomp 过滤器
+    /// 在安装期间拒绝创建新线程，防止 TSYNC 竞态绕过
+    pub seccomp_installing: bool,
 }
 
 impl Process {
@@ -485,6 +500,9 @@ impl Process {
             egid: 0,
             supplementary_groups: Vec::new(),
             umask: 0o022,
+            // OOM killer 支持 - 默认中立设置
+            nice: 0,
+            oom_score_adj: 0,
             // 堆管理 - ELF 加载时设置实际值
             brk_start: 0,
             brk: 0,
@@ -499,6 +517,8 @@ impl Process {
             // Seccomp/Pledge 沙箱 (默认无限制)
             seccomp_state: SeccompState::new(),
             pledge_state: None,
+            // R26-3: seccomp 安装状态标志
+            seccomp_installing: false,
         }
     }
 
@@ -974,7 +994,7 @@ pub fn evaluate_seccomp(syscall_nr: u64, args: &[u64; 6]) -> SeccompVerdict {
 
     // First check pledge if set
     if let Some(ref pledge) = proc.pledge_state {
-        if !pledge.allows(syscall_nr) {
+        if !pledge.allows(syscall_nr, args) {
             return SeccompVerdict::kill(0);
         }
     }
@@ -1419,23 +1439,25 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
 
     // 如果进程拥有独立的页表（memory_space != 0），释放页表及其管理的物理帧
     // R24-1 fix: 检查是否有其他线程共享地址空间，只有在无共享引用时才释放
-    // 【线程修复】线程共享地址空间，只有主进程（is_thread == false）才释放
-    if proc.memory_space != 0 && !proc.is_thread && !keep_address_space {
-        free_address_space(proc.memory_space);
-        println!(
-            "  Released page table hierarchy for process {} (root=0x{:x})",
-            proc.pid, proc.memory_space
-        );
-        proc.memory_space = 0;
-    } else if proc.is_thread || keep_address_space {
-        // 线程或被共享的地址空间不释放，只清零引用
-        if keep_address_space && !proc.is_thread {
+    // 如果该线程是最后持有者（keep_address_space 为 false），也要释放地址空间避免泄漏
+    if proc.memory_space != 0 {
+        if keep_address_space {
+            // 线程或被共享的地址空间不释放，只清零引用
+            if !proc.is_thread {
+                println!(
+                    "  Deferred address space release for process {} (shared by other threads)",
+                    proc.pid
+                );
+            }
+            proc.memory_space = 0;
+        } else {
+            free_address_space(proc.memory_space);
             println!(
-                "  Deferred address space release for process {} (shared by other threads)",
-                proc.pid
+                "  Released page table hierarchy for process {} (root=0x{:x})",
+                proc.pid, proc.memory_space
             );
+            proc.memory_space = 0;
         }
-        proc.memory_space = 0;
     }
 
     // 通知 IPC 子系统清理进程端点（通过回调避免循环依赖）
@@ -1670,4 +1692,76 @@ impl ProcessStats {
         println!("Zombie:     {}", self.zombie);
         println!("Terminated: {}", self.terminated);
     }
+}
+
+// ========== OOM Killer 回调实现 ==========
+
+/// 为 OOM killer 生成进程快照
+///
+/// 返回所有可杀进程的信息，用于 OOM 评分和选择
+pub fn oom_snapshot() -> Vec<mm::OomProcessInfo> {
+    let table = PROCESS_TABLE.lock();
+    let mut result = Vec::new();
+
+    for slot in table.iter() {
+        if let Some(process) = slot {
+            let proc = process.lock();
+
+            // 跳过僵尸和已终止的进程
+            if matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
+                continue;
+            }
+
+            // 跳过 init 进程 (PID 1) - 永不杀死
+            if proc.pid == 1 {
+                continue;
+            }
+
+            // 计算 RSS（简化实现：使用 mmap 区域大小估算）
+            let rss_pages = (proc.mmap_regions.values().sum::<usize>() / 4096) as u64;
+
+            result.push(mm::OomProcessInfo {
+                pid: proc.pid,
+                tgid: proc.tgid,
+                uid: proc.uid,
+                gid: proc.gid,
+                rss_pages,
+                nice: proc.nice,
+                oom_score_adj: proc.oom_score_adj,
+                has_mm: proc.memory_space != 0,
+                is_kernel_thread: proc.memory_space == 0,
+            });
+        }
+    }
+
+    result
+}
+
+/// OOM killer 调用的进程终止函数
+///
+/// 使用指定的退出码终止进程
+pub fn oom_kill(pid: ProcessId, exit_code: i32) {
+    terminate_process(pid, exit_code);
+}
+
+/// OOM killer 调用的进程清理函数
+///
+/// 清理僵尸进程并释放资源
+pub fn oom_cleanup(pid: ProcessId) {
+    cleanup_zombie(pid);
+}
+
+/// OOM killer 调用的时间戳函数
+///
+/// 返回当前时间戳（毫秒）
+pub fn oom_timestamp() -> u64 {
+    time::current_timestamp_ms()
+}
+
+/// 注册 OOM killer 回调
+///
+/// 在内核初始化时调用，将进程管理函数注册到 OOM killer
+pub fn register_oom_callbacks() {
+    mm::register_oom_callbacks(oom_snapshot, oom_kill, oom_cleanup, oom_timestamp);
+    println!("  OOM killer callbacks registered");
 }

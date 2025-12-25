@@ -940,6 +940,24 @@ fn lsm_error_to_syscall(err: lsm::LsmError) -> SyscallError {
     }
 }
 
+/// R26-6 FIX: Map capability errors to syscall errno values.
+///
+/// This ensures proper error reporting when capability operations fail,
+/// rather than silently swallowing errors.
+#[inline]
+#[allow(dead_code)] // Will be used when capability syscalls are added
+fn cap_error_to_syscall(err: cap::CapError) -> SyscallError {
+    match err {
+        cap::CapError::TableFull => SyscallError::EMFILE,
+        cap::CapError::GenerationExhausted => SyscallError::ERANGE, // No EOVERFLOW, use ERANGE
+        cap::CapError::InvalidCapId => SyscallError::EBADF,
+        cap::CapError::DelegationDenied => SyscallError::EPERM,
+        cap::CapError::InsufficientRights => SyscallError::EPERM,
+        cap::CapError::InvalidOperation => SyscallError::EINVAL,
+        cap::CapError::NoCurrentProcess => SyscallError::ESRCH,
+    }
+}
+
 /// Build an LSM ProcessCtx from current process state.
 /// Returns None if no current process is available.
 #[inline]
@@ -1426,6 +1444,7 @@ fn sys_clone(
         parent_umask,
         parent_seccomp_state,
         parent_pledge_state,
+        parent_seccomp_installing,
     ) = {
         let mut parent = parent_arc.lock();
         // 始终从 MSR 同步 fs_base 到 PCB
@@ -1454,6 +1473,7 @@ fn sys_clone(
             parent.umask,
             parent.seccomp_state.clone(),
             parent.pledge_state.clone(),
+            parent.seccomp_installing,
         )
     };
 
@@ -1493,6 +1513,15 @@ fn sys_clone(
         // 设置线程标识
         child.tid = child_pid; // tid == pid (Linux 语义)
         if flags & CLONE_THREAD != 0 {
+            // R26-3 FIX: Reject thread creation if parent is installing seccomp filter
+            // This prevents TOCTOU race where new thread escapes sandbox
+            if parent_seccomp_installing {
+                // Clean up: terminate the child process we just created
+                child.state = ProcessState::Terminated;
+                drop(child);
+                crate::process::terminate_process(child_pid, -1);
+                return Err(SyscallError::EBUSY);
+            }
             child.tgid = parent_tgid; // 加入父进程的线程组
             child.is_thread = true;
         } else {
@@ -3376,7 +3405,10 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     }
 
     // 对齐长度到页边界
-    let len_aligned = (len + 0xfff) & !0xfff;
+    let len_aligned = len
+        .checked_add(0xfff)
+        .ok_or(SyscallError::EINVAL)?
+        & !0xfff;
 
     // W^X 安全检查：禁止同时可写可执行
     if (prot & PROT_WRITE != 0) && (prot & PROT_EXEC != 0) {
@@ -3432,6 +3464,12 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
 // ============================================================================
 // Seccomp/Prctl 系统调用
 // ============================================================================
+
+// R26-3: Helper functions to manage seccomp installation state
+//
+// These functions set/clear the `seccomp_installing` flag to prevent TOCTOU
+// race conditions between seccomp filter installation and thread creation.
+// The flag must be manually cleared after installation completes or on error.
 
 /// Convert seccomp error to syscall error
 fn seccomp_error_to_syscall(err: seccomp::SeccompError) -> SyscallError {
@@ -3625,9 +3663,21 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             let filter = seccomp::strict_filter();
 
             let mut proc = proc_arc.lock();
+
+            // R26-3 FIX: Check if another thread is already installing
+            if proc.seccomp_installing {
+                return Err(SyscallError::EBUSY);
+            }
+
+            // R26-3 FIX: Mark installation in progress
+            proc.seccomp_installing = true;
+
             // Installing any filter sets no_new_privs (sticky, one-way)
             proc.seccomp_state.no_new_privs = true;
             proc.seccomp_state.add_filter(filter);
+
+            // R26-3 FIX: Mark installation complete
+            proc.seccomp_installing = false;
 
             println!("[sys_seccomp] PID={} installed STRICT mode", pid);
             Ok(0)
@@ -3639,6 +3689,11 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             let pid = current_pid().ok_or(SyscallError::ESRCH)?;
             let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
             let mut proc = proc_arc.lock();
+
+            // R26-3 FIX: Check if another thread is already installing
+            if proc.seccomp_installing {
+                return Err(SyscallError::EBUSY);
+            }
 
             // R25-6 FIX: Reject seccomp in multi-threaded processes without TSYNC
             // This prevents security bypass where only one thread is sandboxed
@@ -3653,6 +3708,9 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
                 return Err(SyscallError::EPERM);
             }
 
+            // R26-3 FIX: Mark installation in progress
+            proc.seccomp_installing = true;
+
             // Installing filter sets no_new_privs (sticky, one-way)
             proc.seccomp_state.no_new_privs = true;
 
@@ -3662,6 +3720,9 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             }
 
             proc.seccomp_state.add_filter(filter);
+
+            // R26-3 FIX: Mark installation complete
+            proc.seccomp_installing = false;
 
             println!(
                 "[sys_seccomp] PID={} installed FILTER mode (total filters: {})",

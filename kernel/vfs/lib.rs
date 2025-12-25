@@ -45,14 +45,20 @@ extern crate alloc;
 extern crate drivers;
 
 pub mod devfs;
+pub mod ext2;
+pub mod initramfs;
 pub mod manager;
+pub mod procfs;
 pub mod ramfs;
 pub mod traits;
 pub mod types;
 
 // Re-exports for convenience
 pub use devfs::DevFs;
+pub use ext2::{Ext2Fs, Ext2Inode};
+pub use initramfs::Initramfs;
 pub use manager::{init, mount, open, readdir, stat, umount, VFS};
+pub use procfs::ProcFs;
 pub use ramfs::{RamFs, RamFsInode};
 pub use traits::{FileHandle, FileSystem, Inode};
 pub use types::{DirEntry, FileMode, FileType, FsError, OpenFlags, SeekWhence, Stat, TimeSpec};

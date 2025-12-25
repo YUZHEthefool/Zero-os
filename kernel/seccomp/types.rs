@@ -411,8 +411,8 @@ impl PledgeState {
     }
 
     /// Check if a syscall is allowed by current promises.
-    pub fn allows(&self, syscall_nr: u64) -> bool {
-        promise_allows_syscall(self.promises, syscall_nr)
+    pub fn allows(&self, syscall_nr: u64, args: &[u64; 6]) -> bool {
+        promise_allows_syscall(self.promises, syscall_nr, args)
     }
 }
 
@@ -640,7 +640,7 @@ fn compute_filter_id(prog: &[SeccompInsn]) -> u64 {
 /// Check if a pledge promise set allows a syscall.
 ///
 /// This is a simplified mapping; real implementation would be more comprehensive.
-fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64) -> bool {
+fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64; 6]) -> bool {
     // Define syscall numbers (these should match kernel_core/syscall.rs)
     const SYS_READ: u64 = 0;
     const SYS_WRITE: u64 = 1;
@@ -662,9 +662,76 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64) -> bool {
     const SYS_KILL: u64 = 62;
     const SYS_FUTEX: u64 = 202;
     const SYS_GETRANDOM: u64 = 318;
+    const SYS_OPENAT: u64 = 257;
+
+    // File open flag bits (must match VFS)
+    const O_ACCMODE: u64 = 0x3;
+    const O_WRONLY: u64 = 0x1;
+    const O_RDWR: u64 = 0x2;
+    const O_CREAT: u64 = 0o100;
+    const O_TRUNC: u64 = 0o1000;
+    const O_APPEND: u64 = 0o2000;
+
+    // Memory protection flags
+    const PROT_EXEC: i32 = 0x4;
 
     // Always allow exit
     if syscall_nr == SYS_EXIT {
+        return true;
+    }
+
+    // Handle path syscalls with flag-aware checks
+    if matches!(syscall_nr, SYS_OPEN | SYS_OPENAT) {
+        let flags = if syscall_nr == SYS_OPEN { args[1] } else { args[2] };
+        let accmode = flags & O_ACCMODE;
+        let wants_write = accmode == O_WRONLY || accmode == O_RDWR;
+        let wants_create = (flags & (O_CREAT | O_TRUNC)) != 0;
+        let wants_append = (flags & O_APPEND) != 0;
+
+        // Require at least one path capability
+        let has_path = promises.intersects(
+            PledgePromises::RPATH | PledgePromises::WPATH | PledgePromises::CPATH | PledgePromises::TMPPATH,
+        );
+        if !has_path {
+            return false;
+        }
+
+        // Writing (including append/truncate) requires WPATH/CPATH/TMPPATH
+        if (wants_write || wants_append)
+            && !(promises.contains(PledgePromises::WPATH)
+                || promises.contains(PledgePromises::CPATH)
+                || promises.contains(PledgePromises::TMPPATH))
+        {
+            return false;
+        }
+
+        // Creation/truncate requires CPATH or TMPPATH
+        if wants_create
+            && !(promises.contains(PledgePromises::CPATH) || promises.contains(PledgePromises::TMPPATH))
+        {
+            return false;
+        }
+
+        // Read-only open is permitted with RPATH
+        if !wants_write && !wants_create {
+            return promises.contains(PledgePromises::RPATH)
+                || promises.contains(PledgePromises::WPATH)
+                || promises.contains(PledgePromises::CPATH)
+                || promises.contains(PledgePromises::TMPPATH);
+        }
+
+        return true;
+    }
+
+    // Memory management with PROT_EXEC gating
+    if matches!(syscall_nr, SYS_MMAP | SYS_MPROTECT) {
+        if !promises.contains(PledgePromises::VM) {
+            return false;
+        }
+        let prot = args[2] as i32;
+        if (prot & PROT_EXEC) != 0 && !promises.contains(PledgePromises::PROT_EXEC) {
+            return false;
+        }
         return true;
     }
 
@@ -679,19 +746,19 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64) -> bool {
     }
 
     if promises.contains(PledgePromises::RPATH) {
-        if matches!(syscall_nr, SYS_OPEN | SYS_STAT) {
+        if syscall_nr == SYS_STAT {
             return true;
         }
     }
 
     if promises.contains(PledgePromises::WPATH) {
-        if matches!(syscall_nr, SYS_OPEN | SYS_WRITE) {
+        if syscall_nr == SYS_WRITE {
             return true;
         }
     }
 
     if promises.contains(PledgePromises::VM) {
-        if matches!(syscall_nr, SYS_MMAP | SYS_MPROTECT | SYS_MUNMAP | SYS_BRK) {
+        if matches!(syscall_nr, SYS_MUNMAP | SYS_BRK) {
             return true;
         }
     }

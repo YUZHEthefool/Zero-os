@@ -219,6 +219,14 @@ impl Vfs {
 
         let path = normalize_path(path);
 
+        // R26-2 FIX: MAC gate for mount operations
+        // LSM policy can block mounts even for root users
+        if let Some(task) = LsmProcessCtx::from_current() {
+            let path_hash = hash_path(&path);
+            lsm::hook_file_mount(&task, 0, path_hash, 0, 0)
+                .map_err(|_| FsError::PermDenied)?;
+        }
+
         let mut mounts = self.mounts.write();
         if mounts.contains_key(&path) {
             return Err(FsError::Exists);
@@ -243,6 +251,15 @@ impl Vfs {
         }
 
         let path = normalize_path(path);
+
+        // R26-2 FIX: MAC gate for umount operations
+        // LSM policy can block unmounts even for root users
+        if let Some(task) = LsmProcessCtx::from_current() {
+            let path_hash = hash_path(&path);
+            lsm::hook_file_umount(&task, path_hash, 0)
+                .map_err(|_| FsError::PermDenied)?;
+        }
+
         let mut mounts = self.mounts.write();
 
         if mounts.remove(&path).is_some() {
@@ -335,7 +352,41 @@ impl Vfs {
                 let masked = apply_umask(requested);
                 let sanitized = strip_suid_sgid_if_needed(masked, false);
                 let mode = FileMode::regular(sanitized);
-                fs.create(&parent, filename, mode)?
+
+                // C.4 FIX: Revalidate permissions just before creation to shrink TOCTOU window
+                let latest_parent_stat = parent.stat()?;
+                if latest_parent_stat.ino != parent_stat.ino
+                    || !check_access_permission(&latest_parent_stat, false, true, true)
+                {
+                    return Err(FsError::PermDenied);
+                }
+
+                // C.4 FIX: If the file appeared after the first lookup, honor O_EXCL but
+                // otherwise fall back to opening the existing file (POSIX semantics)
+                match fs.lookup(&parent, filename) {
+                    Ok(existing) => {
+                        if flags.is_exclusive() {
+                            return Err(FsError::Exists);
+                        }
+                        existing
+                    }
+                    Err(FsError::NotFound) => {
+                        // R26-1 FIX: MAC gate before file creation (using freshest metadata)
+                        if let Some(task) = LsmProcessCtx::from_current() {
+                            let name_hash = hash_path(filename);
+                            lsm::hook_file_create(
+                                &task,
+                                latest_parent_stat.ino,
+                                name_hash,
+                                mode.to_raw(),
+                            )
+                            .map_err(|_| FsError::PermDenied)?;
+                        }
+
+                        fs.create(&parent, filename, mode)?
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             Err(e) => return Err(e),
         };
@@ -366,7 +417,12 @@ impl Vfs {
         }
 
         // Handle truncate for writable regular files
+        // C.4 FIX: Revalidate write permission immediately before truncate
         if flags.is_truncate() && flags.is_writable() && !inode.is_dir() {
+            let fresh_stat = inode.stat()?;
+            if !check_access_permission(&fresh_stat, flags.is_readable(), true, false) {
+                return Err(FsError::PermDenied);
+            }
             inode.truncate(0)?;
         }
 
@@ -438,14 +494,26 @@ impl Vfs {
         let sanitized = strip_suid_sgid_if_needed(masked, mode.is_dir());
         let masked_mode = FileMode::new(mode.file_type, sanitized);
 
-        // R25-9 FIX: Call LSM hook before creating file/directory
+        // C.4 FIX: Revalidate parent permissions and absence right before create
+        let latest_parent_stat = parent.stat()?;
+        if latest_parent_stat.ino != parent_stat.ino
+            || !check_access_permission(&latest_parent_stat, false, true, true)
+        {
+            return Err(FsError::PermDenied);
+        }
+        // Verify target still doesn't exist
+        if fs.lookup(&parent, filename).is_ok() {
+            return Err(FsError::Exists);
+        }
+
+        // R25-9 FIX: Call LSM hook before creating file/directory (using freshest metadata)
         if let Some(task) = LsmProcessCtx::from_current() {
             let name_hash = hash_path(filename);
             if masked_mode.is_dir() {
-                lsm::hook_file_mkdir(&task, parent_stat.ino, name_hash, masked_mode.to_raw())
+                lsm::hook_file_mkdir(&task, latest_parent_stat.ino, name_hash, masked_mode.to_raw())
                     .map_err(|_| FsError::PermDenied)?;
             } else {
-                lsm::hook_file_create(&task, parent_stat.ino, name_hash, masked_mode.to_raw())
+                lsm::hook_file_create(&task, latest_parent_stat.ino, name_hash, masked_mode.to_raw())
                     .map_err(|_| FsError::PermDenied)?;
             }
         }
@@ -479,30 +547,51 @@ impl Vfs {
 
         // Look up the child to check sticky bit permissions
         let child = fs.lookup(&parent, filename)?;
+        let child_ino = child.ino();
 
-        // Enforce sticky-bit semantics:
+        // C.4 FIX: Revalidate parent permissions as close as possible to the destructive op
+        let latest_parent_stat = parent.stat()?;
+        if latest_parent_stat.ino != parent_stat.ino
+            || !check_access_permission(&latest_parent_stat, false, true, true)
+        {
+            return Err(FsError::PermDenied);
+        }
+
+        // C.4 FIX: Ensure the target hasn't been swapped since initial lookup
+        let current = fs.lookup(&parent, filename)?;
+        if current.ino() != child_ino {
+            // Target was replaced by a different inode - reject to prevent wrong deletion
+            return Err(FsError::PermDenied);
+        }
+        let current_stat = current.stat()?;
+
+        // Enforce sticky-bit semantics on the current (revalidated) entry:
         // If parent directory has sticky bit set, only root, directory owner,
         // or file owner may delete the file
-        if parent_stat.mode.perm & 0o1000 != 0 {
+        if latest_parent_stat.mode.perm & 0o1000 != 0 {
             let euid = current_euid().unwrap_or(0);
-            if euid != 0 {
-                let child_stat = child.stat()?;
-                if euid != child_stat.uid && euid != parent_stat.uid {
-                    return Err(FsError::PermDenied);
-                }
+            if euid != 0 && euid != current_stat.uid && euid != latest_parent_stat.uid {
+                return Err(FsError::PermDenied);
             }
         }
 
-        // R25-9 FIX: Call LSM hook before unlinking file/directory
+        // R25-9 FIX: Call LSM hook before unlinking file/directory (using revalidated metadata)
         if let Some(task) = LsmProcessCtx::from_current() {
             let name_hash = hash_path(filename);
-            if child.is_dir() {
-                lsm::hook_file_rmdir(&task, parent_stat.ino, name_hash)
+            if current.is_dir() {
+                lsm::hook_file_rmdir(&task, latest_parent_stat.ino, name_hash)
                     .map_err(|_| FsError::PermDenied)?;
             } else {
-                lsm::hook_file_unlink(&task, parent_stat.ino, name_hash)
+                lsm::hook_file_unlink(&task, latest_parent_stat.ino, name_hash)
                     .map_err(|_| FsError::PermDenied)?;
             }
+        }
+
+        // C.4 FIX: Final TOCTOU guard - ensure the entry still refers to the expected inode
+        // immediately before performing the unlink
+        let final_lookup = fs.lookup(&parent, filename)?;
+        if final_lookup.ino() != child_ino {
+            return Err(FsError::PermDenied);
         }
 
         fs.unlink(&parent, filename)
@@ -861,6 +950,14 @@ fn vfs_truncate_callback(fd: i32, length: u64) -> Result<(), SyscallError> {
         .as_any()
         .downcast_ref::<FileHandle>()
         .ok_or(SyscallError::ENOSYS)?;
+
+    // R26-5 FIX: MAC gate for truncate operations
+    // LSM policy can block file truncation
+    if let Some(task) = LsmProcessCtx::from_current() {
+        let stat = file_handle.inode.stat().map_err(fs_error_to_syscall)?;
+        lsm::hook_file_truncate(&task, stat.ino, length)
+            .map_err(|_| SyscallError::EPERM)?;
+    }
 
     file_handle
         .inode

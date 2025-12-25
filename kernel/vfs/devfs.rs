@@ -4,6 +4,7 @@
 //! - /dev/null - Discards all writes, returns EOF on read
 //! - /dev/zero - Returns infinite zeros on read, discards writes
 //! - /dev/console - Kernel console (serial output)
+//! - /dev/vdX - Block devices (virtio-blk, etc.)
 
 use crate::traits::{FileHandle, FileSystem, Inode};
 use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
@@ -12,10 +13,11 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use block::BlockDevice;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_core::FileOps;
-use spin::RwLock;
+use spin::{Mutex, RwLock};
 
 /// Global device filesystem ID counter
 static NEXT_FS_ID: AtomicU64 = AtomicU64::new(1);
@@ -45,6 +47,37 @@ impl DevFs {
         });
 
         Arc::new(Self { fs_id, root })
+    }
+
+    /// Register a block device in devfs.
+    ///
+    /// Creates a device node at /dev/{name} for the given block device.
+    pub fn register_block_device(
+        &self,
+        name: &str,
+        device: Arc<dyn BlockDevice>,
+    ) -> Result<(), FsError> {
+        let mut entries = self.root.entries.write();
+
+        if entries.contains_key(name) {
+            return Err(FsError::Exists);
+        }
+
+        // Assign a unique inode number
+        static NEXT_BLOCK_INO: AtomicU64 = AtomicU64::new(100);
+        let ino = NEXT_BLOCK_INO.fetch_add(1, Ordering::SeqCst);
+
+        let inode = Arc::new(BlockDevInode::new(self.fs_id, ino, device));
+        entries.insert(String::from(name), inode);
+
+        Ok(())
+    }
+
+    /// Unregister a block device from devfs.
+    pub fn unregister_block_device(&self, name: &str) -> Result<(), FsError> {
+        let mut entries = self.root.entries.write();
+        entries.remove(name).ok_or(FsError::NotFound)?;
+        Ok(())
     }
 }
 
@@ -452,5 +485,343 @@ impl DevFileOps for ConsoleDevFile {
             print!("{}", s);
         }
         Ok(data.len())
+    }
+}
+
+// ============================================================================
+// Block device implementation
+// ============================================================================
+
+/// Block device inode (/dev/vdX, /dev/sdX, etc.)
+struct BlockDevInode {
+    fs_id: u64,
+    ino: u64,
+    device: Arc<dyn BlockDevice>,
+    /// Lock for serializing read-modify-write operations
+    rw_lock: Arc<Mutex<()>>,
+}
+
+impl BlockDevInode {
+    fn new(fs_id: u64, ino: u64, device: Arc<dyn BlockDevice>) -> Self {
+        Self {
+            fs_id,
+            ino,
+            device,
+            rw_lock: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+impl Inode for BlockDevInode {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    fn fs_id(&self) -> u64 {
+        self.fs_id
+    }
+
+    fn stat(&self) -> Result<Stat, FsError> {
+        let capacity = self.device.capacity_sectors() * self.device.sector_size() as u64;
+        Ok(Stat {
+            dev: self.fs_id,
+            ino: self.ino,
+            mode: FileMode::block_device(0o660),
+            nlink: 1,
+            uid: 0,
+            gid: 6, // disk group
+            rdev: make_dev(8, (self.ino - 100) as u32), // major 8 = sd, minor = device index
+            size: capacity,
+            blksize: self.device.sector_size(),
+            blocks: self.device.capacity_sectors(),
+            atime: TimeSpec::now(),
+            mtime: TimeSpec::now(),
+            ctime: TimeSpec::now(),
+        })
+    }
+
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+        Ok(Box::new(BlockDevFile {
+            device: Arc::clone(&self.device),
+            rw_lock: Arc::clone(&self.rw_lock),
+            offset: Mutex::new(0),
+            flags,
+        }))
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let sector_size = self.device.sector_size() as u64;
+        let capacity_bytes = self.device.capacity_sectors() * sector_size;
+
+        // Check bounds and empty buffer
+        if offset >= capacity_bytes || buf.is_empty() {
+            return Ok(0); // EOF
+        }
+
+        let mut file_offset = offset;
+        let mut buf_pos = 0usize;
+        let mut sector_buf = alloc::vec![0u8; sector_size as usize];
+        let limit = (capacity_bytes - offset) as usize;
+        let to_read = buf.len().min(limit);
+
+        while buf_pos < to_read && file_offset < capacity_bytes {
+            let sector_idx = file_offset / sector_size;
+            let sector_off = (file_offset % sector_size) as usize;
+            let bytes_until_eof = (capacity_bytes - file_offset) as usize;
+            let available = (sector_size as usize - sector_off)
+                .min(to_read - buf_pos)
+                .min(bytes_until_eof);
+
+            // If sector-aligned and have at least one whole sector, batch the read
+            if sector_off == 0
+                && available == sector_size as usize
+                && (to_read - buf_pos) >= sector_size as usize
+            {
+                let max_full = (to_read - buf_pos).min(bytes_until_eof);
+                let full_len = max_full - (max_full % sector_size as usize);
+                if full_len > 0 {
+                    let aligned_buf = &mut buf[buf_pos..buf_pos + full_len];
+                    self.device
+                        .read_sync(sector_idx, aligned_buf)
+                        .map_err(|_| FsError::Io)?;
+                    buf_pos += full_len;
+                    file_offset += full_len as u64;
+                    continue;
+                }
+            }
+
+            // Handle partial sector read
+            self.device
+                .read_sync(sector_idx, &mut sector_buf)
+                .map_err(|_| FsError::Io)?;
+            buf[buf_pos..buf_pos + available]
+                .copy_from_slice(&sector_buf[sector_off..sector_off + available]);
+
+            buf_pos += available;
+            file_offset += available as u64;
+        }
+
+        Ok(buf_pos)
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+        let sector_size = self.device.sector_size() as u64;
+        let capacity_bytes = self.device.capacity_sectors() * sector_size;
+
+        // Check bounds
+        if offset >= capacity_bytes {
+            return Err(FsError::NoSpace);
+        }
+
+        let max_write = (capacity_bytes - offset) as usize;
+        let to_write = data.len().min(max_write);
+        if to_write == 0 {
+            return Ok(0);
+        }
+
+        // Serialize RMW operations to prevent data corruption
+        let _guard = self.rw_lock.lock();
+        let mut file_offset = offset;
+        let mut data_pos = 0usize;
+        let mut sector_buf = alloc::vec![0u8; sector_size as usize];
+
+        while data_pos < to_write && file_offset < capacity_bytes {
+            let sector_idx = file_offset / sector_size;
+            let sector_off = (file_offset % sector_size) as usize;
+            let bytes_until_eof = (capacity_bytes - file_offset) as usize;
+            let available = (sector_size as usize - sector_off)
+                .min(to_write - data_pos)
+                .min(bytes_until_eof);
+
+            // If sector-aligned and have at least one whole sector, batch the write
+            if sector_off == 0
+                && available == sector_size as usize
+                && (to_write - data_pos) >= sector_size as usize
+            {
+                let max_full = (to_write - data_pos).min(bytes_until_eof);
+                let full_len = max_full - (max_full % sector_size as usize);
+                if full_len > 0 {
+                    let aligned_data = &data[data_pos..data_pos + full_len];
+                    self.device
+                        .write_sync(sector_idx, aligned_data)
+                        .map_err(|_| FsError::Io)?;
+                    data_pos += full_len;
+                    file_offset += full_len as u64;
+                    continue;
+                }
+            }
+
+            // Handle partial sector with read-modify-write
+            self.device
+                .read_sync(sector_idx, &mut sector_buf)
+                .map_err(|_| FsError::Io)?;
+
+            sector_buf[sector_off..sector_off + available]
+                .copy_from_slice(&data[data_pos..data_pos + available]);
+
+            self.device
+                .write_sync(sector_idx, &sector_buf)
+                .map_err(|_| FsError::Io)?;
+
+            data_pos += available;
+            file_offset += available as u64;
+        }
+
+        Ok(data_pos)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Block device file handle
+struct BlockDevFile {
+    device: Arc<dyn BlockDevice>,
+    /// Lock for serializing read-modify-write operations
+    rw_lock: Arc<Mutex<()>>,
+    offset: Mutex<u64>,
+    flags: OpenFlags,
+}
+
+impl FileOps for BlockDevFile {
+    fn clone_box(&self) -> Box<dyn FileOps> {
+        Box::new(BlockDevFile {
+            device: Arc::clone(&self.device),
+            rw_lock: Arc::clone(&self.rw_lock),
+            offset: Mutex::new(*self.offset.lock()),
+            flags: self.flags,
+        })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn type_name(&self) -> &'static str {
+        "BlockDev"
+    }
+}
+
+impl DevFileOps for BlockDevFile {
+    fn dev_read(&self, buf: &mut [u8]) -> Result<usize, FsError> {
+        let mut offset = self.offset.lock();
+        let sector_size = self.device.sector_size() as u64;
+        let capacity_bytes = self.device.capacity_sectors() * sector_size;
+
+        // Check bounds and empty buffer
+        if *offset >= capacity_bytes || buf.is_empty() {
+            return Ok(0); // EOF
+        }
+
+        let mut buf_pos = 0usize;
+        let mut sector_buf = alloc::vec![0u8; sector_size as usize];
+        let limit = (capacity_bytes - *offset) as usize;
+        let to_read = buf.len().min(limit);
+
+        while buf_pos < to_read && *offset < capacity_bytes {
+            let sector_idx = *offset / sector_size;
+            let sector_off = (*offset % sector_size) as usize;
+            let bytes_until_eof = (capacity_bytes - *offset) as usize;
+            let available = (sector_size as usize - sector_off)
+                .min(to_read - buf_pos)
+                .min(bytes_until_eof);
+
+            // If sector-aligned and have at least one whole sector, batch the read
+            if sector_off == 0
+                && available == sector_size as usize
+                && (to_read - buf_pos) >= sector_size as usize
+            {
+                let max_full = (to_read - buf_pos).min(bytes_until_eof);
+                let full_len = max_full - (max_full % sector_size as usize);
+                if full_len > 0 {
+                    let aligned_buf = &mut buf[buf_pos..buf_pos + full_len];
+                    self.device
+                        .read_sync(sector_idx, aligned_buf)
+                        .map_err(|_| FsError::Io)?;
+                    buf_pos += full_len;
+                    *offset += full_len as u64;
+                    continue;
+                }
+            }
+
+            // Handle partial sector read
+            self.device
+                .read_sync(sector_idx, &mut sector_buf)
+                .map_err(|_| FsError::Io)?;
+
+            buf[buf_pos..buf_pos + available]
+                .copy_from_slice(&sector_buf[sector_off..sector_off + available]);
+
+            buf_pos += available;
+            *offset += available as u64;
+        }
+
+        Ok(buf_pos)
+    }
+
+    fn dev_write(&self, data: &[u8]) -> Result<usize, FsError> {
+        let mut offset = self.offset.lock();
+        let sector_size = self.device.sector_size() as u64;
+        let capacity_bytes = self.device.capacity_sectors() * sector_size;
+
+        if *offset >= capacity_bytes {
+            return Err(FsError::NoSpace);
+        }
+
+        let max_write = (capacity_bytes - *offset) as usize;
+        let to_write = data.len().min(max_write);
+        if to_write == 0 {
+            return Ok(0);
+        }
+
+        // Serialize RMW operations to prevent data corruption
+        let _guard = self.rw_lock.lock();
+        let mut data_pos = 0usize;
+        let mut sector_buf = alloc::vec![0u8; sector_size as usize];
+
+        while data_pos < to_write && *offset < capacity_bytes {
+            let sector_idx = *offset / sector_size;
+            let sector_off = (*offset % sector_size) as usize;
+            let bytes_until_eof = (capacity_bytes - *offset) as usize;
+            let available = (sector_size as usize - sector_off)
+                .min(to_write - data_pos)
+                .min(bytes_until_eof);
+
+            // If sector-aligned and have at least one whole sector, batch the write
+            if sector_off == 0
+                && available == sector_size as usize
+                && (to_write - data_pos) >= sector_size as usize
+            {
+                let max_full = (to_write - data_pos).min(bytes_until_eof);
+                let full_len = max_full - (max_full % sector_size as usize);
+                if full_len > 0 {
+                    let aligned_data = &data[data_pos..data_pos + full_len];
+                    self.device
+                        .write_sync(sector_idx, aligned_data)
+                        .map_err(|_| FsError::Io)?;
+                    data_pos += full_len;
+                    *offset += full_len as u64;
+                    continue;
+                }
+            }
+
+            // Handle partial sector with read-modify-write
+            self.device
+                .read_sync(sector_idx, &mut sector_buf)
+                .map_err(|_| FsError::Io)?;
+
+            sector_buf[sector_off..sector_off + available]
+                .copy_from_slice(&data[data_pos..data_pos + available]);
+
+            self.device
+                .write_sync(sector_idx, &sector_buf)
+                .map_err(|_| FsError::Io)?;
+
+            data_pos += available;
+            *offset += available as u64;
+        }
+
+        Ok(data_pos)
     }
 }
