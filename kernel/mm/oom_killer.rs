@@ -187,6 +187,12 @@ fn score_process(info: &OomProcessInfo) -> i64 {
         return i64::MIN;
     }
 
+    // R28-10 Fix: Never kill init (pid 1 or tgid 1) to keep the system alive
+    // Killing init would crash the entire system.
+    if info.pid == 1 || info.tgid == 1 {
+        return i64::MIN;
+    }
+
     // Never target kernel threads or tasks without an mm; killing them
     // would not reclaim user memory and can destabilize the kernel.
     if info.is_kernel_thread || !info.has_mm {

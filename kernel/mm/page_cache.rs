@@ -580,9 +580,17 @@ impl GlobalPageCache {
         bucket.insert((inode_id, index), page.clone());
         self.nr_pages.fetch_add(1, Ordering::Relaxed);
 
-        // Add to LRU
+        // R28-3 Fix: Add to LRU with rollback on failure
+        // If LRU is full and push_front fails, we must roll back the bucket insertion
+        // to avoid creating unreclaimable orphan pages.
         let mut lru = self.lru.lock();
-        lru.push_front(page.clone());
+        if lru.push_front(page.clone()).is_none() {
+            // LRU full: roll back the insertion
+            drop(lru); // Release LRU lock before acquiring bucket lock again
+            bucket.remove(&(inode_id, index));
+            self.nr_pages.fetch_sub(1, Ordering::Relaxed);
+            return Err(page);
+        }
 
         Ok(page)
     }

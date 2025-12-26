@@ -23,6 +23,8 @@ const CPIO_MAGIC: &[u8; 6] = b"070701";
 const CPIO_HEADER_LEN: usize = 110;
 /// Start of generated inode numbers (for implicit directories)
 const GENERATED_INO_START: u64 = 1 << 32;
+/// R28-9 Fix: Maximum per-file size from initramfs to prevent OOM during boot
+const MAX_INITRAMFS_FILE_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
 /// Next filesystem ID
 static NEXT_FS_ID: AtomicU64 = AtomicU64::new(400);
@@ -193,6 +195,10 @@ impl Initramfs {
 
             // Read file data
             let data_len = usize::try_from(header.filesize).map_err(|_| FsError::Invalid)?;
+            // R28-9 Fix: Reject files larger than MAX_INITRAMFS_FILE_SIZE to prevent OOM
+            if data_len > MAX_INITRAMFS_FILE_SIZE {
+                return Err(FsError::Invalid);
+            }
             let data_end = offset.checked_add(data_len).ok_or(FsError::Invalid)?;
             if data_end > buf.len() {
                 return Err(FsError::Invalid);

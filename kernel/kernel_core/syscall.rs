@@ -3410,6 +3410,12 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
         .ok_or(SyscallError::EINVAL)?
         & !0xfff;
 
+    // R28-7 Fix: Validate that addr + len_aligned doesn't overflow or exceed user space
+    let end = addr.checked_add(len_aligned).ok_or(SyscallError::EINVAL)?;
+    if end > USER_SPACE_TOP {
+        return Err(SyscallError::EINVAL);
+    }
+
     // W^X 安全检查：禁止同时可写可执行
     if (prot & PROT_WRITE != 0) && (prot & PROT_EXEC != 0) {
         return Err(SyscallError::EPERM);
@@ -3567,6 +3573,13 @@ fn load_user_seccomp_filter(flags: u32, args: u64) -> Result<seccomp::SeccompFil
     // Silently accepting TSYNC would leave sibling threads unsandboxed (security gap)
     if flags & seccomp::SeccompFlags::TSYNC.bits() != 0 {
         println!("[sys_seccomp] TSYNC not implemented, rejecting");
+        return Err(SyscallError::EINVAL);
+    }
+
+    // R28-8 Fix: Reject NEW_THREADS flag since we don't implement per-new-thread filtering
+    // Accepting this flag would make callers believe new threads are sandboxed when they're not.
+    if flags & seccomp::SeccompFlags::NEW_THREADS.bits() != 0 {
+        println!("[sys_seccomp] NEW_THREADS not implemented, rejecting");
         return Err(SyscallError::EINVAL);
     }
 

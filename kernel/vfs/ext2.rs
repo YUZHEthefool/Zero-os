@@ -349,6 +349,18 @@ impl Ext2Fs {
         (group, index)
     }
 
+    /// R28-5 Fix: Validate block number against filesystem bounds
+    #[inline]
+    fn validate_block(&self, block: u32) -> Result<Option<u32>, FsError> {
+        if block == 0 {
+            Ok(None)
+        } else if block >= self.superblock.blocks_count {
+            Err(FsError::Invalid)
+        } else {
+            Ok(Some(block))
+        }
+    }
+
     /// Map a file block number to physical block number
     fn map_file_block(&self, raw: &Ext2InodeRaw, file_block: u32) -> Result<Option<u32>, FsError> {
         let ptrs_per_block = self.block_size / 4; // 4 bytes per u32 pointer
@@ -356,35 +368,37 @@ impl Ext2Fs {
         // Direct blocks (0-11)
         if file_block < EXT2_NDIR_BLOCKS as u32 {
             let block = raw.block[file_block as usize];
-            return Ok(if block == 0 { None } else { Some(block) });
+            return self.validate_block(block);
         }
 
         let file_block = file_block - EXT2_NDIR_BLOCKS as u32;
 
         // Single indirect (block 12)
         if file_block < ptrs_per_block {
-            let ind_block = raw.block[EXT2_IND_BLOCK];
-            if ind_block == 0 {
-                return Ok(None);
-            }
+            // R28-5 Fix: Validate indirect block pointer
+            let ind_block = match self.validate_block(raw.block[EXT2_IND_BLOCK])? {
+                Some(b) => b,
+                None => return Ok(None),
+            };
 
             let mut buf = alloc::vec![0u8; self.block_size as usize];
             self.read_block(ind_block, &mut buf)?;
 
             let ptrs: &[u32] =
                 unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const u32, ptrs_per_block as usize) };
-            let block = ptrs[file_block as usize];
-            return Ok(if block == 0 { None } else { Some(block) });
+            // R28-5 Fix: Validate data block pointer
+            return self.validate_block(ptrs[file_block as usize]);
         }
 
         let file_block = file_block - ptrs_per_block;
 
         // Double indirect (block 13)
         if file_block < ptrs_per_block * ptrs_per_block {
-            let dind_block = raw.block[EXT2_DIND_BLOCK];
-            if dind_block == 0 {
-                return Ok(None);
-            }
+            // R28-5 Fix: Validate double indirect block pointer
+            let dind_block = match self.validate_block(raw.block[EXT2_DIND_BLOCK])? {
+                Some(b) => b,
+                None => return Ok(None),
+            };
 
             let mut buf = alloc::vec![0u8; self.block_size as usize];
             self.read_block(dind_block, &mut buf)?;
@@ -393,18 +407,19 @@ impl Ext2Fs {
                 unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const u32, ptrs_per_block as usize) };
 
             let ind_index = file_block / ptrs_per_block;
-            let ind_block = ptrs[ind_index as usize];
-            if ind_block == 0 {
-                return Ok(None);
-            }
+            // R28-5 Fix: Validate indirect block pointer from double indirect table
+            let ind_block = match self.validate_block(ptrs[ind_index as usize])? {
+                Some(b) => b,
+                None => return Ok(None),
+            };
 
             self.read_block(ind_block, &mut buf)?;
             let ptrs: &[u32] =
                 unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const u32, ptrs_per_block as usize) };
 
             let block_index = file_block % ptrs_per_block;
-            let block = ptrs[block_index as usize];
-            return Ok(if block == 0 { None } else { Some(block) });
+            // R28-5 Fix: Validate data block pointer
+            return self.validate_block(ptrs[block_index as usize]);
         }
 
         // Triple indirect would go here, but for simplicity we return an error
@@ -498,8 +513,18 @@ impl Ext2Inode {
                 break;
             }
 
+            // R28-4 Fix: Validate rec_len and name_len against buffer boundaries
+            let rec_len = head.rec_len as usize;
+            let min_rec = size_of::<Ext2DirEntryHead>();
+            if rec_len < min_rec || (offset_in_block as usize) + rec_len > block_buf.len() {
+                return Err(FsError::Invalid);
+            }
+            if (head.name_len as usize) > rec_len.saturating_sub(min_rec) {
+                return Err(FsError::Invalid);
+            }
+
             if head.inode != 0 && head.name_len > 0 {
-                let name_bytes = &data[size_of::<Ext2DirEntryHead>()..][..head.name_len as usize];
+                let name_bytes = &data[min_rec..min_rec + head.name_len as usize];
                 if let Ok(entry_name) = core::str::from_utf8(name_bytes) {
                     if entry_name == name {
                         // Found it!
@@ -636,9 +661,20 @@ impl Inode for Ext2Inode {
                 break;
             }
 
+            // R28-4 Fix: Validate rec_len and name_len against buffer boundaries
+            let rec_len = head.rec_len as usize;
+            let min_rec = size_of::<Ext2DirEntryHead>();
+            if rec_len < min_rec || (offset_in_block as usize) + rec_len > block_buf.len() {
+                return Err(FsError::Invalid);
+            }
+
             if head.inode != 0 && head.name_len > 0 {
+                // Validate name_len before accessing
+                if (head.name_len as usize) > rec_len.saturating_sub(min_rec) {
+                    return Err(FsError::Invalid);
+                }
                 if entry_index == offset {
-                    let name_bytes = &data[size_of::<Ext2DirEntryHead>()..][..head.name_len as usize];
+                    let name_bytes = &data[min_rec..min_rec + head.name_len as usize];
                     let name = String::from_utf8_lossy(name_bytes).into_owned();
 
                     let file_type = match head.file_type {

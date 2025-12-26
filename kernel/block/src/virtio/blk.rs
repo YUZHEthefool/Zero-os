@@ -37,6 +37,55 @@ const DEFAULT_QUEUE_SIZE: u16 = 128;
 const MAX_PENDING: usize = 64;
 
 // ============================================================================
+// DMA Address Translation (R28-1 Fix)
+// ============================================================================
+
+/// Translate a kernel virtual address to a DMA-safe physical address.
+///
+/// For kernel heap allocations (which are in the high-half direct map),
+/// we can simply subtract PHYSICAL_MEMORY_OFFSET to get the physical address.
+///
+/// # Arguments
+/// * `ptr` - Virtual address pointer
+/// * `len` - Length of the buffer (must be > 0)
+///
+/// # Returns
+/// Physical address suitable for DMA, or BlockError::Invalid if translation fails.
+///
+/// # Safety
+/// The caller must ensure the buffer is in kernel address space (high-half direct map).
+fn virt_to_phys_dma(ptr: *const u8, len: usize) -> Result<u64, BlockError> {
+    if len == 0 {
+        return Err(BlockError::Invalid);
+    }
+
+    let virt = ptr as u64;
+
+    // Kernel high-half direct map: 0xffffffff80000000 -> physical 0x0
+    // This covers the first 1GB of physical memory where kernel allocations reside.
+    const PHYSICAL_MEMORY_OFFSET: u64 = 0xffff_ffff_8000_0000;
+
+    // Verify the address is in the expected kernel range
+    if virt < PHYSICAL_MEMORY_OFFSET {
+        // Address is not in kernel direct map - this is a programming error
+        // User-space buffers should never reach here
+        return Err(BlockError::Invalid);
+    }
+
+    let phys = virt - PHYSICAL_MEMORY_OFFSET;
+
+    // Overflow check: ensure the entire buffer is within valid physical memory
+    // The direct map covers 0-1GB (0x0 to 0x40000000)
+    let end = phys.checked_add(len as u64 - 1).ok_or(BlockError::Invalid)?;
+    if end >= 0x4000_0000 {
+        // Beyond direct map coverage - likely an error
+        return Err(BlockError::Invalid);
+    }
+
+    Ok(phys)
+}
+
+// ============================================================================
 // VirtQueue Implementation
 // ============================================================================
 
@@ -458,6 +507,19 @@ impl VirtioBlkDevice {
             return Err(BlockError::ReadOnly);
         }
 
+        // R28-2 Fix: Validate buffer alignment and capacity bounds
+        if buf.is_empty() {
+            return Err(BlockError::Invalid);
+        }
+        if (buf.len() as u32) % self.sector_size != 0 {
+            return Err(BlockError::Invalid);
+        }
+        let sectors_count = (buf.len() as u64) / (self.sector_size as u64);
+        let end_sector = sector.checked_add(sectors_count).ok_or(BlockError::Invalid)?;
+        if end_sector > self.capacity {
+            return Err(BlockError::Invalid);
+        }
+
         let _lock = self.lock.lock();
 
         // Get a request buffer
@@ -481,16 +543,19 @@ impl VirtioBlkDevice {
             }
         };
 
-        // Get physical addresses
+        // R28-1 Fix: Convert virtual addresses to physical addresses for DMA
+        // The device will DMA to these physical addresses, so we must translate them.
         let header_phys = {
             let buffers = self.req_buffers.lock();
-            &buffers[buf_idx].header as *const _ as u64
+            let header_ptr = &buffers[buf_idx].header as *const _ as *const u8;
+            virt_to_phys_dma(header_ptr, core::mem::size_of::<VirtioBlkReqHeader>())?
         };
         let status_phys = {
             let buffers = self.req_buffers.lock();
-            &buffers[buf_idx].status as *const _ as u64
+            let status_ptr = &buffers[buf_idx].status as *const u8;
+            virt_to_phys_dma(status_ptr, 1)?
         };
-        let data_phys = buf.as_ptr() as u64;
+        let data_phys = virt_to_phys_dma(buf.as_ptr(), buf.len())?;
 
         // Allocate 3 descriptors
         let desc0 = self.queue.alloc_desc().ok_or(BlockError::Busy)?;
