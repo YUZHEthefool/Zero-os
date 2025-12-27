@@ -50,6 +50,7 @@ extern crate alloc;
 extern crate drivers;
 
 use alloc::vec::Vec;
+use spin::RwLock;
 
 // Audit integration for violation logging
 use audit::{emit_seccomp_violation, AuditSeccompAction, AuditSubject};
@@ -61,6 +62,35 @@ pub use types::{
     SeccompFilter, SeccompFlags, SeccompInsn, SeccompState, SeccompVerdict,
     MAX_INSNS,
 };
+
+// ============================================================================
+// R29-2 FIX: Callback-based process integration
+// ============================================================================
+
+/// Callback type for evaluating seccomp filters on current process.
+pub type SeccompEvaluator = fn(u64, &[u64; 6]) -> SeccompVerdict;
+/// Callback type for checking if current process has seccomp enabled.
+pub type SeccompEnabledCheck = fn() -> bool;
+
+/// Registered evaluator callback (set by kernel_core during init).
+static CURRENT_EVALUATOR: RwLock<Option<SeccompEvaluator>> = RwLock::new(None);
+/// Registered enabled-check callback (set by kernel_core during init).
+static CURRENT_ENABLED_CHECK: RwLock<Option<SeccompEnabledCheck>> = RwLock::new(None);
+
+/// Register callbacks for current-process seccomp evaluation.
+///
+/// This function is called from kernel_core::init() to bridge the dependency
+/// gap between seccomp and kernel_core modules.
+///
+/// # Arguments
+///
+/// * `evaluator` - Function to evaluate seccomp filters for current process
+/// * `enabled_check` - Function to check if current process has seccomp enabled
+pub fn register_current_hooks(evaluator: SeccompEvaluator, enabled_check: SeccompEnabledCheck) {
+    *CURRENT_EVALUATOR.write() = Some(evaluator);
+    *CURRENT_ENABLED_CHECK.write() = Some(enabled_check);
+    println!("  Seccomp hooks registered for current-process evaluation");
+}
 
 // ============================================================================
 // Strict Mode Syscall Whitelist
@@ -243,29 +273,36 @@ pub fn pledge_to_filter(promises: PledgePromises) -> SeccompFilter {
 /// Evaluate seccomp filters for the current process.
 ///
 /// This is the main entry point called from syscall dispatcher.
-/// Returns Allow if no filters are installed.
+/// Returns Allow if no filters are installed or no evaluator is registered.
 ///
-/// # Note
+/// # R29-2 FIX
 ///
-/// This function requires access to the current process's PCB.
-/// Integration with kernel_core::process is pending.
+/// Previously this function always returned Allow, completely bypassing
+/// seccomp filters. Now it delegates to the registered callback from
+/// kernel_core which evaluates the actual process's SeccompState.
 #[inline]
-pub fn evaluate_current(_syscall_nr: u64, _args: &[u64; 6]) -> SeccompVerdict {
-    // TODO: Get current process's SeccompState
-    // For now, return Allow (no filtering)
-    //
-    // Integration:
-    // if let Some(state) = kernel_core::process::current_seccomp_state() {
-    //     return state.evaluate(syscall_nr, args);
-    // }
-
+pub fn evaluate_current(syscall_nr: u64, args: &[u64; 6]) -> SeccompVerdict {
+    // Use registered callback if available
+    if let Some(evaluator) = *CURRENT_EVALUATOR.read() {
+        return evaluator(syscall_nr, args);
+    }
+    // Fallback: no callback registered yet (during early boot)
     SeccompVerdict::allow()
 }
 
 /// Check if current process has seccomp enabled.
+///
+/// # R29-2 FIX
+///
+/// Previously this always returned false. Now it delegates to the
+/// registered callback from kernel_core.
 #[inline]
 pub fn is_enabled() -> bool {
-    // TODO: Check current process's seccomp state
+    // Use registered callback if available
+    if let Some(check) = *CURRENT_ENABLED_CHECK.read() {
+        return check();
+    }
+    // Fallback: no callback registered yet
     false
 }
 

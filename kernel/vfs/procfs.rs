@@ -19,6 +19,8 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_core::FileOps;
+// R29-1 FIX: Import process module for real process information
+use kernel_core::process::{self, ProcessState, PROCESS_TABLE};
 use spin::RwLock;
 
 /// Global procfs ID counter
@@ -984,80 +986,216 @@ fn read_from_content(content: &str, offset: u64, buf: &mut [u8]) -> Result<usize
 }
 
 /// Get current process ID
+///
+/// R29-1 FIX: Now returns the actual current PID from the scheduler
 fn get_current_pid() -> u32 {
-    // TODO: Get actual current PID from scheduler
-    1
+    process::current_pid().unwrap_or(0) as u32
 }
 
 /// Check if a process exists
+///
+/// R29-1 FIX: Now checks the actual process table
 fn process_exists(pid: u32) -> bool {
-    // TODO: Check actual process table
-    pid == 1 || pid == 0
+    if pid == 0 {
+        return false;
+    }
+
+    let table = PROCESS_TABLE.lock();
+    match table.get(pid as usize) {
+        Some(Some(proc)) => {
+            let state = proc.lock().state;
+            !matches!(state, ProcessState::Zombie | ProcessState::Terminated)
+        }
+        _ => false,
+    }
 }
 
 /// List all PIDs
+///
+/// R29-1 FIX: Now returns actual PIDs from the process table
 fn list_pids() -> Vec<u32> {
-    // TODO: Get actual PID list from scheduler
-    alloc::vec![1]
+    let table = PROCESS_TABLE.lock();
+    table
+        .iter()
+        .enumerate()
+        .skip(1) // PID 0 is reserved
+        .filter_map(|(pid, slot)| {
+            slot.as_ref().and_then(|proc| {
+                let state = proc.lock().state;
+                if matches!(state, ProcessState::Zombie | ProcessState::Terminated) {
+                    None
+                } else {
+                    Some(pid as u32)
+                }
+            })
+        })
+        .collect()
 }
 
 /// Get process owner (uid, gid)
-fn get_process_owner(_pid: u32) -> (u32, u32) {
-    // TODO: Get actual process owner
-    (0, 0)
+///
+/// R29-1 FIX: Now returns actual process credentials
+fn get_process_owner(pid: u32) -> (u32, u32) {
+    if pid == 0 {
+        return (0, 0);
+    }
+
+    let table = PROCESS_TABLE.lock();
+    match table.get(pid as usize) {
+        Some(Some(proc)) => {
+            let p = proc.lock();
+            (p.uid, p.gid)
+        }
+        _ => (0, 0),
+    }
 }
 
 /// Get process command line
+///
+/// R29-1 FIX: Now returns actual process name from PCB
 fn get_process_cmdline(pid: u32) -> String {
-    // TODO: Get actual command line from process
-    if pid == 1 {
-        String::from("init\0")
-    } else {
-        String::new()
+    if pid == 0 {
+        return String::new();
+    }
+
+    let table = PROCESS_TABLE.lock();
+    match table.get(pid as usize) {
+        Some(Some(proc)) => {
+            let p = proc.lock();
+            // Return process name with null terminator (Linux format)
+            format!("{}\0", p.name)
+        }
+        _ => String::new(),
     }
 }
 
 /// List file descriptors for a process
-fn list_process_fds(_pid: u32) -> Vec<u32> {
-    // TODO: Get actual FD list from process
-    alloc::vec![0, 1, 2]
+///
+/// R29-1 FIX: Now returns actual FD list from process
+fn list_process_fds(pid: u32) -> Vec<u32> {
+    if pid == 0 {
+        return Vec::new();
+    }
+
+    let table = PROCESS_TABLE.lock();
+    match table.get(pid as usize) {
+        Some(Some(proc)) => {
+            let p = proc.lock();
+            p.fd_table.keys().map(|&fd| fd as u32).collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Resolve a file descriptor target for /proc/[pid]/fd/<n>
+///
+/// R29-1 FIX: Now returns actual FD type from process
 fn get_fd_target(pid: u32, fd: u32) -> String {
-    // TODO: Look up the real path or descriptor type from the process table
-    match fd {
-        0 => String::from("/dev/console"),
-        1 => String::from("/dev/console"),
-        2 => String::from("/dev/console"),
-        _ => format!("(pid {} fd {})", pid, fd),
+    if pid == 0 {
+        return String::new();
+    }
+
+    let table = PROCESS_TABLE.lock();
+    match table.get(pid as usize) {
+        Some(Some(proc)) => {
+            let p = proc.lock();
+            match p.fd_table.get(&(fd as i32)) {
+                Some(fd_obj) => {
+                    // Return type name as the "target"
+                    format!("{}", fd_obj.type_name())
+                }
+                None => String::new(),
+            }
+        }
+        _ => String::new(),
     }
 }
 
 /// Generate /proc/[pid]/status content
+///
+/// R29-1 FIX: Now uses real process data
 fn generate_status(pid: u32) -> String {
-    // TODO: Get actual process info
-    format!(
-        "Name:\tinit\n\
-         Umask:\t0022\n\
-         State:\tS (sleeping)\n\
-         Tgid:\t{pid}\n\
-         Pid:\t{pid}\n\
-         PPid:\t0\n\
-         Uid:\t0\t0\t0\t0\n\
-         Gid:\t0\t0\t0\t0\n\
-         VmSize:\t    1024 kB\n\
-         VmRSS:\t     512 kB\n\
-         Threads:\t1\n"
-    )
+    if pid == 0 {
+        return String::new();
+    }
+
+    let table = PROCESS_TABLE.lock();
+    match table.get(pid as usize) {
+        Some(Some(proc)) => {
+            let p = proc.lock();
+            let state_char = match p.state {
+                ProcessState::Ready => 'R',
+                ProcessState::Running => 'R',
+                ProcessState::Blocked => 'S',
+                ProcessState::Sleeping => 'S',
+                ProcessState::Stopped => 'T',
+                ProcessState::Zombie => 'Z',
+                ProcessState::Terminated => 'X',
+            };
+            let state_name = match p.state {
+                ProcessState::Ready | ProcessState::Running => "running",
+                ProcessState::Blocked | ProcessState::Sleeping => "sleeping",
+                ProcessState::Stopped => "stopped",
+                ProcessState::Zombie => "zombie",
+                ProcessState::Terminated => "dead",
+            };
+            format!(
+                "Name:\t{}\n\
+                 Umask:\t{:04o}\n\
+                 State:\t{} ({})\n\
+                 Tgid:\t{}\n\
+                 Pid:\t{}\n\
+                 PPid:\t{}\n\
+                 Uid:\t{}\t{}\t{}\t{}\n\
+                 Gid:\t{}\t{}\t{}\t{}\n\
+                 Threads:\t1\n",
+                p.name,
+                p.umask,
+                state_char, state_name,
+                p.tgid,
+                p.pid,
+                p.ppid,
+                p.uid, p.euid, p.uid, p.uid,  // real, effective, saved, fs
+                p.gid, p.egid, p.gid, p.gid,
+            )
+        }
+        _ => String::new(),
+    }
 }
 
 /// Generate /proc/[pid]/stat content
+///
+/// R29-1 FIX: Now uses real process data
 fn generate_stat(pid: u32) -> String {
-    // Minimal stat format: pid (comm) state ppid pgrp session tty_nr ...
-    format!(
-        "{pid} (init) S 0 {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
-    )
+    if pid == 0 {
+        return String::new();
+    }
+
+    let table = PROCESS_TABLE.lock();
+    match table.get(pid as usize) {
+        Some(Some(proc)) => {
+            let p = proc.lock();
+            let state_char = match p.state {
+                ProcessState::Ready | ProcessState::Running => 'R',
+                ProcessState::Blocked | ProcessState::Sleeping => 'S',
+                ProcessState::Stopped => 'T',
+                ProcessState::Zombie => 'Z',
+                ProcessState::Terminated => 'X',
+            };
+            // Minimal stat format: pid (comm) state ppid pgrp session tty_nr ...
+            format!(
+                "{} ({}) {} {} {} {} 0 -1 0 0 0 0 0 0 0 0 {} 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                p.pid,
+                p.name,
+                state_char,
+                p.ppid,
+                p.pid, // pgrp = pid for now
+                p.pid, // session = pid for now
+                p.priority,
+            )
+        }
+        _ => String::new(),
+    }
 }
 
 /// Generate /proc/[pid]/maps content

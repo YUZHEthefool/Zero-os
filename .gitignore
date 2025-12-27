@@ -16,6 +16,7 @@ Cargo.lock
 #no_need
 *.md
 *.log
+core
 
 !README.md
 !README_zh.md

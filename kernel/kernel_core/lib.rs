@@ -118,6 +118,10 @@ pub fn init() {
     // Register LSM context providers (must be after process::init)
     lsm::register_context_provider(lsm_get_pid, lsm_get_credentials, lsm_get_ticks);
 
+    // R29-2 FIX: Register seccomp current-process evaluation callbacks
+    // This bridges the seccomp module to the process module for filter evaluation
+    seccomp::register_current_hooks(evaluate_seccomp, has_seccomp_enabled);
+
     // R26-4 FIX: Register audit snapshot authorizer
     // Allow root (euid == 0) to access audit logs
     // Future: Could also check for CAP_AUDIT_READ capability
