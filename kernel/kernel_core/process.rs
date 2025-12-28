@@ -106,7 +106,16 @@ pub enum KernelStackError {
 pub enum ProcessCreateError {
     /// 内核栈分配失败
     KernelStackAllocFailed(KernelStackError),
+    /// R29-5 FIX: PID 空间耗尽（内核栈地址空间溢出）
+    PidExhausted,
 }
+
+/// R29-5 FIX: Maximum PID before kernel stack address overflow
+///
+/// Each process gets a kernel stack at KSTACK_BASE + pid * KSTACK_STRIDE.
+/// After this many PIDs, new stacks would overflow into other kernel memory.
+/// Calculation: (u64::MAX - KSTACK_BASE) / KSTACK_STRIDE ≈ 209,715
+pub const MAX_PID: ProcessId = ((u64::MAX - KSTACK_BASE) / KSTACK_STRIDE) as ProcessId;
 
 /// 计算指定 PID 的内核栈虚拟地址范围
 ///
@@ -655,6 +664,15 @@ pub fn create_process(
     // 先尝试分配内核栈，失败则直接返回错误（不分配 PID）
     let mut next_pid_guard = NEXT_PID.lock();
     let pid = *next_pid_guard;
+
+    // R29-5 FIX: Check PID upper bound to prevent kernel stack address overflow
+    if pid > MAX_PID {
+        println!(
+            "Error: PID space exhausted (pid {} > MAX_PID {})",
+            pid, MAX_PID
+        );
+        return Err(ProcessCreateError::PidExhausted);
+    }
 
     // 为进程分配内核栈 - SECURITY FIX Z-7: 失败时必须返回错误
     let (stack_base, stack_top) = match allocate_kernel_stack(pid) {

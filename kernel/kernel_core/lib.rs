@@ -123,14 +123,24 @@ pub fn init() {
     seccomp::register_current_hooks(evaluate_seccomp, has_seccomp_enabled);
 
     // R26-4 FIX: Register audit snapshot authorizer
-    // Allow root (euid == 0) to access audit logs
-    // Future: Could also check for CAP_AUDIT_READ capability
+    // Allow root (euid == 0) or processes with CAP_AUDIT_READ capability
     audit::register_snapshot_authorizer(|| {
+        // First check: root always allowed
         if let Some(creds) = current_credentials() {
             if creds.euid == 0 {
                 return Ok(());
             }
         }
+
+        // Second check: CAP_AUDIT_READ capability
+        if let Some(has_cap) =
+            with_current_cap_table(|table| table.has_rights(cap::CapRights::AUDIT_READ))
+        {
+            if has_cap {
+                return Ok(());
+            }
+        }
+
         Err(audit::AuditError::AccessDenied)
     });
 

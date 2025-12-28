@@ -3002,6 +3002,13 @@ fn sys_brk(addr: usize) -> SyscallResult {
         return Ok(proc.brk);
     }
 
+    // R29-3 FIX: Call LSM hook for brk operations
+    if let Some(ctx) = lsm::ProcessCtx::from_current() {
+        if lsm::hook_memory_brk(&ctx, addr as u64).is_err() {
+            return Err(SyscallError::EPERM);
+        }
+    }
+
     // 拒绝缩小到 brk_start 以下
     if addr < proc.brk_start {
         return Ok(proc.brk);
@@ -3137,9 +3144,23 @@ fn sys_mmap(
         return Err(SyscallError::EINVAL);
     }
 
+    // R30-2 FIX: Enforce W^X policy - reject PROT_WRITE | PROT_EXEC
+    // PROT_WRITE = 0x2, PROT_EXEC = 0x4
+    // Mirrors the check in sys_mprotect for consistency
+    if (prot & 0x2 != 0) && (prot & 0x4 != 0) {
+        return Err(SyscallError::EPERM);
+    }
+
     // 文件映射暂不支持
     if fd >= 0 {
         return Err(SyscallError::ENOSYS);
+    }
+
+    // R29-3 FIX: Call LSM hook for anonymous mmap operations
+    if let Some(ctx) = lsm::ProcessCtx::from_current() {
+        if lsm::hook_memory_mmap(&ctx, addr as u64, length as u64, prot as u32, _flags as u32).is_err() {
+            return Err(SyscallError::EPERM);
+        }
     }
 
     // 对齐到页边界（使用 checked_add 防止整数溢出）
@@ -3313,6 +3334,14 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         return Err(SyscallError::EINVAL);
     }
 
+    // R30-3 FIX: Call LSM hook for munmap operations
+    // This ensures memory unmapping is subject to policy and audit
+    if let Some(ctx) = lsm::ProcessCtx::from_current() {
+        if lsm::hook_memory_munmap(&ctx, addr as u64, length_aligned as u64).is_err() {
+            return Err(SyscallError::EPERM);
+        }
+    }
+
     // 使用基于当前 CR3 的页表管理器进行取消映射
     // R23-3 fix: 使用两阶段方法 - 先收集帧、做 TLB shootdown、再释放
     let unmap_result: Result<(), SyscallError> = unsafe {
@@ -3419,6 +3448,13 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     // W^X 安全检查：禁止同时可写可执行
     if (prot & PROT_WRITE != 0) && (prot & PROT_EXEC != 0) {
         return Err(SyscallError::EPERM);
+    }
+
+    // R29-3 FIX: Call LSM hook for mprotect operations
+    if let Some(ctx) = lsm::ProcessCtx::from_current() {
+        if lsm::hook_memory_mprotect(&ctx, addr as u64, len_aligned as u64, prot as u32).is_err() {
+            return Err(SyscallError::EPERM);
+        }
     }
 
     // 构建页表标志

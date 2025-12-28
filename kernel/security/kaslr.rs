@@ -237,6 +237,76 @@ impl KernelLayout {
 }
 
 // ============================================================================
+// Linker Symbols
+// ============================================================================
+
+// Linker-provided section boundaries (defined in kernel.ld)
+extern "C" {
+    static kernel_start: u8;
+    static text_start: u8;
+    static text_end: u8;
+    static rodata_start: u8;
+    static rodata_end: u8;
+    static data_start: u8;
+    static data_end: u8;
+    static bss_start: u8;
+    static bss_end: u8;
+    static kernel_end: u8;
+}
+
+/// Convert a linker symbol reference to its virtual address
+#[inline]
+unsafe fn sym_addr(sym: &u8) -> u64 {
+    sym as *const u8 as u64
+}
+
+/// Build kernel layout from linker symbols at runtime
+///
+/// This function reads the actual section boundaries from linker symbols
+/// and populates the KernelLayout structure. This allows accurate bounds
+/// checking even without bootloader-assisted KASLR.
+fn build_kernel_layout_from_linker() -> KernelLayout {
+    // Safety: symbols are provided by kernel.ld and valid after kernel load
+    let kernel_start_addr = unsafe { sym_addr(&kernel_start) };
+    let text_start_addr = unsafe { sym_addr(&text_start) };
+    let text_end_addr = unsafe { sym_addr(&text_end) };
+    let rodata_start_addr = unsafe { sym_addr(&rodata_start) };
+    let rodata_end_addr = unsafe { sym_addr(&rodata_end) };
+    let data_start_addr = unsafe { sym_addr(&data_start) };
+    let data_end_addr = unsafe { sym_addr(&data_end) };
+    let bss_start_addr = unsafe { sym_addr(&bss_start) };
+    let bss_end_addr = unsafe { sym_addr(&bss_end) };
+
+    // Calculate runtime slide by comparing actual vs expected addresses
+    // If bootloader relocates kernel, this will show the offset
+    let runtime_slide = kernel_start_addr.saturating_sub(KERNEL_VIRT_BASE + KERNEL_ENTRY_OFFSET);
+
+    KernelLayout {
+        virt_base: KERNEL_VIRT_BASE + runtime_slide,
+        phys_base: KERNEL_PHYS_BASE,
+        kaslr_slide: runtime_slide,
+        text_start: text_start_addr,
+        text_size: text_end_addr.saturating_sub(text_start_addr),
+        rodata_start: rodata_start_addr,
+        rodata_size: rodata_end_addr.saturating_sub(rodata_start_addr),
+        data_start: data_start_addr,
+        data_size: data_end_addr.saturating_sub(data_start_addr),
+        bss_start: bss_start_addr,
+        bss_size: bss_end_addr.saturating_sub(bss_start_addr),
+        heap_start: KERNEL_VIRT_BASE + 0x200000 + runtime_slide,
+        heap_size: 1 * 1024 * 1024, // 1 MiB
+        phys_offset: PHYSICAL_MEMORY_OFFSET,
+    }
+}
+
+/// Update the global kernel layout from linker symbols
+fn set_kernel_layout(layout: KernelLayout) {
+    KASLR_ENABLED.store(layout.kaslr_slide != 0, Ordering::SeqCst);
+    let mut guard = KERNEL_LAYOUT.lock();
+    *guard = layout;
+}
+
+// ============================================================================
 // KPTI Infrastructure
 // ============================================================================
 
@@ -339,43 +409,97 @@ impl KptiContext {
     }
 }
 
+/// Active KPTI context (shared for now, per-CPU in future SMP)
+static KPTI_CONTEXT: Mutex<KptiContext> = Mutex::new(KptiContext {
+    user_cr3: 0,
+    kernel_cr3: 0,
+    pcid: 0,
+});
+
+/// Install a new KPTI context (enables/disables KPTI based on separation)
+///
+/// # Arguments
+///
+/// * `ctx` - The KPTI context to install
+///
+/// # Note
+///
+/// This should only be called during process switch or KPTI setup.
+/// Installing a context with different user/kernel CR3 enables KPTI.
+pub fn install_kpti_context(ctx: KptiContext) {
+    KPTI_ENABLED.store(ctx.has_kpti(), Ordering::SeqCst);
+    let mut guard = KPTI_CONTEXT.lock();
+    *guard = ctx;
+}
+
+/// Read the current KPTI context
+#[inline]
+pub fn current_kpti_context() -> KptiContext {
+    *KPTI_CONTEXT.lock()
+}
+
 // ============================================================================
-// KPTI Stubs (No-op until Phase B)
+// KPTI CR3 Switching
 // ============================================================================
 
 /// Switch to kernel CR3 on syscall/interrupt entry
 ///
+/// When KPTI is enabled, this switches from the user page table
+/// (which has minimal kernel mappings) to the kernel page table
+/// (which has full kernel access).
+///
 /// # Safety
 ///
-/// This function should only be called from syscall entry points.
-/// Currently a no-op; will perform CR3 switch when KPTI is implemented.
+/// This function modifies CR3 register. It should only be called
+/// from syscall/interrupt entry paths before accessing kernel data.
 #[inline]
 pub fn enter_kernel_mode() {
-    // No-op: KPTI not yet implemented
-    // Future: load kernel CR3, update PCID, fence
-    if KPTI_ENABLED.load(Ordering::Relaxed) {
-        // Will be implemented in Phase B:
-        // 1. Read current KPTI context from per-CPU data
-        // 2. Load kernel_cr3 into CR3 register
-        // 3. Apply PCID if supported
+    if !KPTI_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let ctx = current_kpti_context();
+    if !ctx.has_kpti() {
+        return;
+    }
+
+    // Switch to kernel CR3
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {}",
+            in(reg) ctx.kernel_cr3_with_pcid(),
+            options(nostack, preserves_flags)
+        );
     }
 }
 
 /// Switch to user CR3 before returning to userspace
 ///
+/// When KPTI is enabled, this switches from the kernel page table
+/// to the user page table (which has only trampoline + user mappings).
+///
 /// # Safety
 ///
-/// This function should only be called from syscall/interrupt exit points.
-/// Currently a no-op; will perform CR3 switch when KPTI is implemented.
+/// This function modifies CR3 register. It should only be called
+/// from syscall/interrupt exit paths just before returning to user mode.
 #[inline]
 pub fn return_to_user_mode() {
-    // No-op: KPTI not yet implemented
-    // Future: load user CR3, update PCID, fence
-    if KPTI_ENABLED.load(Ordering::Relaxed) {
-        // Will be implemented in Phase B:
-        // 1. Read current KPTI context from per-CPU data
-        // 2. Load user_cr3 into CR3 register
-        // 3. Apply PCID if supported
+    if !KPTI_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let ctx = current_kpti_context();
+    if !ctx.has_kpti() {
+        return;
+    }
+
+    // Switch to user CR3
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {}",
+            in(reg) ctx.user_cr3_with_pcid(),
+            options(nostack, preserves_flags)
+        );
     }
 }
 
@@ -656,17 +780,21 @@ pub fn init() {
     // Step 1: Enable PCID if CPU supports it
     let pcid_enabled = enable_pcid_if_supported();
 
-    // R25-11 FIX: KASLR is not actually implemented - kernel runs at fixed address
-    // Do NOT generate a slide value or report as enabled until bootloader supports relocation
-    // Previously this generated a slide and stored it in KernelLayout, but the kernel
-    // was never actually relocated, causing the layout to contain incorrect addresses.
-    let slide = 0;  // KASLR disabled until bootloader supports relocation
-    apply_kaslr_slide(slide);
+    // Step 2: Build kernel layout from linker symbols
+    // This populates section bounds accurately even without bootloader-assisted KASLR
+    let layout = build_kernel_layout_from_linker();
+    set_kernel_layout(layout);
 
-    // Report status (accurately reflect disabled state)
+    // Report status
     println!("  PCID: {}",
         if pcid_enabled { "enabled" } else { "unsupported/disabled" });
-    println!("  KASLR: disabled (requires bootloader support)");
+    println!("  KASLR: {} (slide: 0x{:x})",
+        if layout.kaslr_slide != 0 { "enabled" } else { "disabled" },
+        layout.kaslr_slide);
+    println!("  Kernel sections: text={:#x}..{:#x} ({} bytes)",
+        layout.text_start,
+        layout.text_start + layout.text_size,
+        layout.text_size);
     println!("  KPTI: {} (stubs installed)",
         if is_kpti_enabled() { "enabled" } else { "disabled" });
 }

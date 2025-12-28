@@ -1065,6 +1065,106 @@ pub fn hook_file_umount(task: &ProcessCtx, target_hash: u64, flags: u64) -> LsmR
     }
 }
 
+// ============================================================================
+// Memory Hooks (R29-3 FIX)
+// ============================================================================
+
+/// R29-3 FIX: Hook for anonymous mmap operations.
+///
+/// This hook is called for memory mappings not backed by a file.
+/// Policies can use this to enforce W^X or other memory protection rules.
+#[inline]
+pub fn hook_memory_mmap(
+    task: &ProcessCtx,
+    addr: u64,
+    len: u64,
+    prot: u32,
+    flags: u32,
+) -> LsmResult {
+    #[cfg(feature = "lsm")]
+    {
+        let res = policy().memory_mmap(task, addr, len, prot, flags);
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Memory { vaddr: addr, size: len, prot };
+            emit_denial_audit(subject, object, "memory_mmap", err);
+        }
+        res
+    }
+    #[cfg(not(feature = "lsm"))]
+    {
+        let _ = (task, addr, len, prot, flags);
+        Ok(())
+    }
+}
+
+/// R29-3 FIX: Hook for mprotect operations.
+///
+/// Called when a process changes memory protection.
+#[inline]
+pub fn hook_memory_mprotect(task: &ProcessCtx, addr: u64, len: u64, prot: u32) -> LsmResult {
+    #[cfg(feature = "lsm")]
+    {
+        let res = policy().memory_mprotect(task, addr, len, prot);
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Memory { vaddr: addr, size: len, prot };
+            emit_denial_audit(subject, object, "memory_mprotect", err);
+        }
+        res
+    }
+    #[cfg(not(feature = "lsm"))]
+    {
+        let _ = (task, addr, len, prot);
+        Ok(())
+    }
+}
+
+/// R29-3 FIX: Hook for brk (heap) operations.
+///
+/// Called when a process extends or shrinks its heap.
+#[inline]
+pub fn hook_memory_brk(task: &ProcessCtx, new_brk: u64) -> LsmResult {
+    #[cfg(feature = "lsm")]
+    {
+        let res = policy().memory_brk(task, new_brk);
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Memory { vaddr: new_brk, size: 0, prot: 0 };
+            emit_denial_audit(subject, object, "memory_brk", err);
+        }
+        res
+    }
+    #[cfg(not(feature = "lsm"))]
+    {
+        let _ = (task, new_brk);
+        Ok(())
+    }
+}
+
+/// R30-3 FIX: Hook for munmap operations.
+///
+/// Called when a process unmaps a memory region.
+/// Policies can use this to audit or control memory unmapping.
+#[inline]
+pub fn hook_memory_munmap(task: &ProcessCtx, addr: u64, len: u64) -> LsmResult {
+    #[cfg(feature = "lsm")]
+    {
+        let res = policy().memory_munmap(task, addr, len);
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            let object = AuditObject::Memory { vaddr: addr, size: len, prot: 0 };
+            emit_denial_audit(subject, object, "memory_munmap", err);
+        }
+        res
+    }
+    #[cfg(not(feature = "lsm"))]
+    {
+        let _ = (task, addr, len);
+        Ok(())
+    }
+}
+
 /// Hook: IPC send.
 #[inline]
 pub fn hook_ipc_send(task: &ProcessCtx, ctx: &IpcCtx) -> LsmResult {

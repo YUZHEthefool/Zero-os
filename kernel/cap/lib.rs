@@ -84,7 +84,8 @@ pub use types::{
 pub const DEFAULT_CAP_SLOTS: usize = 64;
 
 /// Maximum slots per capability table (prevents memory exhaustion).
-pub const MAX_CAP_SLOTS: usize = 65536;
+/// R30-1 FIX: Reduced from 65536 to 65535 to match u16 index range (0..65535).
+pub const MAX_CAP_SLOTS: usize = 65535;
 
 // ============================================================================
 // Capability Table
@@ -106,18 +107,21 @@ struct CapTableInner {
     slots: Vec<Option<CapSlot>>,
 
     /// Free slot indices for fast allocation.
-    free: Vec<u32>,
+    /// R29-4 FIX: Changed from u32 to u16 to match new CapId encoding.
+    free: Vec<u16>,
 
     /// Next generation counter (monotonically increasing).
+    /// R29-4 FIX: Extended from u32 to u64 (48 bits used, ~281 trillion allocations).
     /// Starts at 1; generation 0 is reserved for INVALID.
-    next_generation: u32,
+    next_generation: u64,
 }
 
 /// Slot ties a capability entry to its generation counter.
 #[derive(Debug, Clone)]
 struct CapSlot {
-    /// Generation counter for this slot (matches CapId.generation).
-    generation: u32,
+    /// R29-4 FIX: Generation counter for this slot (matches CapId.generation).
+    /// Extended to u64 to support 48-bit generation space.
+    generation: u64,
 
     /// The actual capability entry.
     entry: CapEntry,
@@ -240,6 +244,29 @@ impl CapTable {
         })
     }
 
+    /// Check if any capability in the table grants the required rights.
+    ///
+    /// Used by ambient gates such as audit snapshot export to check if
+    /// the current process has CAP_AUDIT_READ or similar rights.
+    ///
+    /// # Arguments
+    ///
+    /// * `required` - The rights to check for
+    ///
+    /// # Returns
+    ///
+    /// true if any capability in the table grants the required rights
+    pub fn has_rights(&self, required: CapRights) -> bool {
+        interrupts::without_interrupts(|| {
+            let inner = self.inner.lock();
+            inner
+                .slots
+                .iter()
+                .flatten()
+                .any(|slot| slot.entry.allows(required))
+        })
+    }
+
     /// Get the number of active capabilities.
     pub fn len(&self) -> usize {
         interrupts::without_interrupts(|| {
@@ -309,7 +336,8 @@ impl CapTable {
                     if !slot.entry.inherits_on_exec() {
                         // Revoke this capability - slot will get new generation on reuse
                         if let Some(old_slot) = inner.slots[idx].take() {
-                            inner.free.push(idx as u32);
+                            // R29-4 FIX: Changed from u32 to u16
+                            inner.free.push(idx as u16);
                             drop(old_slot);
                         }
                     }
@@ -328,9 +356,12 @@ impl Default for CapTable {
 impl CapTableInner {
     /// Initialize the table state with preallocated slots.
     fn with_capacity(capacity: usize) -> Self {
+        // R30-1 FIX: Avoid u16 truncation - capacity limited to MAX_CAP_SLOTS (65535)
+        // which is the maximum valid u16 index range (0..65535)
         let capacity = capacity.min(MAX_CAP_SLOTS);
         let slots = alloc::vec![None; capacity];
-        let free: Vec<u32> = (0..capacity as u32).collect();
+        // R29-4/R30-1 FIX: Build free list safely without u16 overflow
+        let free: Vec<u16> = (0..capacity).map(|i| i as u16).collect();
 
         Self {
             slots,
@@ -342,24 +373,29 @@ impl CapTableInner {
     /// Allocate a new capability.
     fn allocate(&mut self, entry: CapEntry) -> Result<CapId, CapError> {
         // Try to get a slot from the free list
-        let index = if let Some(idx) = self.free.pop() {
+        // R29-4 FIX: index is now u16
+        let index: u16 = if let Some(idx) = self.free.pop() {
             idx
         } else {
             // Try to grow the table
             if self.slots.len() >= MAX_CAP_SLOTS {
                 return Err(CapError::TableFull);
             }
-            let new_idx = self.slots.len() as u32;
+            let new_idx = self.slots.len() as u16;
             self.slots.push(None);
             new_idx
         };
 
+        // R29-4 FIX: Extended generation to 48 bits (~281 trillion allocations)
         // R25-2 FIX: Fail on generation exhaustion instead of wrapping
-        // This prevents use-after-free regression after ~4 billion allocations
         let generation = self.next_generation;
-        self.next_generation = self.next_generation.checked_add(1)
-            .ok_or(CapError::GenerationExhausted)?;
-        // Skip 0 if we somehow reach it (defensive, should not happen with checked_add)
+        // Check against 48-bit limit (0x0000_FFFF_FFFF_FFFF)
+        const MAX_GENERATION: u64 = 0x0000_FFFF_FFFF_FFFF;
+        if self.next_generation >= MAX_GENERATION {
+            return Err(CapError::GenerationExhausted);
+        }
+        self.next_generation = self.next_generation.wrapping_add(1);
+        // Skip 0 if we somehow reach it (defensive)
         if self.next_generation == 0 {
             self.next_generation = 1;
         }
@@ -376,6 +412,7 @@ impl CapTableInner {
             return Err(CapError::InvalidCapId);
         }
 
+        // R29-4 FIX: index() now returns u16
         let index = cap_id.index() as usize;
         if index >= self.slots.len() {
             return Err(CapError::InvalidCapId);
@@ -393,6 +430,7 @@ impl CapTableInner {
             return Err(CapError::InvalidCapId);
         }
 
+        // R29-4 FIX: index() now returns u16
         let index = cap_id.index() as usize;
         if index >= self.slots.len() {
             return Err(CapError::InvalidCapId);
@@ -401,7 +439,7 @@ impl CapTableInner {
         match &self.slots[index] {
             Some(slot) if slot.generation == cap_id.generation() => {
                 let old_slot = self.slots[index].take().unwrap();
-                self.free.push(index as u32);
+                self.free.push(index as u16);
                 Ok(old_slot.entry)
             }
             _ => Err(CapError::InvalidCapId),
@@ -444,7 +482,8 @@ impl CapTableInner {
         self.free.clear();
         for (idx, slot) in self.slots.iter().enumerate() {
             if slot.is_none() {
-                self.free.push(idx as u32);
+                // R29-4 FIX: Changed from u32 to u16
+                self.free.push(idx as u16);
             }
         }
     }

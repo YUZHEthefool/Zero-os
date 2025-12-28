@@ -80,19 +80,23 @@ impl NamespaceId {
 // Capability Identifier
 // ============================================================================
 
-/// Capability identifier: high 32 bits = generation, low 32 bits = slot index.
+/// Capability identifier: high 48 bits = generation, low 16 bits = slot index.
 ///
-/// # Encoding
+/// # Encoding (R29-4 FIX: Extended from 32-bit to 48-bit generation)
 ///
 /// ```text
-/// 63              32 31              0
-/// +----------------+------------------+
-/// |   Generation   |      Index       |
-/// +----------------+------------------+
+/// 63              16 15              0
+/// +------------------+----------------+
+/// |    Generation    |     Index      |
+/// |     (48 bits)    |   (16 bits)    |
+/// +------------------+----------------+
 /// ```
 ///
-/// - **Index**: Slot in per-process CapTable (max 65536 practical)
+/// - **Index**: Slot in per-process CapTable (max 65536 = MAX_CAP_SLOTS)
 /// - **Generation**: Incremented on revocation, prevents use-after-free
+///
+/// With 48-bit generation (~281 trillion allocations before exhaustion),
+/// this provides sufficient headroom for long-running systems.
 ///
 /// # Invalid CapId
 ///
@@ -106,26 +110,39 @@ impl CapId {
     /// Sentinel invalid capability (generation=0 is never used for valid caps).
     pub const INVALID: CapId = CapId(0);
 
-    /// Construct from (index, generation) parts.
+    /// R29-4 FIX: Construct from (index, generation) parts with extended generation.
+    ///
+    /// # Arguments
+    /// * `index` - Slot index (16 bits, max 65535)
+    /// * `generation` - Generation counter (48 bits, will be masked)
     ///
     /// # Safety Note
     ///
     /// Caller must ensure generation >= 1 for valid capabilities.
     #[inline]
-    pub const fn from_parts(index: u32, generation: u32) -> Self {
-        Self(((generation as u64) << 32) | (index as u64))
+    pub const fn from_parts(index: u16, generation: u64) -> Self {
+        // Mask generation to 48 bits and combine with 16-bit index
+        let gen_masked = generation & 0x0000_FFFF_FFFF_FFFF;
+        Self((gen_masked << 16) | (index as u64))
     }
 
-    /// Extract slot index (low 32 bits).
+    /// R29-4 FIX: Legacy constructor for 32-bit generation (backward compatibility).
+    /// Deprecated: Use from_parts with u64 generation instead.
     #[inline]
-    pub const fn index(self) -> u32 {
-        self.0 as u32
+    pub const fn from_parts_u32(index: u32, generation: u32) -> Self {
+        Self::from_parts(index as u16, generation as u64)
     }
 
-    /// Extract generation counter (high 32 bits).
+    /// Extract slot index (low 16 bits).
     #[inline]
-    pub const fn generation(self) -> u32 {
-        (self.0 >> 32) as u32
+    pub const fn index(self) -> u16 {
+        (self.0 & 0xFFFF) as u16
+    }
+
+    /// R29-4 FIX: Extract generation counter (high 48 bits).
+    #[inline]
+    pub const fn generation(self) -> u64 {
+        self.0 >> 16
     }
 
     /// Get raw u64 backing value.

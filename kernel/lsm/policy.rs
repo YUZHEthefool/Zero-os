@@ -168,6 +168,71 @@ pub trait LsmPolicy: Send + Sync {
         Ok(())
     }
 
+    // ========================================================================
+    // Memory Hooks (R29-3 FIX)
+    // ========================================================================
+
+    /// R29-3 FIX: Called for anonymous mmap operations.
+    ///
+    /// This hook is invoked for memory mappings that are not backed by a file.
+    /// Policies can use this to enforce memory protection rules (e.g., W^X).
+    ///
+    /// # Arguments
+    /// * `task` - Process context
+    /// * `addr` - Requested address (0 for kernel-chosen)
+    /// * `len` - Length of the mapping
+    /// * `prot` - Protection flags (PROT_READ, PROT_WRITE, PROT_EXEC)
+    /// * `flags` - Mapping flags (MAP_PRIVATE, MAP_SHARED, etc.)
+    fn memory_mmap(
+        &self,
+        task: &ProcessCtx,
+        addr: u64,
+        len: u64,
+        prot: u32,
+        flags: u32,
+    ) -> LsmResult {
+        Ok(())
+    }
+
+    /// R29-3 FIX: Called for mprotect operations.
+    ///
+    /// This hook is invoked when a process changes memory protection.
+    /// Policies can use this to enforce W^X or other memory protection rules.
+    ///
+    /// # Arguments
+    /// * `task` - Process context
+    /// * `addr` - Start address of the region
+    /// * `len` - Length of the region
+    /// * `prot` - New protection flags
+    fn memory_mprotect(&self, task: &ProcessCtx, addr: u64, len: u64, prot: u32) -> LsmResult {
+        Ok(())
+    }
+
+    /// R29-3 FIX: Called for brk (heap) operations.
+    ///
+    /// This hook is invoked when a process extends or shrinks its heap.
+    /// Policies can use this to monitor heap growth.
+    ///
+    /// # Arguments
+    /// * `task` - Process context
+    /// * `new_brk` - Requested new break address
+    fn memory_brk(&self, task: &ProcessCtx, new_brk: u64) -> LsmResult {
+        Ok(())
+    }
+
+    /// R30-3 FIX: Called for munmap operations.
+    ///
+    /// This hook is invoked when a process unmaps a memory region.
+    /// Policies can use this to audit or control memory unmapping.
+    ///
+    /// # Arguments
+    /// * `task` - Process context
+    /// * `addr` - Start address of the unmapped region
+    /// * `len` - Length of the region
+    fn memory_munmap(&self, task: &ProcessCtx, addr: u64, len: u64) -> LsmResult {
+        Ok(())
+    }
+
     /// Called when file permissions are changed.
     fn file_chmod(&self, task: &ProcessCtx, inode: u64, mode: u32) -> LsmResult {
         Ok(())
@@ -422,6 +487,30 @@ impl LsmPolicy for DenyAllPolicy {
     }
 
     fn file_mmap(&self, _task: &ProcessCtx, _inode: u64, _prot: u32, _flags: u32) -> LsmResult {
+        Err(LsmError::Denied)
+    }
+
+    // R29-3 FIX: Memory hooks for DenyAllPolicy
+    fn memory_mmap(
+        &self,
+        _task: &ProcessCtx,
+        _addr: u64,
+        _len: u64,
+        _prot: u32,
+        _flags: u32,
+    ) -> LsmResult {
+        Err(LsmError::Denied)
+    }
+
+    fn memory_mprotect(&self, _task: &ProcessCtx, _addr: u64, _len: u64, _prot: u32) -> LsmResult {
+        Err(LsmError::Denied)
+    }
+
+    fn memory_brk(&self, _task: &ProcessCtx, _new_brk: u64) -> LsmResult {
+        Err(LsmError::Denied)
+    }
+
+    fn memory_munmap(&self, _task: &ProcessCtx, _addr: u64, _len: u64) -> LsmResult {
         Err(LsmError::Denied)
     }
 
