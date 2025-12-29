@@ -17,6 +17,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use block::BlockDevice;
 use kernel_core::{
     current_egid, current_euid, current_supplementary_groups, current_umask, FileDescriptor,
     FileOps, SyscallError, VfsStat,
@@ -169,6 +170,8 @@ pub struct Vfs {
     mounts: RwLock<BTreeMap<String, Mount>>,
     /// Root filesystem
     root_fs: RwLock<Option<Arc<dyn FileSystem>>>,
+    /// Device filesystem handle for block device registration
+    devfs: RwLock<Option<Arc<DevFs>>>,
 }
 
 impl Vfs {
@@ -177,6 +180,7 @@ impl Vfs {
         Self {
             mounts: RwLock::new(BTreeMap::new()),
             root_fs: RwLock::new(None),
+            devfs: RwLock::new(None),
         }
     }
 
@@ -193,7 +197,9 @@ impl Vfs {
 
         // Create and mount devfs at /dev
         let devfs = DevFs::new();
-        self.mount("/dev", devfs).expect("Failed to mount devfs");
+        self.mount("/dev", devfs.clone())
+            .expect("Failed to mount devfs");
+        *self.devfs.write() = Some(devfs);
 
         println!("VFS initialized: ramfs at /, devfs at /dev");
     }
@@ -651,6 +657,33 @@ impl Vfs {
             }
         }
     }
+
+    /// Register a block device under /dev
+    ///
+    /// Creates a device node at /dev/{name} for the given block device.
+    /// This enables filesystem mounting and raw device access.
+    ///
+    /// # Arguments
+    /// * `name` - Device name (e.g., "vda", "sda")
+    /// * `device` - Block device implementation
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(FsError::NotFound)` if VFS/devfs not initialized
+    /// * `Err(FsError::Exists)` if device name already exists
+    pub fn register_block_device(
+        &self,
+        name: &str,
+        device: Arc<dyn BlockDevice>,
+    ) -> Result<(), FsError> {
+        // Clone Arc and release lock before calling into DevFs to avoid
+        // holding our lock while DevFs acquires its internal lock
+        let devfs = {
+            let guard = self.devfs.read();
+            guard.as_ref().cloned().ok_or(FsError::NotFound)?
+        };
+        devfs.register_block_device(name, device)
+    }
 }
 
 /// Global VFS instance
@@ -748,6 +781,24 @@ pub fn mount(path: &str, fs: Arc<dyn FileSystem>) -> Result<(), FsError> {
 /// Unmount a filesystem
 pub fn umount(path: &str) -> Result<(), FsError> {
     VFS.umount(path)
+}
+
+/// Register a block device in devfs
+///
+/// Creates a device node at /dev/{name} for the given block device.
+/// This is the main entry point for drivers to register block devices.
+///
+/// # Arguments
+/// * `name` - Device name (e.g., "vda" for first virtio-blk device)
+/// * `device` - Block device implementation
+///
+/// # Example
+/// ```ignore
+/// let virtio_dev = VirtioBlkDevice::probe(mmio_addr, virt_offset, "vda")?;
+/// vfs::register_block_device("vda", Arc::new(virtio_dev))?;
+/// ```
+pub fn register_block_device(name: &str, device: Arc<dyn BlockDevice>) -> Result<(), FsError> {
+    VFS.register_block_device(name, device)
 }
 
 // ============================================================================

@@ -41,7 +41,9 @@ extern crate alloc;
 
 #[macro_use]
 extern crate drivers;
+extern crate mm;
 
+pub mod pci;
 pub mod virtio;
 
 use alloc::boxed::Box;
@@ -813,6 +815,203 @@ pub fn init() {
     println!("  Block layer initialized");
     println!("    Max BIO size: {} KB", MAX_BIO_BYTES / 1024);
     println!("    Default sector size: {} bytes", DEFAULT_SECTOR_SIZE);
+}
+
+// ============================================================================
+// High Address MMIO Mapping
+// ============================================================================
+
+use core::sync::atomic::AtomicU64 as MmioAtomicU64;
+
+/// Base virtual address for mapping MMIO regions above 4GB.
+/// This is in the kernel's higher-half address space, separate from the kernel image.
+const HIGH_MMIO_VIRT_BASE: u64 = 0xffff_ffff_4000_0000;
+
+/// Maximum size of the high MMIO virtual address region (256 MB).
+const HIGH_MMIO_VIRT_SIZE: u64 = 256 * 1024 * 1024;
+
+/// Current offset within the high MMIO virtual address region.
+static HIGH_MMIO_OFFSET: MmioAtomicU64 = MmioAtomicU64::new(0);
+
+/// Physical address threshold - addresses at or above this need mapping.
+const PHYS_4GB: u64 = 0x1_0000_0000;
+
+/// Map a physical MMIO region and return the virtual offset to use.
+///
+/// For physical addresses below 4GB, the bootloader's identity mapping is used
+/// (virt_offset = 0, meaning virt == phys).
+///
+/// For physical addresses at or above 4GB, this function allocates a virtual
+/// address in the HIGH_MMIO_VIRT region and creates the mapping.
+///
+/// # Arguments
+/// * `phys_base` - Physical base address of the MMIO region
+/// * `size` - Size of the MMIO region in bytes
+///
+/// # Returns
+/// * `Ok(virt_offset)` - Offset to add to physical address to get virtual address
+/// * `Err(BlockError)` - Mapping failed
+///
+/// # Safety
+/// The caller must ensure the physical address is a valid MMIO region.
+unsafe fn map_high_mmio(phys_base: u64, size: usize) -> Result<i64, BlockError> {
+    // If below 4GB, use identity mapping
+    if phys_base < PHYS_4GB && phys_base.saturating_add(size as u64) <= PHYS_4GB {
+        return Ok(0);
+    }
+
+    // Allocate virtual address space (page-aligned)
+    let aligned_size = (size + 0xFFF) & !0xFFF;
+    let offset = HIGH_MMIO_OFFSET.fetch_add(aligned_size as u64, Ordering::SeqCst);
+
+    if offset + aligned_size as u64 > HIGH_MMIO_VIRT_SIZE {
+        println!("      [ERROR] High MMIO virtual space exhausted");
+        return Err(BlockError::NoMem);
+    }
+
+    let virt_addr = HIGH_MMIO_VIRT_BASE + offset;
+    let virt_offset = virt_addr as i64 - phys_base as i64;
+
+    println!(
+        "      [MMIO] Mapping phys {:#x} -> virt {:#x} (size {:#x})",
+        phys_base, virt_addr, aligned_size
+    );
+
+    // Create the mapping using the mm crate's map_mmio function
+    use x86_64::{PhysAddr, VirtAddr};
+    let mut frame_alloc = mm::FrameAllocator::new();
+
+    match mm::map_mmio(
+        VirtAddr::new(virt_addr),
+        PhysAddr::new(phys_base),
+        aligned_size,
+        &mut frame_alloc,
+    ) {
+        Ok(()) => {
+            println!("      [MMIO] Mapping successful");
+            Ok(virt_offset)
+        }
+        Err(e) => {
+            println!("      [ERROR] MMIO mapping failed: {:?}", e);
+            Err(BlockError::NoMem)
+        }
+    }
+}
+
+/// Probe for block devices and register them with VFS.
+///
+/// This function:
+/// 1. Tries known virtio-mmio addresses (for embedded/VM configurations)
+/// 2. Scans PCI bus 0 for virtio-blk devices (modern transport)
+/// 3. Initializes found devices
+/// 4. Returns the device for caller to register with VFS
+///
+/// # Returns
+/// Option containing (device Arc, device name) if found
+pub fn probe_devices() -> Option<(Arc<dyn BlockDevice>, &'static str)> {
+    // Known virtio-mmio addresses to try (used by some VMs)
+    // These use identity mapping (virt == phys for first 4GB)
+    const VIRTIO_MMIO_BASES: [u64; 2] = [
+        0x10001000, // Common virtio-mmio base
+        0x10002000, // Secondary virtio-mmio base
+    ];
+    let mmio_virt_offset = 0u64; // Identity mapped for low addresses
+
+    // First, try MMIO transport at known addresses
+    for (idx, &base) in VIRTIO_MMIO_BASES.iter().enumerate() {
+        let name = match idx {
+            0 => "vda",
+            1 => "vdb",
+            _ => "vdx",
+        };
+        match unsafe { virtio::VirtioBlkDevice::probe_mmio(base, mmio_virt_offset, name) } {
+            Ok(device) => {
+                let capacity = device.capacity_sectors();
+                let sector_size = device.sector_size();
+                let size_mb = (capacity * sector_size as u64) / (1024 * 1024);
+                println!(
+                    "    virtio-blk (mmio) /dev/{}: {} MB ({} sectors x {} bytes)",
+                    name, size_mb, capacity, sector_size
+                );
+                return Some((device, name));
+            }
+            Err(BlockError::NotFound) => {
+                // No device at this address, continue silently
+            }
+            Err(e) => {
+                println!("    MMIO virtio-blk at {:#x} failed: {:?}", base, e);
+            }
+        }
+    }
+
+    // Then, try PCI transport (virtio-pci modern)
+    if let Some((pci_addrs, name)) = pci::probe_virtio_blk() {
+        // Calculate the range of physical addresses that need to be mapped
+        let phys_addrs = [
+            pci_addrs.common_cfg,
+            pci_addrs.notify_base,
+            pci_addrs.isr,
+            pci_addrs.device_cfg,
+        ];
+
+        // Find the minimum non-zero physical address
+        let min_phys = phys_addrs
+            .iter()
+            .filter(|&&a| a != 0)
+            .copied()
+            .min()
+            .unwrap_or(0);
+
+        // Find the maximum address (assume each region is at most 4KB)
+        let max_phys = phys_addrs
+            .iter()
+            .filter(|&&a| a != 0)
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 0x1000; // Add 4KB for the last region
+
+        let mmio_size = (max_phys - min_phys) as usize;
+
+        // Map high MMIO if needed
+        let virt_offset = match unsafe { map_high_mmio(min_phys, mmio_size) } {
+            Ok(offset) => {
+                // Convert i64 offset to u64 using wrapping arithmetic
+                // This works because Rust's as conversion uses wrapping
+                offset as u64
+            }
+            Err(e) => {
+                println!(
+                    "    Failed to map virtio-blk MMIO region {:#x}-{:#x}: {:?}",
+                    min_phys, max_phys, e
+                );
+                return None;
+            }
+        };
+
+        match unsafe { virtio::VirtioBlkDevice::probe_pci(pci_addrs, virt_offset, name) } {
+            Ok(device) => {
+                let capacity = device.capacity_sectors();
+                let sector_size = device.sector_size();
+                let size_mb = (capacity * sector_size as u64) / (1024 * 1024);
+                println!(
+                    "    virtio-blk (pci) /dev/{}: {} MB ({} sectors x {} bytes)",
+                    name, size_mb, capacity, sector_size
+                );
+                return Some((device, name));
+            }
+            Err(e) => {
+                println!(
+                    "    Failed to probe virtio-blk (pci caps @ {:#x}): {:?}",
+                    pci_addrs.common_cfg, e
+                );
+            }
+        }
+    } else {
+        println!("    No virtio-blk devices found on PCI buses");
+    }
+
+    None
 }
 
 // ============================================================================

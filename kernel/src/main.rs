@@ -10,6 +10,7 @@ use mm::memory::BootInfo;
 #[macro_use]
 extern crate drivers;
 extern crate arch;
+extern crate block;
 extern crate ipc;
 extern crate kernel_core;
 extern crate mm;
@@ -301,6 +302,17 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     vfs::init(); // 初始化虚拟文件系统
     println!("      ✓ devfs mounted at /dev");
     println!("      ✓ Device files: null, zero, console");
+
+    // Phase C: Block Layer and Storage Foundation
+    println!("[7.55/8] Initializing Block Layer...");
+    block::init();
+    // Probe for virtio-blk devices and register with VFS
+    if let Some((device, name)) = block::probe_devices() {
+        match vfs::register_block_device(name, device) {
+            Ok(()) => println!("      ✓ Registered /dev/{} in devfs", name),
+            Err(e) => println!("      ! Failed to register /dev/{}: {:?}", name, e),
+        }
+    }
 
     println!("[7.6/8] Initializing audit subsystem...");
     match audit::init(64) { // Reduced from 256 to save heap memory

@@ -117,6 +117,10 @@ impl ProcRootInode {
                 // Try to parse as PID
                 if let Ok(pid) = name.parse::<u32>() {
                     if process_exists(pid) {
+                        // R31-1 FIX: Check access permission before returning PID directory
+                        if !can_access_pid(pid) {
+                            return Err(FsError::PermDenied);
+                        }
                         return Ok(Arc::new(ProcPidDirInode {
                             fs_id: self.fs_id,
                             pid,
@@ -185,8 +189,8 @@ impl Inode for ProcRootInode {
             )));
         }
 
-        // List PIDs
-        let pids = list_pids();
+        // R31-1 FIX: List PIDs filtered by access control (self/root/same owner/gid)
+        let pids: Vec<u32> = list_pids().into_iter().filter(|&pid| can_access_pid(pid)).collect();
         let pid_offset = offset - static_entries.len();
 
         if pid_offset < pids.len() {
@@ -296,6 +300,10 @@ struct ProcPidDirInode {
 
 impl ProcPidDirInode {
     fn lookup_child(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+        // R31-1 FIX: Check access permission before returning child entries
+        if !can_access_pid(self.pid) {
+            return Err(FsError::PermDenied);
+        }
         match name {
             "status" => Ok(Arc::new(ProcPidStatusInode {
                 fs_id: self.fs_id,
@@ -359,6 +367,10 @@ impl Inode for ProcPidDirInode {
     }
 
     fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
+        // R31-1 FIX: Check access permission before listing entries
+        if !can_access_pid(self.pid) {
+            return Err(FsError::PermDenied);
+        }
         let entries = ["status", "cmdline", "stat", "maps", "fd"];
 
         if offset < entries.len() {
@@ -613,6 +625,10 @@ struct ProcPidFdDirInode {
 
 impl ProcPidFdDirInode {
     fn lookup_child(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
+        // R31-1 FIX: Check access permission before returning fd entries
+        if !can_access_pid(self.pid) {
+            return Err(FsError::PermDenied);
+        }
         let fd: u32 = name.parse().map_err(|_| FsError::NotFound)?;
         let fds = list_process_fds(self.pid);
         if !fds.iter().any(|&n| n == fd) {
@@ -663,6 +679,10 @@ impl Inode for ProcPidFdDirInode {
     }
 
     fn readdir(&self, offset: usize) -> Result<Option<(usize, DirEntry)>, FsError> {
+        // R31-1 FIX: Defense-in-depth access check for fd listing
+        if !can_access_pid(self.pid) {
+            return Err(FsError::PermDenied);
+        }
         let fds = list_process_fds(self.pid);
         if offset < fds.len() {
             let fd = fds[offset];
@@ -990,6 +1010,50 @@ fn read_from_content(content: &str, offset: u64, buf: &mut [u8]) -> Result<usize
 /// R29-1 FIX: Now returns the actual current PID from the scheduler
 fn get_current_pid() -> u32 {
     process::current_pid().unwrap_or(0) as u32
+}
+
+/// Get current process credentials (uid, gid)
+///
+/// R31-1 FIX: Returns (0, 0) if no current process (kernel context)
+fn get_current_creds() -> (u32, u32) {
+    let pid = process::current_pid().unwrap_or(0);
+    if pid == 0 {
+        return (0, 0);
+    }
+    let table = PROCESS_TABLE.lock();
+    match table.get(pid) {
+        Some(Some(proc)) => {
+            let p = proc.lock();
+            (p.uid, p.gid)
+        }
+        _ => (0, 0),
+    }
+}
+
+/// R31-1 FIX: Access control for /proc/[pid] entries.
+///
+/// Allow access if any of the following conditions are met:
+/// - Accessing own process (self)
+/// - Caller is root (uid 0)
+/// - Caller has same owner UID or GID as target process
+fn can_access_pid(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // Self access is always allowed
+    if let Some(cur_pid) = process::current_pid() {
+        if cur_pid as u32 == pid {
+            return true;
+        }
+    }
+    // Root can access all processes
+    let (cur_uid, cur_gid) = get_current_creds();
+    if cur_uid == 0 {
+        return true;
+    }
+    // Same owner/group can access
+    let (owner_uid, owner_gid) = get_process_owner(pid);
+    cur_uid == owner_uid || cur_gid == owner_gid
 }
 
 /// Check if a process exists

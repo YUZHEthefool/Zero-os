@@ -16,7 +16,7 @@ pub mod tlb_shootdown;
 pub use memory::{BootInfo, FrameAllocator, MemoryMapInfo};
 pub use page_table::{
     phys_to_virt, with_current_manager, MapError, PageTableManager, UnmapError, UpdateFlagsError,
-    PHYSICAL_MEMORY_OFFSET,
+    PHYSICAL_MEMORY_OFFSET, map_mmio,
 };
 pub use tlb_shootdown::{
     flush_current_as_all, flush_current_as_page, flush_current_as_range, get_stats as get_tlb_stats,

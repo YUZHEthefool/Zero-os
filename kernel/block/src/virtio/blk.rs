@@ -1,10 +1,11 @@
 //! VirtIO Block Device Driver for Zero-OS
 //!
-//! This module implements a virtio-blk driver using MMIO transport.
+//! This module implements a virtio-blk driver supporting both MMIO and PCI transports.
 //! It provides a simple synchronous interface for block I/O.
 //!
 //! # Features
-//! - MMIO transport (no PCI dependency)
+//! - MMIO transport for embedded/virtio-mmio setups
+//! - PCI modern transport for standard x86 VMs
 //! - Synchronous read/write operations
 //! - Proper feature negotiation
 //! - Integration with Block Layer
@@ -17,10 +18,11 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU16, Ordering};
 use spin::Mutex;
 
+use super::transport::{MmioTransport, VirtioPciAddrs, VirtioPciTransport, VirtioTransport};
 use super::{
-    blk_features, blk_status, blk_types, mmio, mb, rmb, wmb, VirtioBlkConfig, VirtioBlkReqHeader,
+    blk_features, blk_status, blk_types, mb, rmb, wmb, VirtioBlkConfig, VirtioBlkReqHeader,
     VringAvail, VringDesc, VringUsed, VringUsedElem, VIRTIO_DEVICE_BLK, VIRTIO_F_VERSION_1,
-    VIRTIO_MAGIC, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
+    VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
     VIRTIO_STATUS_FEATURES_OK, VIRTIO_VERSION_LEGACY, VIRTIO_VERSION_MODERN, VRING_DESC_F_NEXT,
     VRING_DESC_F_WRITE,
 };
@@ -93,6 +95,8 @@ fn virt_to_phys_dma(ptr: *const u8, len: usize) -> Result<u64, BlockError> {
 pub struct VirtQueue {
     /// Queue size (number of descriptors).
     size: u16,
+    /// Queue notify offset (for PCI transport).
+    notify_off: u16,
     /// Descriptor table (DMA-able memory).
     desc: *mut VringDesc,
     /// Available ring.
@@ -137,7 +141,8 @@ impl VirtQueue {
     ///
     /// # Safety
     /// The caller must ensure the memory region is valid and DMA-able.
-    unsafe fn new(base_phys: u64, queue_size: u16, virt_offset: u64) -> Self {
+    /// DMA memory is accessed via the kernel's high-half mapping (PHYSICAL_MEMORY_OFFSET).
+    unsafe fn new(base_phys: u64, queue_size: u16, _virt_offset: u64, notify_off: u16) -> Self {
         let desc_size = core::mem::size_of::<VringDesc>() * queue_size as usize;
         let avail_size = 4 + 2 * queue_size as usize;
 
@@ -149,10 +154,11 @@ impl VirtQueue {
         let avail_phys = desc_phys + (desc_pages * 4096) as u64;
         let used_phys = avail_phys + (avail_pages * 4096) as u64;
 
-        // Convert to virtual addresses
-        let desc = (desc_phys + virt_offset) as *mut VringDesc;
-        let avail = (avail_phys + virt_offset) as *mut VringAvail;
-        let used = (used_phys + virt_offset) as *mut VringUsed;
+        // Convert to virtual addresses using kernel's high-half mapping
+        // DMA memory from buddy allocator uses PHYSICAL_MEMORY_OFFSET, not the MMIO virt_offset
+        let desc = (desc_phys + mm::PHYSICAL_MEMORY_OFFSET) as *mut VringDesc;
+        let avail = (avail_phys + mm::PHYSICAL_MEMORY_OFFSET) as *mut VringAvail;
+        let used = (used_phys + mm::PHYSICAL_MEMORY_OFFSET) as *mut VringUsed;
 
         // Initialize free list
         let mut free_list = Vec::with_capacity(queue_size as usize);
@@ -167,6 +173,7 @@ impl VirtQueue {
 
         Self {
             size: queue_size,
+            notify_off,
             desc,
             avail,
             used,
@@ -258,8 +265,8 @@ impl VirtQueue {
 pub struct VirtioBlkDevice {
     /// Device name.
     name: String,
-    /// MMIO base address (virtual).
-    mmio_base: *mut u8,
+    /// Transport layer (MMIO or PCI).
+    transport: VirtioTransport,
     /// Virtqueue for requests.
     queue: VirtQueue,
     /// Device capacity in sectors.
@@ -292,7 +299,7 @@ unsafe impl Send for VirtioBlkDevice {}
 unsafe impl Sync for VirtioBlkDevice {}
 
 impl VirtioBlkDevice {
-    /// Probe for a virtio-blk device at the given MMIO address.
+    /// Probe for a virtio-blk device using MMIO transport.
     ///
     /// # Arguments
     /// * `mmio_phys` - Physical address of the MMIO region
@@ -301,74 +308,82 @@ impl VirtioBlkDevice {
     ///
     /// # Safety
     /// Caller must ensure the MMIO address is valid and mapped.
-    pub unsafe fn probe(
+    pub unsafe fn probe_mmio(
         mmio_phys: u64,
         virt_offset: u64,
         name: &str,
     ) -> Result<Arc<Self>, BlockError> {
-        let mmio_base = (mmio_phys + virt_offset) as *mut u8;
+        let transport = MmioTransport::probe(mmio_phys, virt_offset)
+            .ok_or(BlockError::NotFound)?;
+        Self::probe_with_transport(VirtioTransport::Mmio(transport), virt_offset, name)
+    }
 
-        // Check magic value
-        let magic = Self::read_reg(mmio_base, mmio::MAGIC_VALUE);
-        if magic != VIRTIO_MAGIC {
-            return Err(BlockError::NotFound);
-        }
+    /// Probe for a virtio-blk device using virtio-pci modern transport.
+    ///
+    /// # Arguments
+    /// * `pci_addrs` - Parsed PCI capability addresses
+    /// * `virt_offset` - Offset to add for virtual address conversion
+    /// * `name` - Device name (e.g., "vda")
+    ///
+    /// # Safety
+    /// Caller must ensure the MMIO windows are mapped (identity mapped low memory).
+    pub unsafe fn probe_pci(
+        pci_addrs: VirtioPciAddrs,
+        virt_offset: u64,
+        name: &str,
+    ) -> Result<Arc<Self>, BlockError> {
+        let transport = VirtioPciTransport::from_addrs(pci_addrs, virt_offset)
+            .ok_or(BlockError::NotSupported)?;
+        Self::probe_with_transport(VirtioTransport::Pci(transport), virt_offset, name)
+    }
 
-        // Check version
-        let version = Self::read_reg(mmio_base, mmio::VERSION);
-        if version != VIRTIO_VERSION_LEGACY && version != VIRTIO_VERSION_MODERN {
-            return Err(BlockError::NotSupported);
-        }
-
+    /// Common probe logic for any transport.
+    unsafe fn probe_with_transport(
+        transport: VirtioTransport,
+        virt_offset: u64,
+        name: &str,
+    ) -> Result<Arc<Self>, BlockError> {
         // Check device type
-        let device_id = Self::read_reg(mmio_base, mmio::DEVICE_ID);
+        let device_id = transport.device_id();
         if device_id != VIRTIO_DEVICE_BLK {
             return Err(BlockError::NotFound);
         }
 
-        // Initialize device
-        Self::init_device(mmio_base, mmio_phys, virt_offset, name)
-    }
+        // Check version
+        let version = transport.version();
+        if version != VIRTIO_VERSION_LEGACY && version != VIRTIO_VERSION_MODERN {
+            return Err(BlockError::NotSupported);
+        }
 
-    /// Read a 32-bit register.
-    #[inline]
-    unsafe fn read_reg(base: *mut u8, offset: usize) -> u32 {
-        read_volatile(base.add(offset) as *const u32)
-    }
-
-    /// Write a 32-bit register.
-    #[inline]
-    unsafe fn write_reg(base: *mut u8, offset: usize, value: u32) {
-        write_volatile(base.add(offset) as *mut u32, value);
+        Self::init_device(transport, virt_offset, name)
     }
 
     /// Initialize the device.
     unsafe fn init_device(
-        mmio_base: *mut u8,
-        mmio_phys: u64,
+        transport: VirtioTransport,
         virt_offset: u64,
         name: &str,
     ) -> Result<Arc<Self>, BlockError> {
         // Reset device
-        Self::write_reg(mmio_base, mmio::STATUS, 0);
+        transport.reset();
         mb();
 
         // Acknowledge device
-        Self::write_reg(mmio_base, mmio::STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
+        transport.set_status(VIRTIO_STATUS_ACKNOWLEDGE);
 
         // Set DRIVER status
-        let status = Self::read_reg(mmio_base, mmio::STATUS);
-        Self::write_reg(mmio_base, mmio::STATUS, status | VIRTIO_STATUS_DRIVER);
+        let status = transport.status();
+        transport.set_status(status | VIRTIO_STATUS_DRIVER);
 
         // Read device features
-        Self::write_reg(mmio_base, mmio::DEVICE_FEATURES_SEL, 0);
-        let features_low = Self::read_reg(mmio_base, mmio::DEVICE_FEATURES);
-        Self::write_reg(mmio_base, mmio::DEVICE_FEATURES_SEL, 1);
-        let features_high = Self::read_reg(mmio_base, mmio::DEVICE_FEATURES);
-        let device_features = (features_high as u64) << 32 | features_low as u64;
+        let device_features = transport.device_features();
 
         // Select features we want
         let mut driver_features = 0u64;
+        // Modern virtio devices (1.0+) require VIRTIO_F_VERSION_1 to be acknowledged
+        if device_features & VIRTIO_F_VERSION_1 != 0 {
+            driver_features |= VIRTIO_F_VERSION_1;
+        }
         if device_features & blk_features::VIRTIO_BLK_F_RO != 0 {
             driver_features |= blk_features::VIRTIO_BLK_F_RO;
         }
@@ -380,23 +395,20 @@ impl VirtioBlkDevice {
         }
 
         // Write driver features
-        Self::write_reg(mmio_base, mmio::DRIVER_FEATURES_SEL, 0);
-        Self::write_reg(mmio_base, mmio::DRIVER_FEATURES, driver_features as u32);
-        Self::write_reg(mmio_base, mmio::DRIVER_FEATURES_SEL, 1);
-        Self::write_reg(mmio_base, mmio::DRIVER_FEATURES, (driver_features >> 32) as u32);
+        transport.write_driver_features(driver_features);
 
         // Set FEATURES_OK
-        let status = Self::read_reg(mmio_base, mmio::STATUS);
-        Self::write_reg(mmio_base, mmio::STATUS, status | VIRTIO_STATUS_FEATURES_OK);
+        let status = transport.status();
+        transport.set_status(status | VIRTIO_STATUS_FEATURES_OK);
 
         // Verify FEATURES_OK
-        let status = Self::read_reg(mmio_base, mmio::STATUS);
+        let status = transport.status();
         if status & VIRTIO_STATUS_FEATURES_OK == 0 {
             return Err(BlockError::NotSupported);
         }
 
         // Read device config
-        let config = Self::read_config(mmio_base);
+        let config = transport.read_blk_config();
         let capacity = config.capacity;
         let sector_size = if config.blk_size != 0 {
             config.blk_size
@@ -406,8 +418,7 @@ impl VirtioBlkDevice {
         let read_only = driver_features & blk_features::VIRTIO_BLK_F_RO != 0;
 
         // Setup queue 0
-        Self::write_reg(mmio_base, mmio::QUEUE_SEL, 0);
-        let queue_size_max = Self::read_reg(mmio_base, mmio::QUEUE_NUM_MAX) as u16;
+        let queue_size_max = transport.queue_max(0);
         let queue_size = queue_size_max.min(DEFAULT_QUEUE_SIZE);
 
         if queue_size == 0 {
@@ -419,22 +430,25 @@ impl VirtioBlkDevice {
         let queue_mem_size = VirtQueue::calc_size(queue_size);
         let queue_phys = Self::alloc_dma_memory(queue_mem_size)?;
 
+        // Get notify offset for PCI transport
+        let notify_off = transport.queue_notify_off(0);
+
         // Create virtqueue
-        let queue = VirtQueue::new(queue_phys, queue_size, virt_offset);
+        let queue = VirtQueue::new(queue_phys, queue_size, virt_offset, notify_off);
 
         // Configure queue
-        Self::write_reg(mmio_base, mmio::QUEUE_NUM, queue_size as u32);
-        Self::write_reg(mmio_base, mmio::QUEUE_DESC_LOW, queue.desc_phys as u32);
-        Self::write_reg(mmio_base, mmio::QUEUE_DESC_HIGH, (queue.desc_phys >> 32) as u32);
-        Self::write_reg(mmio_base, mmio::QUEUE_AVAIL_LOW, queue.avail_phys as u32);
-        Self::write_reg(mmio_base, mmio::QUEUE_AVAIL_HIGH, (queue.avail_phys >> 32) as u32);
-        Self::write_reg(mmio_base, mmio::QUEUE_USED_LOW, queue.used_phys as u32);
-        Self::write_reg(mmio_base, mmio::QUEUE_USED_HIGH, (queue.used_phys >> 32) as u32);
-        Self::write_reg(mmio_base, mmio::QUEUE_READY, 1);
+        transport.setup_queue(
+            0,
+            queue_size,
+            queue.desc_phys,
+            queue.avail_phys,
+            queue.used_phys,
+        );
+        transport.queue_ready(0, true);
 
         // Set DRIVER_OK
-        let status = Self::read_reg(mmio_base, mmio::STATUS);
-        Self::write_reg(mmio_base, mmio::STATUS, status | VIRTIO_STATUS_DRIVER_OK);
+        let status = transport.status();
+        transport.set_status(status | VIRTIO_STATUS_DRIVER_OK);
 
         // Create request buffers
         let mut req_buffers = Vec::with_capacity(MAX_PENDING);
@@ -448,7 +462,7 @@ impl VirtioBlkDevice {
 
         Ok(Arc::new(Self {
             name: String::from(name),
-            mmio_base,
+            transport,
             queue,
             capacity,
             sector_size,
@@ -459,45 +473,36 @@ impl VirtioBlkDevice {
         }))
     }
 
-    /// Read device config.
-    unsafe fn read_config(mmio_base: *mut u8) -> VirtioBlkConfig {
-        let config_base = mmio_base.add(mmio::CONFIG);
-        VirtioBlkConfig {
-            capacity: read_volatile(config_base as *const u64),
-            size_max: read_volatile(config_base.add(8) as *const u32),
-            seg_max: read_volatile(config_base.add(12) as *const u32),
-            geometry_cylinders: read_volatile(config_base.add(16) as *const u16),
-            geometry_heads: read_volatile(config_base.add(18) as *const u8),
-            geometry_sectors: read_volatile(config_base.add(19) as *const u8),
-            blk_size: read_volatile(config_base.add(20) as *const u32),
-        }
-    }
-
-    /// Allocate DMA-able memory (simplified implementation).
+    /// Allocate DMA-able memory using the kernel's buddy allocator.
+    ///
+    /// Returns the physical address of the allocated memory.
+    /// The memory is zeroed before returning.
     fn alloc_dma_memory(size: usize) -> Result<u64, BlockError> {
-        // In a real implementation, this would use the kernel's DMA allocator.
-        // For now, we use a static high-memory region.
-        // This is a placeholder that should be replaced with proper allocation.
-        static NEXT_DMA: core::sync::atomic::AtomicU64 =
-            core::sync::atomic::AtomicU64::new(0x1000_0000); // 256MB
+        use mm::buddy_allocator;
 
-        let aligned_size = (size + 4095) & !4095;
-        let addr = NEXT_DMA.fetch_add(aligned_size as u64, Ordering::SeqCst);
+        // Calculate number of 4KB pages needed
+        let pages = (size + 4095) / 4096;
 
-        // Zero the memory
+        // Allocate from buddy allocator
+        let frame = buddy_allocator::alloc_physical_pages(pages)
+            .ok_or(BlockError::NoMem)?;
+
+        let phys_addr = frame.start_address().as_u64();
+
+        // Zero the memory using high-half kernel mapping
+        // Physical memory is mapped at PHYSICAL_MEMORY_OFFSET (0xffffffff80000000)
         unsafe {
-            // Note: This requires the memory to be mapped
-            // In real code, we'd use the kernel's page allocator
-            core::ptr::write_bytes(addr as *mut u8, 0, aligned_size);
+            let virt_addr = (phys_addr + mm::PHYSICAL_MEMORY_OFFSET) as *mut u8;
+            core::ptr::write_bytes(virt_addr, 0, pages * 4096);
         }
 
-        Ok(addr)
+        Ok(phys_addr)
     }
 
     /// Notify the device of new available descriptors.
     fn notify(&self) {
         unsafe {
-            Self::write_reg(self.mmio_base, mmio::QUEUE_NOTIFY, 0);
+            self.transport.notify(0, self.queue.notify_off);
         }
     }
 

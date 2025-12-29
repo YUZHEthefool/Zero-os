@@ -7,8 +7,10 @@
 //! - VirtIO Spec: https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html
 
 pub mod blk;
+pub mod transport;
 
 pub use blk::VirtioBlkDevice;
+pub use transport::{VirtioPciAddrs, VirtioTransport};
 
 use core::sync::atomic::{fence, Ordering};
 

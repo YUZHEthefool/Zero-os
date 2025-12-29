@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui clean
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial clean
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -180,11 +180,51 @@ run-clone-test: build-clone-test
 
 # 通用QEMU参数
 # -vga std: 强制使用标准VGA模式，确保0xB8000文本缓冲区可用
+# 使用默认的i440FX机器类型，其PCI内存布局将BAR放在4GB以下
+# (q35会将某些BAR放在高于4GB的地址，超出bootloader的identity mapping范围)
 QEMU_COMMON = -bios $(OVMF_PATH) \
 	-drive format=raw,file=fat:rw:esp \
 	-m 256M \
 	-vga std \
 	-no-reboot -no-shutdown
+
+# virtio-blk 块设备配置 (Phase C: Storage Foundation)
+# 默认使用PCI transport（x86 QEMU更可靠），可切换为MMIO
+# 使用环境变量 VIRTIO_BLK_TRANSPORT=mmio 切换到MMIO transport
+VIRTIO_BLK_TRANSPORT ?= pci
+VIRTIO_MMIO_ADDR = 0x10001000
+
+# PCI transport: 标准x86 QEMU配置
+QEMU_BLK_PCI = -drive if=none,file=disk-ext2.img,format=raw,id=vdisk0,cache=writeback,discard=unmap \
+	-device virtio-blk-pci,drive=vdisk0
+
+# MMIO transport: 用于非PCI平台或特殊配置
+QEMU_BLK_MMIO = -drive if=none,file=disk-ext2.img,format=raw,id=vdisk0,cache=writeback,discard=unmap \
+	-device virtio-blk-device,drive=vdisk0
+
+ifeq ($(VIRTIO_BLK_TRANSPORT),mmio)
+QEMU_BLK = $(QEMU_BLK_MMIO)
+else
+QEMU_BLK = $(QEMU_BLK_PCI)
+endif
+
+# 创建64MB ext2虚拟磁盘镜像
+# 使用dd确保跨平台兼容性，debugfs可选创建测试文件
+disk-ext2.img:
+	@echo "=== 创建 64MB ext2 虚拟磁盘镜像 ==="
+	dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
+	mkfs.ext2 -F -L zeroos $@
+	@echo "=== 写入测试文件 ==="
+	@if command -v debugfs >/dev/null 2>&1; then \
+		tmpfile=$$(mktemp); \
+		echo "Zero-OS virtio-blk test file" > $$tmpfile; \
+		debugfs -w -R "mkdir /test" $@ 2>/dev/null || true; \
+		debugfs -w -R "write $$tmpfile /test/hello.txt" $@ 2>/dev/null || true; \
+		rm -f $$tmpfile; \
+		echo "测试文件已写入: /test/hello.txt"; \
+	else \
+		echo "警告: debugfs不可用，跳过测试文件创建"; \
+	fi
 
 # 默认运行 - 图形窗口模式（可看到VGA输出）
 run: build
@@ -197,6 +237,21 @@ run-serial: build
 	@echo "=== 启动内核（串口输出模式）==="
 	@echo "提示：按Ctrl+A然后按X退出QEMU"
 	$(QEMU) $(QEMU_COMMON) \
+		-nographic
+
+# virtio-blk 图形模式 - 附加ext2磁盘镜像
+run-blk: build disk-ext2.img
+	@echo "=== 启动内核（virtio-blk 图形模式）==="
+	@echo "磁盘: disk-ext2.img (64MB ext2)"
+	@echo "提示：使用Ctrl+Alt+G释放鼠标，Ctrl+Alt+2切换到QEMU监视器"
+	$(QEMU) $(QEMU_COMMON) $(QEMU_BLK)
+
+# virtio-blk 串口模式 - 便于查看挂载日志
+run-blk-serial: build disk-ext2.img
+	@echo "=== 启动内核（virtio-blk 串口模式）==="
+	@echo "磁盘: disk-ext2.img (64MB ext2)"
+	@echo "提示：按Ctrl+A然后按X退出QEMU"
+	$(QEMU) $(QEMU_COMMON) $(QEMU_BLK) \
 		-nographic
 
 # Shell模式 - 运行交互式Shell（串口输出）
@@ -260,7 +315,7 @@ clean:
 	rm -rf kernel-target
 	rm -rf bootloader-target
 	rm -rf esp
-	rm -f qemu-debug.log qemu-verbose.log
+	rm -f qemu-debug.log qemu-verbose.log disk-ext2.img
 
 # 用于连接到QEMU监视器
 monitor:
@@ -277,6 +332,8 @@ help:
 	@echo "运行模式:"
 	@echo "  make run          - 图形窗口模式（推荐，可看到VGA输出）"
 	@echo "  make run-serial   - 串口输出模式（终端显示）"
+	@echo "  make run-blk      - virtio-blk磁盘模式（图形）"
+	@echo "  make run-blk-serial - virtio-blk磁盘模式（串口）"
 	@echo "  make run-shell    - 串口模式运行交互式Shell（终端输入输出）"
 	@echo "  make run-shell-gui - 图形模式运行交互式Shell（VGA+键盘）"
 	@echo "  make run-debug    - 调试模式（显示中断和CPU状态）"

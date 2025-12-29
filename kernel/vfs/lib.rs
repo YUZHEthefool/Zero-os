@@ -57,7 +57,7 @@ pub mod types;
 pub use devfs::DevFs;
 pub use ext2::{Ext2Fs, Ext2Inode};
 pub use initramfs::Initramfs;
-pub use manager::{init, mount, open, readdir, stat, umount, VFS};
+pub use manager::{init, mount, open, readdir, register_block_device, stat, umount, VFS};
 pub use procfs::ProcFs;
 pub use ramfs::{RamFs, RamFsInode};
 pub use traits::{FileHandle, FileSystem, Inode};
