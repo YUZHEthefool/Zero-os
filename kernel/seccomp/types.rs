@@ -530,6 +530,12 @@ impl fmt::Display for SeccompError {
 // ============================================================================
 
 /// Validate a seccomp program.
+///
+/// # Security (R32-SECCOMP-1 fix)
+///
+/// Jump targets must be strictly less than prog.len() to ensure they
+/// land on a valid instruction. Allowing target == prog.len() enables
+/// policy bypass by falling through to the default action.
 fn validate_program(prog: &[SeccompInsn]) -> Result<(), SeccompError> {
     if prog.is_empty() {
         return Err(SeccompError::NoTerminator);
@@ -552,13 +558,15 @@ fn validate_program(prog: &[SeccompInsn]) -> Result<(), SeccompError> {
             | SeccompInsn::JmpGe(_, t, f) => {
                 let true_target = i + 1 + *t as usize;
                 let false_target = i + 1 + *f as usize;
-                if true_target > prog.len() || false_target > prog.len() {
+                // R32-SECCOMP-1 FIX: Use >= instead of > to prevent jumping past program end
+                if true_target >= prog.len() || false_target >= prog.len() {
                     return Err(SeccompError::InvalidJump);
                 }
             }
             SeccompInsn::Jmp(offset) => {
                 let target = i + 1 + *offset as usize;
-                if target > prog.len() {
+                // R32-SECCOMP-1 FIX: Use >= instead of > to prevent jumping past program end
+                if target >= prog.len() {
                     return Err(SeccompError::InvalidJump);
                 }
             }

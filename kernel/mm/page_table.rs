@@ -4,6 +4,7 @@
 
 use spin::Mutex;
 use x86_64::{
+    instructions::interrupts,
     structures::paging::{
         page_table::PageTableEntry, FrameAllocator, Mapper, OffsetPageTable, Page, PageTable,
         PageTableFlags, PhysFrame, Size4KiB, Translate,
@@ -54,16 +55,24 @@ pub struct PageTableManager {
 ///
 /// 调用者必须提供正确的物理内存偏移量。
 /// 在回调函数执行期间，不得发生导致 CR3 切换的上下文切换。
+///
+/// # Security (R32-MM-1 fix)
+///
+/// 此函数在执行期间禁用中断，防止上下文切换导致操作错误的地址空间。
+/// 这可以避免跨进程内存破坏漏洞。
 pub unsafe fn with_current_manager<T, F>(physical_memory_offset: VirtAddr, f: F) -> T
 where
     F: FnOnce(&mut PageTableManager) -> T,
 {
-    let _ = physical_memory_offset; // 调用方参数保持兼容，实际使用固定偏移
-    let phys_offset = get_phys_offset();
-    let level_4_table = active_level_4_table(phys_offset);
-    let mapper = OffsetPageTable::new(level_4_table, phys_offset);
-    let mut manager = PageTableManager { mapper };
-    f(&mut manager)
+    // R32-MM-1 FIX: Disable interrupts to prevent CR3 switch during page table operations
+    interrupts::without_interrupts(|| {
+        let _ = physical_memory_offset; // 调用方参数保持兼容，实际使用固定偏移
+        let phys_offset = get_phys_offset();
+        let level_4_table = active_level_4_table(phys_offset);
+        let mapper = OffsetPageTable::new(level_4_table, phys_offset);
+        let mut manager = PageTableManager { mapper };
+        f(&mut manager)
+    })
 }
 
 impl PageTableManager {
@@ -166,6 +175,8 @@ impl PageTableManager {
     }
 
     /// 映射一个连续的虚拟地址范围
+    ///
+    /// R32-MM-2 FIX: Uses checked arithmetic to prevent integer overflow
     pub fn map_range(
         &mut self,
         start_virt: VirtAddr,
@@ -174,12 +185,27 @@ impl PageTableManager {
         flags: PageTableFlags,
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     ) -> Result<(), MapError> {
-        let page_count = (size + 0xfff) / 0x1000;
+        // R32-MM-2 FIX: Use checked_add to prevent overflow when rounding up
+        let page_count = size
+            .checked_add(0xfff)
+            .ok_or(MapError::InvalidRange)?
+            / 0x1000;
 
         for i in 0..page_count {
-            let offset = (i * 0x1000) as u64;
-            let page = Page::containing_address(start_virt + offset);
-            let frame = PhysFrame::containing_address(start_phys + offset);
+            // R32-MM-2 FIX: Use checked arithmetic for offset calculation
+            let offset = (i as u64)
+                .checked_mul(0x1000)
+                .ok_or(MapError::InvalidRange)?;
+            let virt_u64 = start_virt
+                .as_u64()
+                .checked_add(offset)
+                .ok_or(MapError::InvalidRange)?;
+            let phys_u64 = start_phys
+                .as_u64()
+                .checked_add(offset)
+                .ok_or(MapError::InvalidRange)?;
+            let page = Page::containing_address(VirtAddr::new(virt_u64));
+            let frame = PhysFrame::containing_address(PhysAddr::new(phys_u64));
 
             self.map_page(page, frame, flags, frame_allocator)?;
         }
@@ -262,6 +288,8 @@ pub enum MapError {
     FrameAllocationFailed,
     ParentEntryHugePage,
     PageAlreadyMapped,
+    /// R32-MM-2 FIX: Invalid range (overflow in size or offset calculation)
+    InvalidRange,
 }
 
 /// 页表取消映射错误
@@ -538,14 +566,28 @@ pub unsafe fn ensure_pte_level(
 /// # Safety
 ///
 /// Caller must ensure addresses are valid and CR3 won't change.
+///
+/// R32-MM-2 FIX: Uses checked arithmetic to prevent integer overflow
 pub unsafe fn ensure_pte_range(
     start: VirtAddr,
     size: usize,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<(), MapError> {
-    let pages = (size + 0xfff) / 0x1000;
+    // R32-MM-2 FIX: Use checked_add to prevent overflow when rounding up
+    let pages = size
+        .checked_add(0xfff)
+        .ok_or(MapError::InvalidRange)?
+        / 0x1000;
     for i in 0..pages {
-        let page = Page::<Size4KiB>::containing_address(start + (i as u64 * 0x1000));
+        // R32-MM-2 FIX: Use checked arithmetic for offset calculation
+        let offset = (i as u64)
+            .checked_mul(0x1000)
+            .ok_or(MapError::InvalidRange)?;
+        let addr_u64 = start
+            .as_u64()
+            .checked_add(offset)
+            .ok_or(MapError::InvalidRange)?;
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr_u64));
         ensure_pte_level(page, frame_allocator)?;
     }
     Ok(())
@@ -560,12 +602,20 @@ pub unsafe fn ensure_pte_range(
 ///
 /// - Caller must ensure addresses are valid
 /// - TLB will be flushed automatically
+///
+/// R32-MM-2 FIX: Uses checked arithmetic to prevent integer overflow
 pub unsafe fn map_mmio(
     virt: VirtAddr,
     phys: PhysAddr,
     size: usize,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<(), MapError> {
+    // R32-MM-2 FIX: Pre-calculate page count with overflow checking
+    let pages = size
+        .checked_add(0xfff)
+        .ok_or(MapError::InvalidRange)?
+        / 0x1000;
+
     // First ensure all pages are at 4KB granularity
     ensure_pte_range(virt, size, frame_allocator)?;
 
@@ -573,10 +623,21 @@ pub unsafe fn map_mmio(
 
     // Now map or update each page
     with_current_manager(get_phys_offset(), |mgr| {
-        let pages = (size + 0xfff) / 0x1000;
         for i in 0..pages {
-            let page = Page::<Size4KiB>::containing_address(virt + (i as u64) * 0x1000);
-            let frame = PhysFrame::containing_address(phys + (i as u64) * 0x1000);
+            // R32-MM-2 FIX: Use checked arithmetic for offset calculation
+            let offset = (i as u64)
+                .checked_mul(0x1000)
+                .ok_or(MapError::InvalidRange)?;
+            let virt_u64 = virt
+                .as_u64()
+                .checked_add(offset)
+                .ok_or(MapError::InvalidRange)?;
+            let phys_u64 = phys
+                .as_u64()
+                .checked_add(offset)
+                .ok_or(MapError::InvalidRange)?;
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt_u64));
+            let frame = PhysFrame::containing_address(PhysAddr::new(phys_u64));
 
             match mgr.map_page(page, frame, flags, frame_allocator) {
                 Ok(()) => {}
@@ -605,9 +666,16 @@ pub unsafe fn map_mmio(
     })?;
 
     // Flush TLB for the mapped range
-    for i in 0..(size + 0xfff) / 0x1000 {
-        let addr = virt + (i as u64) * 0x1000;
-        x86_64::instructions::tlb::flush(addr);
+    // R32-MM-2 FIX: Reuse pre-calculated pages count
+    for i in 0..pages {
+        let offset = (i as u64)
+            .checked_mul(0x1000)
+            .ok_or(MapError::InvalidRange)?;
+        let addr_u64 = virt
+            .as_u64()
+            .checked_add(offset)
+            .ok_or(MapError::InvalidRange)?;
+        x86_64::instructions::tlb::flush(VirtAddr::new(addr_u64));
     }
 
     Ok(())

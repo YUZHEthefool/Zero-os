@@ -513,17 +513,48 @@ impl VirtioBlkDevice {
         }
 
         // R28-2 Fix: Validate buffer alignment and capacity bounds
+        // R32-BLK-1 FIX: Use consistent byte-based bounds checking
+        // VirtIO spec: capacity is always in 512-byte sectors, but blk_size may differ
         if buf.is_empty() {
             return Err(BlockError::Invalid);
         }
-        if (buf.len() as u32) % self.sector_size != 0 {
+        // R32-BLK-1 additional hardening: prevent u32 wrap in descriptor length
+        if buf.len() > u32::MAX as usize {
             return Err(BlockError::Invalid);
         }
-        let sectors_count = (buf.len() as u64) / (self.sector_size as u64);
-        let end_sector = sector.checked_add(sectors_count).ok_or(BlockError::Invalid)?;
-        if end_sector > self.capacity {
+        const VIRTIO_CAPACITY_SECTOR_SIZE: u64 = 512;
+        let sector_size = self.sector_size as u64;
+        let buf_len = buf.len() as u64;
+
+        // Buffer must be aligned to logical sector size
+        if buf_len % sector_size != 0 {
             return Err(BlockError::Invalid);
         }
+
+        // Convert to byte offsets for consistent bounds checking
+        let start_byte = sector
+            .checked_mul(sector_size)
+            .ok_or(BlockError::Invalid)?;
+        let end_byte = start_byte
+            .checked_add(buf_len)
+            .ok_or(BlockError::Invalid)?;
+        let capacity_bytes = self
+            .capacity
+            .checked_mul(VIRTIO_CAPACITY_SECTOR_SIZE)
+            .ok_or(BlockError::Invalid)?;
+
+        // Start must be aligned to 512-byte boundary for VirtIO header
+        if start_byte % VIRTIO_CAPACITY_SECTOR_SIZE != 0 {
+            return Err(BlockError::Invalid);
+        }
+
+        // End must not exceed device capacity
+        if end_byte > capacity_bytes {
+            return Err(BlockError::Invalid);
+        }
+
+        // Calculate sector in 512-byte units for VirtIO request header
+        let header_sector = start_byte / VIRTIO_CAPACITY_SECTOR_SIZE;
 
         let _lock = self.lock.lock();
 
@@ -540,7 +571,7 @@ impl VirtioBlkDevice {
                         blk_types::VIRTIO_BLK_T_IN
                     };
                     buffers[i].header.reserved = 0;
-                    buffers[i].header.sector = sector;
+                    buffers[i].header.sector = header_sector;  // R32-BLK-1: Use 512-byte sector units
                     buffers[i].status = 0xFF; // Invalid status
                     i
                 }

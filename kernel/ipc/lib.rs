@@ -216,13 +216,55 @@ fn fs_error_to_syscall(err: vfs::types::FsError) -> SyscallError {
 ///
 /// FUTEX_WAIT: 成功返回 0，值不匹配返回 EAGAIN
 /// FUTEX_WAKE: 返回实际唤醒的进程数量
+///
+/// # Security (R32-IPC-2 fix)
+///
+/// Validates that uaddr is properly aligned and points to a user-accessible page.
+/// This prevents using kernel addresses or unmapped memory as futex keys.
 fn futex_callback(
     uaddr: usize,
     op: i32,
     val: u32,
     current_value: u32,
 ) -> Result<usize, SyscallError> {
+    use mm::page_table::{with_current_manager, PHYSICAL_MEMORY_OFFSET};
     use process::current_pid;
+    use x86_64::structures::paging::PageTableFlags;
+    use x86_64::VirtAddr;
+
+    // R32-IPC-2 FIX: Validate alignment (u32 must be 4-byte aligned)
+    if uaddr & 0x3 != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // R32-IPC-2 FIX: Validate user-space address range
+    // Reject kernel addresses (addresses >= PHYSICAL_MEMORY_OFFSET are kernel space)
+    if uaddr as u64 >= PHYSICAL_MEMORY_OFFSET {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // R32-IPC-2 FIX: Verify page is mapped with USER_ACCESSIBLE flag
+    unsafe {
+        with_current_manager(VirtAddr::new(0), |mgr| {
+            // Check start and end of u32 value
+            let end_addr = uaddr
+                .checked_add(core::mem::size_of::<u32>() - 1)
+                .ok_or(SyscallError::EFAULT)?;
+
+            for addr in [uaddr, end_addr] {
+                if let Some((_, flags)) = mgr.translate_with_flags(VirtAddr::new(addr as u64)) {
+                    if !flags.contains(PageTableFlags::PRESENT)
+                        || !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+                    {
+                        return Err(SyscallError::EFAULT);
+                    }
+                } else {
+                    return Err(SyscallError::EFAULT);
+                }
+            }
+            Ok(())
+        })?;
+    }
 
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
 

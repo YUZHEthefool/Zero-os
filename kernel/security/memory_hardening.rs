@@ -765,5 +765,7 @@ fn map_error_to_hardening(err: MapError) -> HardeningError {
             HardeningError::UnsafeOperation("Cannot demote huge page at requested granularity")
         }
         MapError::PageAlreadyMapped => HardeningError::InconsistentTopology,
+        // R32-MM-2 FIX: Handle InvalidRange error from overflow-checked page table operations
+        MapError::InvalidRange => HardeningError::InvalidAddress,
     }
 }

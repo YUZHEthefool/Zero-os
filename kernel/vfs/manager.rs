@@ -223,7 +223,7 @@ impl Vfs {
             }
         }
 
-        let path = normalize_path(path);
+        let path = normalize_path(path)?;
 
         // R26-2 FIX: MAC gate for mount operations
         // LSM policy can block mounts even for root users
@@ -256,7 +256,7 @@ impl Vfs {
             }
         }
 
-        let path = normalize_path(path);
+        let path = normalize_path(path)?;
 
         // R26-2 FIX: MAC gate for umount operations
         // LSM policy can block unmounts even for root users
@@ -280,7 +280,7 @@ impl Vfs {
     /// Enforces execute/search permission on each directory component during traversal.
     /// This prevents unauthorized access to files in directories without "x" permission.
     pub fn lookup_path(&self, path: &str) -> Result<Arc<dyn Inode>, FsError> {
-        let path = normalize_path(path);
+        let path = normalize_path(path)?;
 
         // Find the mount point that covers this path
         let (_mount_path, fs, relative_path) = self.find_mount(&path)?;
@@ -327,7 +327,7 @@ impl Vfs {
         flags: OpenFlags,
         create_mode: u16,
     ) -> Result<Box<dyn FileOps>, FsError> {
-        let path = normalize_path(path);
+        let path = normalize_path(path)?;
 
         // Resolve existing path or create on demand
         let inode = match self.lookup_path(&path) {
@@ -475,7 +475,7 @@ impl Vfs {
 
     /// Create a file or directory
     pub fn create(&self, path: &str, mode: FileMode) -> Result<Arc<dyn Inode>, FsError> {
-        let path = normalize_path(path);
+        let path = normalize_path(path)?;
 
         // Get parent directory and filename
         let (parent_path, filename) = split_path(&path)?;
@@ -533,7 +533,7 @@ impl Vfs {
     /// Enforces sticky-bit semantics: in a directory with sticky bit set (mode & 0o1000),
     /// only root, the directory owner, or the file owner may delete files.
     pub fn unlink(&self, path: &str) -> Result<(), FsError> {
-        let path = normalize_path(path);
+        let path = normalize_path(path)?;
 
         let (parent_path, filename) = split_path(&path)?;
         let parent = self.lookup_path(&parent_path)?;
@@ -702,28 +702,37 @@ pub fn init() {
 // ============================================================================
 
 /// Normalize a path (remove . and .., ensure leading /)
-fn normalize_path(path: &str) -> String {
+///
+/// # Security (R32-VFS-1 fix)
+///
+/// Rejects paths that attempt to traverse above the root directory.
+/// Paths like "/../../etc/passwd" will return PermDenied to prevent
+/// sandbox/mount jail escapes.
+fn normalize_path(path: &str) -> Result<String, FsError> {
     let mut components: Vec<&str> = Vec::new();
 
     for component in path.split('/') {
         match component {
             "" | "." => {} // Skip empty and current dir
             ".." => {
-                components.pop(); // Go up one level
+                // R32-VFS-1 FIX: Reject attempts to traverse above root
+                if components.pop().is_none() {
+                    return Err(FsError::PermDenied);
+                }
             }
             _ => components.push(component),
         }
     }
 
     if components.is_empty() {
-        "/".to_string()
+        Ok("/".to_string())
     } else {
         let mut result = String::new();
         for c in components {
             result.push('/');
             result.push_str(c);
         }
-        result
+        Ok(result)
     }
 }
 
