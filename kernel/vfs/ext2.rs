@@ -15,9 +15,11 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use block::BlockDevice;
 use core::any::Any;
+use core::cmp;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_core::FileOps;
+use mm::{buddy_allocator, page_cache, PageCacheEntry, PAGE_SIZE, PHYSICAL_MEMORY_OFFSET};
 use spin::{Mutex, RwLock};
 
 // ============================================================================
@@ -540,39 +542,132 @@ impl Ext2Inode {
         Err(FsError::NotFound)
     }
 
-    /// Read file data at offset
+    /// Read file data at offset using page cache
+    ///
+    /// This implementation routes all file reads through the global page cache,
+    /// providing caching and reducing disk I/O for repeated accesses.
     fn read_file_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         if offset >= self.size {
             return Ok(0);
         }
 
         let fs = self.fs.upgrade().ok_or(FsError::Invalid)?;
-        let mut block_buf = alloc::vec![0u8; fs.block_size as usize];
+        let block_size = fs.block_size as usize;
 
-        let to_read = buf.len().min((self.size - offset) as usize);
+        // Create unique inode_id for page cache: combine fs_id and ino
+        // Use upper 32 bits for fs_id, lower 32 bits for ino
+        let cache_inode_id = (self.fs_id << 32) | (self.ino as u64);
+        let file_size = self.size;
+        let raw_inode = self.raw;
+
+        let to_read = buf.len().min((file_size - offset) as usize);
         let mut bytes_read = 0;
-        let mut file_offset = offset;
 
         while bytes_read < to_read {
-            let file_block = file_offset / fs.block_size as u64;
-            let offset_in_block = (file_offset % fs.block_size as u64) as usize;
-            let remaining_in_block = fs.block_size as usize - offset_in_block;
-            let copy_len = (to_read - bytes_read).min(remaining_in_block);
+            let file_offset = offset + bytes_read as u64;
+            let page_index = file_offset / PAGE_SIZE as u64;
+            let offset_in_page = (file_offset % PAGE_SIZE as u64) as usize;
+            let remaining_in_page = PAGE_SIZE - offset_in_page;
+            let copy_len = cmp::min(remaining_in_page, to_read - bytes_read);
 
-            // Map to physical block
-            let phys_block = fs.map_file_block(&self.raw, file_block as u32)?;
-            if let Some(phys) = phys_block {
-                fs.read_block(phys, &mut block_buf)?;
-            } else {
-                // Hole - return zeros
-                block_buf.fill(0);
-            }
+            // Clone fs for the I/O closure
+            let fs_for_io = fs.clone();
 
-            buf[bytes_read..bytes_read + copy_len]
-                .copy_from_slice(&block_buf[offset_in_block..offset_in_block + copy_len]);
+            // Allocate physical frame for new page
+            let alloc_pfn = || -> Option<u64> {
+                let frame = buddy_allocator::alloc_physical_pages(1)?;
+                Some(frame.start_address().as_u64() / PAGE_SIZE as u64)
+            };
+
+            // Read page from cache, or load from disk if not cached
+            let page = page_cache::read_page(
+                cache_inode_id,
+                page_index,
+                alloc_pfn,
+                |page_entry: &PageCacheEntry| {
+                    // This closure populates the page from disk
+                    let page_phys = page_entry.physical_address();
+                    let page_virt = (page_phys + PHYSICAL_MEMORY_OFFSET) as *mut u8;
+
+                    // Zero the page first (handles sparse files and EOF)
+                    unsafe {
+                        core::ptr::write_bytes(page_virt, 0, PAGE_SIZE);
+                    }
+
+                    // Calculate file offset for this page
+                    let page_start_offset = page_entry.index * PAGE_SIZE as u64;
+                    let mut filled = 0usize;
+
+                    // Fill the page from disk blocks
+                    while filled < PAGE_SIZE {
+                        let global_offset = page_start_offset + filled as u64;
+
+                        // Stop at end of file
+                        if global_offset >= file_size {
+                            break;
+                        }
+
+                        // Calculate which file block and offset within block
+                        let file_block = (global_offset / block_size as u64) as u32;
+                        let offset_in_block = (global_offset % block_size as u64) as usize;
+
+                        // Read the block from disk
+                        let mut block_buf = alloc::vec![0u8; block_size];
+                        let phys_block = match fs_for_io.map_file_block(&raw_inode, file_block) {
+                            Ok(Some(b)) => Some(b),
+                            Ok(None) => None, // Hole in file
+                            Err(_) => return Err(()),
+                        };
+
+                        if let Some(phys) = phys_block {
+                            if fs_for_io.read_block(phys, &mut block_buf).is_err() {
+                                return Err(());
+                            }
+                        }
+                        // For holes, block_buf is already zeroed
+
+                        // Calculate how much to copy from this block
+                        let bytes_left_in_block = block_size.saturating_sub(offset_in_block);
+                        let bytes_left_in_page = PAGE_SIZE - filled;
+                        let bytes_left_in_file = (file_size - global_offset) as usize;
+                        let chunk = cmp::min(
+                            cmp::min(bytes_left_in_block, bytes_left_in_page),
+                            bytes_left_in_file,
+                        );
+
+                        if chunk == 0 {
+                            break;
+                        }
+
+                        // Copy data to page
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                block_buf.as_ptr().add(offset_in_block),
+                                page_virt.add(filled),
+                                chunk,
+                            );
+                        }
+
+                        filled += chunk;
+                    }
+
+                    Ok(())
+                },
+            )
+            .ok_or(FsError::Io)?;
+
+            // Copy data from cached page to user buffer
+            let page_virt = (page.physical_address() + PHYSICAL_MEMORY_OFFSET) as *const u8;
+            let src = unsafe {
+                core::slice::from_raw_parts(page_virt.add(offset_in_page), copy_len)
+            };
+            buf[bytes_read..bytes_read + copy_len].copy_from_slice(src);
+
+            // R36-FIX: Balance the page cache refcount so shrink() can reclaim this page.
+            // find_get_page increments refcount, we must call put() when done using the page.
+            page.put();
 
             bytes_read += copy_len;
-            file_offset += copy_len as u64;
         }
 
         Ok(bytes_read)

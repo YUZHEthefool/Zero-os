@@ -84,7 +84,8 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
 ///
 /// 从指定的文件描述符读取数据（管道 + VFS 文件）
 ///
-/// 注意：为避免死锁，必须在释放进程锁后再调用可能阻塞的管道操作
+/// R32-IPC-1 FIX: Single lookup to avoid TOCTOU - determine fd type and
+/// get handle in one lock acquisition.
 fn fd_read_callback(fd: i32, buf: &mut [u8]) -> Result<usize, SyscallError> {
     use process::{current_pid, get_process};
     use vfs::traits::FileHandle;
@@ -92,25 +93,23 @@ fn fd_read_callback(fd: i32, buf: &mut [u8]) -> Result<usize, SyscallError> {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
-    // 首先尝试管道（在锁外执行可能阻塞的读取）
-    if let Some(pipe_handle) = {
-        let proc = process.lock();
-        let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
-        fd_obj.as_any().downcast_ref::<PipeHandle>().cloned()
-    } {
-        return pipe_handle.read(buf).map_err(pipe_error_to_syscall);
+    // Single lock acquisition for both type checks
+    let proc = process.lock();
+    let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+
+    // Check for pipe first (needs clone for out-of-lock I/O to avoid deadlock)
+    if let Some(pipe_handle) = fd_obj.as_any().downcast_ref::<PipeHandle>() {
+        let pipe_clone = pipe_handle.clone();
+        drop(proc); // Release lock before potentially blocking pipe I/O
+        return pipe_clone.read(buf).map_err(pipe_error_to_syscall);
     }
 
-    // 再尝试 VFS FileHandle（VFS 读通常不阻塞，持锁访问即可）
-    {
-        let proc = process.lock();
-        let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
-        if let Some(file) = fd_obj.as_any().downcast_ref::<FileHandle>() {
-            if file.inode.is_dir() {
-                return Err(SyscallError::EISDIR);
-            }
-            return file.read(buf).map_err(fs_error_to_syscall);
+    // Check for file (operates under lock - VFS reads are non-blocking)
+    if let Some(file) = fd_obj.as_any().downcast_ref::<FileHandle>() {
+        if file.inode.is_dir() {
+            return Err(SyscallError::EISDIR);
         }
+        return file.read(buf).map_err(fs_error_to_syscall);
     }
 
     Err(SyscallError::EBADF)
@@ -120,7 +119,8 @@ fn fd_read_callback(fd: i32, buf: &mut [u8]) -> Result<usize, SyscallError> {
 ///
 /// 向指定的文件描述符写入数据（管道 + VFS 文件）
 ///
-/// 注意：为避免死锁，必须在释放进程锁后再调用可能阻塞的管道操作
+/// R32-IPC-1 FIX: Single lookup to avoid TOCTOU - determine fd type and
+/// get handle in one lock acquisition.
 fn fd_write_callback(fd: i32, buf: &[u8]) -> Result<usize, SyscallError> {
     use process::{current_pid, get_process};
     use vfs::traits::FileHandle;
@@ -128,25 +128,23 @@ fn fd_write_callback(fd: i32, buf: &[u8]) -> Result<usize, SyscallError> {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
-    // 先尝试管道（在锁外执行可能阻塞的写入）
-    if let Some(pipe_handle) = {
-        let proc = process.lock();
-        let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
-        fd_obj.as_any().downcast_ref::<PipeHandle>().cloned()
-    } {
-        return pipe_handle.write(buf).map_err(pipe_error_to_syscall);
+    // Single lock acquisition for both type checks
+    let proc = process.lock();
+    let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+
+    // Check for pipe first (needs clone for out-of-lock I/O to avoid deadlock)
+    if let Some(pipe_handle) = fd_obj.as_any().downcast_ref::<PipeHandle>() {
+        let pipe_clone = pipe_handle.clone();
+        drop(proc); // Release lock before potentially blocking pipe I/O
+        return pipe_clone.write(buf).map_err(pipe_error_to_syscall);
     }
 
-    // 再尝试 VFS FileHandle
-    {
-        let proc = process.lock();
-        let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
-        if let Some(file) = fd_obj.as_any().downcast_ref::<FileHandle>() {
-            if file.inode.is_dir() {
-                return Err(SyscallError::EISDIR);
-            }
-            return file.write(buf).map_err(fs_error_to_syscall);
+    // Check for file (operates under lock - VFS writes are non-blocking)
+    if let Some(file) = fd_obj.as_any().downcast_ref::<FileHandle>() {
+        if file.inode.is_dir() {
+            return Err(SyscallError::EISDIR);
         }
+        return file.write(buf).map_err(fs_error_to_syscall);
     }
 
     Err(SyscallError::EBADF)

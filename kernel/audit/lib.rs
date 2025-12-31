@@ -988,12 +988,39 @@ pub struct AuditStats {
 /// ```
 pub type SnapshotAuthorizer = fn() -> Result<(), AuditError>;
 
+/// Callback type for pre-snapshot flush hook.
+///
+/// This function is called by `snapshot()` immediately before draining
+/// the audit ring buffer. It allows other subsystems (LSM, seccomp, etc.)
+/// to flush any buffered security events into the audit ring so they are
+/// included in the snapshot.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// fn flush_pending_events() {
+///     // Flush any buffered LSM denial events
+///     lsm::flush_audit_queue();
+///     // Flush any buffered seccomp events
+///     seccomp::flush_audit_queue();
+/// }
+///
+/// audit::register_flush_hook(flush_pending_events);
+/// ```
+pub type FlushHook = fn();
+
 /// Optional capability gate for audit snapshots (set once at boot).
 ///
 /// When set, `snapshot()` calls this function to verify the caller
 /// has CAP_AUDIT_READ (or equivalent) before returning events.
 /// If not set, `snapshot()` fails closed with AccessDenied.
 static SNAPSHOT_AUTHORIZER: Mutex<Option<SnapshotAuthorizer>> = Mutex::new(None);
+
+/// Optional flush hook executed prior to draining the audit ring buffer.
+///
+/// When set, `snapshot()` calls this function before draining events,
+/// allowing other subsystems to flush pending audit data.
+static FLUSH_HOOK: Mutex<Option<FlushHook>> = Mutex::new(None);
 
 /// Register the snapshot authorizer callback.
 ///
@@ -1024,6 +1051,45 @@ pub fn register_snapshot_authorizer(authorizer: SnapshotAuthorizer) {
         let mut guard = SNAPSHOT_AUTHORIZER.lock();
         *guard = Some(authorizer);
     });
+}
+
+/// Register a flush hook to be called before snapshot drains the ring buffer.
+///
+/// The flush hook allows other subsystems (LSM, seccomp, capability system)
+/// to emit any pending audit events before the snapshot is taken. This
+/// ensures that security events are not lost during the drain operation.
+///
+/// # Arguments
+///
+/// * `hook` - Function to call before draining the audit ring
+///
+/// # Example
+///
+/// ```rust,ignore
+/// audit::register_flush_hook(|| {
+///     // Flush any pending LSM events
+///     lsm::flush_pending_audit_events();
+/// });
+/// ```
+pub fn register_flush_hook(hook: FlushHook) {
+    interrupts::without_interrupts(|| {
+        let mut guard = FLUSH_HOOK.lock();
+        *guard = Some(hook);
+    });
+}
+
+/// Invoke the registered flush hook if present.
+///
+/// Called by `snapshot()` before draining the ring buffer.
+fn run_flush_hook() {
+    let hook = interrupts::without_interrupts(|| {
+        let guard = FLUSH_HOOK.lock();
+        *guard
+    });
+
+    if let Some(func) = hook {
+        func();
+    }
 }
 
 /// Enforce the snapshot capability gate.
@@ -1113,8 +1179,15 @@ pub fn enable() {
 }
 
 /// Disable audit event emission
+///
+/// # Security (Phase A Hardening)
+///
+/// This function is intentionally a no-op. The audit subsystem is mandatory
+/// and cannot be disabled at runtime. Attempts to disable are logged but
+/// ignored to prevent attackers from covering their tracks.
 pub fn disable() {
-    AUDIT_ENABLED.store(false, Ordering::SeqCst);
+    // R35-AUDIT-1: Audit is mandatory - log the attempt but don't disable
+    println!("  audit: disable() called but ignored (audit is mandatory)");
 }
 
 /// Check if audit is enabled
@@ -1374,6 +1447,10 @@ pub fn snapshot() -> Result<AuditSnapshot, AuditError> {
 
     // Capability gate: verify caller has CAP_AUDIT_READ
     ensure_snapshot_authorized()?;
+
+    // Phase A hardening: invoke flush hook to allow subsystems to emit
+    // any pending audit events before we drain the ring buffer
+    run_flush_hook();
 
     interrupts::without_interrupts(|| {
         let mut ring = AUDIT_RING.lock();

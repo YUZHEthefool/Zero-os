@@ -388,13 +388,17 @@ impl CapTableInner {
 
         // R29-4 FIX: Extended generation to 48 bits (~281 trillion allocations)
         // R25-2 FIX: Fail on generation exhaustion instead of wrapping
+        // R32-CAP-1 FIX: Use checked_add instead of wrapping_add for defense-in-depth
         let generation = self.next_generation;
         // Check against 48-bit limit (0x0000_FFFF_FFFF_FFFF)
         const MAX_GENERATION: u64 = 0x0000_FFFF_FFFF_FFFF;
         if self.next_generation >= MAX_GENERATION {
             return Err(CapError::GenerationExhausted);
         }
-        self.next_generation = self.next_generation.wrapping_add(1);
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or(CapError::GenerationExhausted)?;
         // Skip 0 if we somehow reach it (defensive)
         if self.next_generation == 0 {
             self.next_generation = 1;

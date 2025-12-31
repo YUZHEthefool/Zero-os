@@ -2,6 +2,9 @@
 //!
 //! 提供对x86_64页表的完整管理功能
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use spin::Mutex;
 use x86_64::{
     instructions::interrupts,
@@ -177,6 +180,7 @@ impl PageTableManager {
     /// 映射一个连续的虚拟地址范围
     ///
     /// R32-MM-2 FIX: Uses checked arithmetic to prevent integer overflow
+    /// R34-MM-1 FIX: Rolls back partial mappings on failure to prevent orphaned pages
     pub fn map_range(
         &mut self,
         start_virt: VirtAddr,
@@ -190,6 +194,9 @@ impl PageTableManager {
             .checked_add(0xfff)
             .ok_or(MapError::InvalidRange)?
             / 0x1000;
+
+        // R34-MM-1 FIX: Track successfully mapped pages for rollback on error
+        let mut mapped_pages: Vec<Page<Size4KiB>> = Vec::with_capacity(page_count);
 
         for i in 0..page_count {
             // R32-MM-2 FIX: Use checked arithmetic for offset calculation
@@ -207,19 +214,42 @@ impl PageTableManager {
             let page = Page::containing_address(VirtAddr::new(virt_u64));
             let frame = PhysFrame::containing_address(PhysAddr::new(phys_u64));
 
-            self.map_page(page, frame, flags, frame_allocator)?;
+            // R34-MM-1 FIX: On error, roll back all previously mapped pages in this call
+            if let Err(e) = self.map_page(page, frame, flags, frame_allocator) {
+                // Unmap all pages that were successfully mapped before the failure
+                for rollback_page in mapped_pages.drain(..) {
+                    // Best effort: ignore errors during rollback
+                    let _ = self.unmap_page(rollback_page);
+                }
+                return Err(e);
+            }
+            mapped_pages.push(page);
         }
 
         Ok(())
     }
 
     /// 取消映射一个连续的虚拟地址范围
+    ///
+    /// R35-MM-2 FIX: Uses checked arithmetic to prevent integer overflow,
+    /// mirroring the safety measures in map_range().
     pub fn unmap_range(&mut self, start_virt: VirtAddr, size: usize) -> Result<(), UnmapError> {
-        let page_count = (size + 0xfff) / 0x1000;
+        // R35-MM-2 FIX: Use checked_add to prevent overflow when rounding up
+        let page_count = size
+            .checked_add(0xfff)
+            .ok_or(UnmapError::InvalidRange)?
+            / 0x1000;
 
         for i in 0..page_count {
-            let offset = (i * 0x1000) as u64;
-            let page = Page::containing_address(start_virt + offset);
+            // R35-MM-2 FIX: Use checked arithmetic for offset calculation
+            let offset = (i as u64)
+                .checked_mul(0x1000)
+                .ok_or(UnmapError::InvalidRange)?;
+            let virt_u64 = start_virt
+                .as_u64()
+                .checked_add(offset)
+                .ok_or(UnmapError::InvalidRange)?;
+            let page = Page::containing_address(VirtAddr::new(virt_u64));
             self.unmap_page(page)?;
         }
 
@@ -298,6 +328,8 @@ pub enum UnmapError {
     PageNotMapped,
     ParentEntryHugePage,
     InvalidFrameAddress,
+    /// R35-MM-2 FIX: Overflow or invalid range in unmap_range offset calculation
+    InvalidRange,
 }
 
 /// 更新标志位错误

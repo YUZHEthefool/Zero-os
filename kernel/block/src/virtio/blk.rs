@@ -44,8 +44,10 @@ const MAX_PENDING: usize = 64;
 
 /// Translate a kernel virtual address to a DMA-safe physical address.
 ///
-/// For kernel heap allocations (which are in the high-half direct map),
-/// we can simply subtract PHYSICAL_MEMORY_OFFSET to get the physical address.
+/// **NOTE**: This function only works correctly for addresses in the direct-mapped
+/// kernel region (PHYSICAL_MEMORY_OFFSET). It does NOT work for heap allocations
+/// which are mapped via the page table at different physical addresses.
+/// For heap buffers, use `alloc_dma_memory` to get physically contiguous DMA-safe memory.
 ///
 /// # Arguments
 /// * `ptr` - Virtual address pointer
@@ -56,6 +58,7 @@ const MAX_PENDING: usize = 64;
 ///
 /// # Safety
 /// The caller must ensure the buffer is in kernel address space (high-half direct map).
+#[allow(dead_code)]
 fn virt_to_phys_dma(ptr: *const u8, len: usize) -> Result<u64, BlockError> {
     if len == 0 {
         return Err(BlockError::Invalid);
@@ -499,6 +502,20 @@ impl VirtioBlkDevice {
         Ok(phys_addr)
     }
 
+    /// Free DMA-able memory previously allocated with `alloc_dma_memory`.
+    fn free_dma_memory(phys_addr: u64, size: usize) {
+        use mm::buddy_allocator;
+        use x86_64::{structures::paging::PhysFrame, PhysAddr};
+
+        if size == 0 {
+            return;
+        }
+
+        let pages = (size + 4095) / 4096;
+        let frame = PhysFrame::containing_address(PhysAddr::new(phys_addr));
+        buddy_allocator::free_physical_pages(frame, pages);
+    }
+
     /// Notify the device of new available descriptors.
     fn notify(&self) {
         unsafe {
@@ -579,26 +596,64 @@ impl VirtioBlkDevice {
             }
         };
 
-        // R28-1 Fix: Convert virtual addresses to physical addresses for DMA
-        // The device will DMA to these physical addresses, so we must translate them.
-        let header_phys = {
-            let buffers = self.req_buffers.lock();
-            let header_ptr = &buffers[buf_idx].header as *const _ as *const u8;
-            virt_to_phys_dma(header_ptr, core::mem::size_of::<VirtioBlkReqHeader>())?
+        // DMA bounce buffer for header/status: heap buffers don't have correct virt-to-phys mapping
+        // Allocate DMA memory from buddy allocator which provides correct physical addresses
+        let header_size = core::mem::size_of::<VirtioBlkReqHeader>();
+        let header_status_dma_size = if header_size + 1 < 32 { 32 } else { header_size + 1 };
+        let header_status_dma_phys = match Self::alloc_dma_memory(header_status_dma_size) {
+            Ok(p) => p,
+            Err(e) => {
+                self.req_buffers.lock()[buf_idx].in_use = false;
+                return Err(e);
+            }
         };
-        let status_phys = {
-            let buffers = self.req_buffers.lock();
-            let status_ptr = &buffers[buf_idx].status as *const u8;
-            virt_to_phys_dma(status_ptr, 1)?
+        let header_status_dma_virt =
+            (header_status_dma_phys + mm::PHYSICAL_MEMORY_OFFSET) as *mut u8;
+
+        // Copy header to DMA buffer and initialize status to 0xFF (invalid)
+        unsafe {
+            let header = {
+                let buffers = self.req_buffers.lock();
+                buffers[buf_idx].header
+            };
+            core::ptr::write(header_status_dma_virt as *mut VirtioBlkReqHeader, header);
+            core::ptr::write(header_status_dma_virt.add(header_size), 0xFFu8);
+        }
+        let header_phys = header_status_dma_phys;
+        let status_phys = header_status_dma_phys + header_size as u64;
+
+        // DMA bounce buffer for data: heap data buffers don't have correct virt-to-phys mapping
+        let dma_phys = match Self::alloc_dma_memory(buf.len()) {
+            Ok(p) => p,
+            Err(e) => {
+                Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
+                self.req_buffers.lock()[buf_idx].in_use = false;
+                return Err(e);
+            }
         };
-        let data_phys = virt_to_phys_dma(buf.as_ptr(), buf.len())?;
+        let dma_virt = (dma_phys + mm::PHYSICAL_MEMORY_OFFSET) as *mut u8;
+
+        // For writes: copy from caller buffer into DMA buffer before I/O
+        if is_write {
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), dma_virt, buf.len());
+            }
+        }
 
         // Allocate 3 descriptors
-        let desc0 = self.queue.alloc_desc().ok_or(BlockError::Busy)?;
+        let desc0 = self.queue.alloc_desc().ok_or_else(|| {
+            Self::free_dma_memory(dma_phys, buf.len());
+            Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
+            self.req_buffers.lock()[buf_idx].in_use = false;
+            BlockError::Busy
+        })?;
         let desc1 = match self.queue.alloc_desc() {
             Some(d) => d,
             None => {
                 self.queue.free_desc(desc0);
+                Self::free_dma_memory(dma_phys, buf.len());
+                Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
+                self.req_buffers.lock()[buf_idx].in_use = false;
                 return Err(BlockError::Busy);
             }
         };
@@ -607,6 +662,9 @@ impl VirtioBlkDevice {
             None => {
                 self.queue.free_desc(desc0);
                 self.queue.free_desc(desc1);
+                Self::free_dma_memory(dma_phys, buf.len());
+                Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
+                self.req_buffers.lock()[buf_idx].in_use = false;
                 return Err(BlockError::Busy);
             }
         };
@@ -619,9 +677,9 @@ impl VirtioBlkDevice {
             d0.flags = VRING_DESC_F_NEXT;
             d0.next = desc1;
 
-            // Descriptor 1: Data buffer
+            // Descriptor 1: Data buffer (use DMA bounce buffer)
             let d1 = self.queue.desc(desc1);
-            d1.addr = data_phys;
+            d1.addr = dma_phys;
             d1.len = buf.len() as u32;
             d1.flags = VRING_DESC_F_NEXT | if is_write { 0 } else { VRING_DESC_F_WRITE };
             d1.next = desc2;
@@ -649,20 +707,25 @@ impl VirtioBlkDevice {
         }
 
         // Process completion
-        let result = if let Some(used) = self.queue.pop_used() {
+        let result = if let Some(_used) = self.queue.pop_used() {
             // Free descriptors
             self.queue.free_desc(desc0);
             self.queue.free_desc(desc1);
             self.queue.free_desc(desc2);
 
-            // Check status
-            let status = {
-                let buffers = self.req_buffers.lock();
-                buffers[buf_idx].status
-            };
+            // Read status from DMA buffer (device wrote to status_phys)
+            let status = unsafe { core::ptr::read(header_status_dma_virt.add(header_size)) };
 
             match status {
-                blk_status::VIRTIO_BLK_S_OK => Ok(buf.len()),
+                blk_status::VIRTIO_BLK_S_OK => {
+                    // For reads: copy from DMA buffer back to caller buffer
+                    if !is_write {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(dma_virt, buf.as_mut_ptr(), buf.len());
+                        }
+                    }
+                    Ok(buf.len())
+                }
                 blk_status::VIRTIO_BLK_S_IOERR => Err(BlockError::Io),
                 blk_status::VIRTIO_BLK_S_UNSUPP => Err(BlockError::NotSupported),
                 _ => Err(BlockError::Io),
@@ -674,6 +737,10 @@ impl VirtioBlkDevice {
             self.queue.free_desc(desc2);
             Err(BlockError::Io)
         };
+
+        // Free DMA bounce buffers
+        Self::free_dma_memory(dma_phys, buf.len());
+        Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
 
         // Release buffer
         {
@@ -727,7 +794,128 @@ impl BlockDevice for VirtioBlkDevice {
         if self.features & blk_features::VIRTIO_BLK_F_FLUSH == 0 {
             return Ok(()); // No flush support, assume write-through
         }
-        // TODO: Implement flush
-        Ok(())
+
+        let _lock = self.lock.lock();
+
+        // Acquire a request buffer slot
+        let buf_idx = {
+            let mut buffers = self.req_buffers.lock();
+            let idx = buffers.iter().position(|b| !b.in_use);
+            match idx {
+                Some(i) => {
+                    buffers[i].in_use = true;
+                    buffers[i].header.req_type = blk_types::VIRTIO_BLK_T_FLUSH;
+                    buffers[i].header.reserved = 0;
+                    buffers[i].header.sector = 0; // Sector is ignored for flush
+                    buffers[i].status = 0xFF;
+                    i
+                }
+                None => return Err(BlockError::Busy),
+            }
+        };
+
+        // DMA buffer for header + status
+        let header_size = core::mem::size_of::<VirtioBlkReqHeader>();
+        let header_status_dma_size = if header_size + 1 < 32 {
+            32
+        } else {
+            header_size + 1
+        };
+        let header_status_dma_phys = match Self::alloc_dma_memory(header_status_dma_size) {
+            Ok(p) => p,
+            Err(e) => {
+                self.req_buffers.lock()[buf_idx].in_use = false;
+                return Err(e);
+            }
+        };
+        let header_status_dma_virt =
+            (header_status_dma_phys + mm::PHYSICAL_MEMORY_OFFSET) as *mut u8;
+
+        // Write header and initialize status byte
+        unsafe {
+            let header = {
+                let buffers = self.req_buffers.lock();
+                buffers[buf_idx].header
+            };
+            core::ptr::write(header_status_dma_virt as *mut VirtioBlkReqHeader, header);
+            core::ptr::write(header_status_dma_virt.add(header_size), 0xFFu8);
+        }
+        let header_phys = header_status_dma_phys;
+        let status_phys = header_status_dma_phys + header_size as u64;
+
+        // Allocate descriptors (header + status, no data buffer for flush)
+        let desc0 = self.queue.alloc_desc().ok_or_else(|| {
+            Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
+            self.req_buffers.lock()[buf_idx].in_use = false;
+            BlockError::Busy
+        })?;
+        let desc1 = match self.queue.alloc_desc() {
+            Some(d) => d,
+            None => {
+                self.queue.free_desc(desc0);
+                Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
+                self.req_buffers.lock()[buf_idx].in_use = false;
+                return Err(BlockError::Busy);
+            }
+        };
+
+        unsafe {
+            // Descriptor 0: Header (device reads)
+            let d0 = self.queue.desc(desc0);
+            d0.addr = header_phys;
+            d0.len = core::mem::size_of::<VirtioBlkReqHeader>() as u32;
+            d0.flags = VRING_DESC_F_NEXT;
+            d0.next = desc1;
+
+            // Descriptor 1: Status (device writes)
+            let d1 = self.queue.desc(desc1);
+            d1.addr = status_phys;
+            d1.len = 1;
+            d1.flags = VRING_DESC_F_WRITE;
+            d1.next = 0;
+
+            // Push to available ring
+            self.queue.push_avail(desc0);
+        }
+
+        // Notify device
+        mb();
+        self.notify();
+
+        // Poll for completion
+        let mut timeout = 1_000_000u32;
+        while !self.queue.has_used() && timeout > 0 {
+            core::hint::spin_loop();
+            timeout -= 1;
+        }
+
+        // Process completion
+        let result = if let Some(_used) = self.queue.pop_used() {
+            // Free descriptors
+            self.queue.free_desc(desc0);
+            self.queue.free_desc(desc1);
+
+            // Read status from DMA buffer
+            let status = unsafe { core::ptr::read(header_status_dma_virt.add(header_size)) };
+            match status {
+                blk_status::VIRTIO_BLK_S_OK => Ok(()),
+                blk_status::VIRTIO_BLK_S_UNSUPP => Err(BlockError::NotSupported),
+                _ => Err(BlockError::Io),
+            }
+        } else {
+            // Timeout
+            self.queue.free_desc(desc0);
+            self.queue.free_desc(desc1);
+            Err(BlockError::Io)
+        };
+
+        // Free DMA buffer and release request slot
+        Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
+        {
+            let mut buffers = self.req_buffers.lock();
+            buffers[buf_idx].in_use = false;
+        }
+
+        result
     }
 }

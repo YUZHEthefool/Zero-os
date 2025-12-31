@@ -203,6 +203,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         }
     }
 
+    // KASLR/KPTI/PCID initialization
+    println!("[2.65/3] Initializing KASLR/KPTI/PCID...");
+    security::init_kaslr();
+
     // CPU 硬件保护特性启用 (SMEP/SMAP/UMIP)
     println!("[2.7/3] Enabling CPU protection features...");
     {
@@ -303,13 +307,29 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("      ✓ devfs mounted at /dev");
     println!("      ✓ Device files: null, zero, console");
 
+    // Initialize page cache before block layer mounts filesystems
+    println!("[7.52/8] Initializing Page Cache...");
+    mm::init_page_cache();
+    println!("      ✓ Global page cache initialized");
+
     // Phase C: Block Layer and Storage Foundation
     println!("[7.55/8] Initializing Block Layer...");
     block::init();
     // Probe for virtio-blk devices and register with VFS
     if let Some((device, name)) = block::probe_devices() {
-        match vfs::register_block_device(name, device) {
-            Ok(()) => println!("      ✓ Registered /dev/{} in devfs", name),
+        let device_for_registration = device.clone();
+        match vfs::register_block_device(name, device_for_registration) {
+            Ok(()) => {
+                println!("      ✓ Registered /dev/{} in devfs", name);
+                // Phase C: Try to mount as ext2 filesystem
+                match vfs::Ext2Fs::mount(device) {
+                    Ok(fs) => match vfs::mount("/mnt", fs) {
+                        Ok(()) => println!("      ✓ Mounted /dev/{} on /mnt as ext2", name),
+                        Err(e) => println!("      ! Registered /dev/{} but failed to mount on /mnt: {:?}", name, e),
+                    },
+                    Err(e) => println!("      ! Registered /dev/{} but failed to initialize ext2: {:?}", name, e),
+                }
+            }
             Err(e) => println!("      ! Failed to register /dev/{}: {:?}", name, e),
         }
     }

@@ -620,37 +620,19 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "sysretq",                                  // 返回用户态
 
         // ========================================
-        // IRETQ 回退路径：非规范或高半区地址
+        // R35-SYSRET-1 FIX: 回退路径 - 终止进程而非尝试返回
         // ========================================
+        // 当检测到非规范或高半区 RIP/RSP 时，不执行 swapgs/iretq，
+        // 因为使用攻击者提供的无效地址会导致 #GP 并在错误的 GS 状态下处理。
+        // 相反，调用 syscall_bad_return() 终止当前进程并调度其他任务。
         "2:",
-        // Z-1 fix: IRETQ 路径也需要恢复 FPU 状态（r13 仍指向 FPU 保存区）
-        "fxrstor64 [r13]",
-        "mov rcx, [r12 + {off_rcx}]",               // 用户 RIP
-        "mov rbx, [r12 + {off_rbx}]",
-        "mov rbp, [r12 + {off_rbp}]",
-        "mov rsi, [r12 + {off_rsi}]",
-        "mov rdi, [r12 + {off_rdi}]",
-        "mov r8,  [r12 + {off_r8}]",
-        "mov r9,  [r12 + {off_r9}]",
-        "mov r10, [r12 + {off_r10}]",
-        "mov r11, [r12 + {off_r11}]",               // 用户 RFLAGS
-        "mov r13, [r12 + {off_r13}]",
-        "mov r14, [r12 + {off_r14}]",
-        "mov r15, [r12 + {off_r15}]",
-        "mov rdx, [r12 + {off_rsp}]",               // 用户 RSP (临时保存到 rdx)
-        // 构建 IRETQ 帧
-        "push {user_ss}",
-        "push rdx",                                 // 用户 RSP
-        "push r11",                                 // 用户 RFLAGS
-        "push {user_cs}",
-        "push rcx",                                 // 用户 RIP
-        "mov rdx, [r12 + {off_rdx}]",               // 恢复用户 rdx
-        "mov r12, [r12 + {off_r12}]",               // 恢复 r12
-        // CVE-2019-1125 SWAPGS 防护：
-        // IRETQ 慢路径同样需要恢复用户 GS 基址并序列化
-        "swapgs",
-        "lfence",
-        "iretq",                                    // 通过 IRETQ 返回用户态
+        // 设置 System V ABI 调用参数
+        "mov rdi, [r12 + {off_rcx}]",               // arg0 = 用户 RIP (用于日志)
+        "mov rsi, [r12 + {off_rsp}]",               // arg1 = 用户 RSP (用于日志)
+        "mov r12, [r12 + {off_r12}]",               // 恢复 r12 保持 ABI 整洁
+        // 对齐栈：call 后 RSP+8 应为 16B 对齐
+        "sub rsp, 8",                               // 对齐填充
+        "call {bad_return}",                        // syscall_bad_return() 不返回
 
         // 符号绑定
         // R23-2 fix: 符号绑定 - 使用 per-CPU 数组（当前 CPU ID = 0，使用 slot 0）
@@ -680,9 +662,52 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         off_r15 = const OFF_R15,
         get_rsp0 = sym syscall_get_kernel_rsp0,
         dispatcher = sym syscall_dispatcher_bridge,
-        user_cs = const USER_CODE_SELECTOR,
-        user_ss = const USER_DATA_SELECTOR,
+        bad_return = sym syscall_bad_return,
     );
+}
+
+// ============================================================================
+// R35-SYSRET-1 FIX: Fatal handler for invalid SYSRET targets
+// ============================================================================
+
+/// Fatal handler for invalid SYSRET targets (non-canonical or high-half RIP/RSP).
+///
+/// This function is called when syscall_entry_stub detects that the user's RIP or RSP
+/// is non-canonical or points to kernel space. Instead of attempting IRETQ with invalid
+/// addresses (which would cause #GP with corrupted GS state), we terminate the process.
+///
+/// # Safety
+///
+/// This function must only be called from the syscall path on a valid kernel stack.
+/// It never returns - it either reschedules to another task or halts.
+///
+/// # Arguments
+///
+/// * `user_rip` - The invalid user RIP that triggered the fallback
+/// * `user_rsp` - The invalid user RSP that triggered the fallback
+#[no_mangle]
+extern "C" fn syscall_bad_return(user_rip: u64, user_rsp: u64) -> ! {
+    println!(
+        "syscall: SECURITY - rejecting invalid return RIP=0x{:x} RSP=0x{:x}",
+        user_rip, user_rsp
+    );
+
+    // Terminate the current process with SIGSEGV-style exit code
+    if let Some(pid) = kernel_core::process::current_pid() {
+        // Exit code 128 + 11 = 139 (SIGSEGV)
+        kernel_core::process::terminate_process(pid, 139);
+        kernel_core::process::cleanup_zombie(pid);
+    }
+
+    // Never resume to user; let scheduler pick a new task.
+    // We're on the kernel stack in interrupt-disabled state (cli was executed in asm).
+    // The scheduler will handle finding the next runnable task.
+    kernel_core::scheduler_hook::force_reschedule();
+
+    // If schedule() somehow returns (e.g., no other tasks), halt the CPU
+    loop {
+        x86_64::instructions::hlt();
+    }
 }
 
 #[cfg(test)]

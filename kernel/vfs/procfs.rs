@@ -21,6 +21,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_core::FileOps;
 // R29-1 FIX: Import process module for real process information
 use kernel_core::process::{self, ProcessState, PROCESS_TABLE};
+// R36 FIX: Import time module for uptime and mm for memory stats
+use kernel_core::time;
+use mm::memory::FrameAllocator;
+use mm::page_cache::PAGE_CACHE;
 use spin::RwLock;
 
 /// Global procfs ID counter
@@ -1263,25 +1267,86 @@ fn generate_stat(pid: u32) -> String {
 }
 
 /// Generate /proc/[pid]/maps content
-fn generate_maps(_pid: u32) -> String {
-    // TODO: Get actual memory maps from process
-    String::from(
-        "00400000-00401000 r-xp 00000000 00:00 0    [code]\n\
-         7fffffffe000-7ffffffff000 rw-p 00000000 00:00 0    [stack]\n",
-    )
+///
+/// Shows the memory mappings for the process in Linux format:
+/// address           perms offset  dev   inode   pathname
+fn generate_maps(pid: u32) -> String {
+    let table = PROCESS_TABLE.lock();
+    if let Some(Some(proc)) = table.get(pid as usize) {
+        let proc = proc.lock();
+        let mut result = String::new();
+
+        // Output mmap regions
+        // R36-FIX: Use 16 hex digits for 64-bit addresses
+        for (&start, &size) in &proc.mmap_regions {
+            let end = start + size;
+            // Format: start-end perms offset dev:inode pathname
+            result.push_str(&format!(
+                "{:016x}-{:016x} rw-p 00000000 00:00 0    [anon]\n",
+                start, end
+            ));
+        }
+
+        // Add stack mapping if present
+        if let Some(user_stack) = proc.user_stack {
+            let stack_top = user_stack.as_u64();
+            let stack_bottom = stack_top.saturating_sub(0x10000); // 64KB stack
+            result.push_str(&format!(
+                "{:016x}-{:016x} rw-p 00000000 00:00 0    [stack]\n",
+                stack_bottom, stack_top
+            ));
+        }
+
+        if result.is_empty() {
+            // Fallback if no mappings
+            result.push_str("0000000000400000-0000000000401000 r-xp 00000000 00:00 0    [code]\n");
+        }
+
+        result
+    } else {
+        // Process not found, return empty
+        String::new()
+    }
 }
 
 /// Generate /proc/meminfo content
+///
+/// Shows real memory statistics from the buddy allocator and page cache.
 fn generate_meminfo() -> String {
-    // TODO: Get actual memory info from mm
+    let mem_stats = FrameAllocator::new().stats();
+    let cache_stats = PAGE_CACHE.stats();
+
+    // Convert pages to KB (4KB pages)
+    let total_kb = mem_stats.total_physical_pages * 4;
+    let free_kb = mem_stats.free_physical_pages * 4;
+    let used_kb = mem_stats.used_physical_pages * 4;
+    let cached_kb = cache_stats.nr_pages as usize * 4;
+    let buffers_kb = cache_stats.nr_dirty as usize * 4;
+    let available_kb = free_kb + cached_kb;
+
     format!(
-        "MemTotal:      131072 kB\n\
-         MemFree:        65536 kB\n\
-         MemAvailable:   65536 kB\n\
-         Buffers:            0 kB\n\
-         Cached:          4096 kB\n\
-         SwapTotal:          0 kB\n\
-         SwapFree:           0 kB\n"
+        "MemTotal:       {:8} kB\n\
+         MemFree:        {:8} kB\n\
+         MemAvailable:   {:8} kB\n\
+         Buffers:        {:8} kB\n\
+         Cached:         {:8} kB\n\
+         SwapTotal:      {:8} kB\n\
+         SwapFree:       {:8} kB\n\
+         Active:         {:8} kB\n\
+         Inactive:       {:8} kB\n\
+         Dirty:          {:8} kB\n\
+         KernelHeap:     {:8} kB\n",
+        total_kb,
+        free_kb,
+        available_kb,
+        buffers_kb,
+        cached_kb,
+        0,  // SwapTotal - no swap
+        0,  // SwapFree - no swap
+        used_kb,  // Active = used pages
+        cached_kb,  // Inactive = cached pages
+        buffers_kb,  // Dirty = dirty pages in cache
+        mem_stats.heap_used_bytes / 1024,
     )
 }
 
@@ -1302,7 +1367,19 @@ fn generate_cpuinfo() -> String {
 }
 
 /// Generate /proc/uptime content
+///
+/// Shows system uptime in seconds (timer tick count / 1000 assuming 1kHz timer).
+/// Format: uptime_seconds idle_seconds
 fn generate_uptime() -> String {
-    // TODO: Get actual uptime from timer
-    String::from("0.00 0.00\n")
+    let ticks = time::get_ticks();
+    // Assuming timer runs at 1000 Hz (1 tick = 1 ms)
+    let uptime_secs = ticks / 1000;
+    let uptime_frac = (ticks % 1000) / 10; // Two decimal places
+
+    // Idle time is approximated as a portion of uptime (simplified)
+    // In a real system, this would track actual CPU idle time
+    let idle_secs = uptime_secs / 2; // Rough approximation
+    let idle_frac = uptime_frac;
+
+    format!("{}.{:02} {}.{:02}\n", uptime_secs, uptime_frac, idle_secs, idle_frac)
 }

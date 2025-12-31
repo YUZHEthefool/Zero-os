@@ -241,26 +241,49 @@ impl SeccompFilter {
                     acc >>= shift;
                     pc += 1;
                 }
+                // R32-SECCOMP-2 FIX: All jump instructions must validate pc bounds
+                // after increment. If pc escapes program bounds, fail-closed with Trap.
                 SeccompInsn::JmpEq(val, t, f) => {
                     pc += 1 + if acc == val { t as usize } else { f as usize };
+                    if pc >= self.prog.len() {
+                        return SeccompAction::Trap;
+                    }
                 }
                 SeccompInsn::JmpNe(val, t, f) => {
                     pc += 1 + if acc != val { t as usize } else { f as usize };
+                    if pc >= self.prog.len() {
+                        return SeccompAction::Trap;
+                    }
                 }
                 SeccompInsn::JmpLt(val, t, f) => {
                     pc += 1 + if acc < val { t as usize } else { f as usize };
+                    if pc >= self.prog.len() {
+                        return SeccompAction::Trap;
+                    }
                 }
                 SeccompInsn::JmpLe(val, t, f) => {
                     pc += 1 + if acc <= val { t as usize } else { f as usize };
+                    if pc >= self.prog.len() {
+                        return SeccompAction::Trap;
+                    }
                 }
                 SeccompInsn::JmpGt(val, t, f) => {
                     pc += 1 + if acc > val { t as usize } else { f as usize };
+                    if pc >= self.prog.len() {
+                        return SeccompAction::Trap;
+                    }
                 }
                 SeccompInsn::JmpGe(val, t, f) => {
                     pc += 1 + if acc >= val { t as usize } else { f as usize };
+                    if pc >= self.prog.len() {
+                        return SeccompAction::Trap;
+                    }
                 }
                 SeccompInsn::Jmp(offset) => {
                     pc += 1 + offset as usize;
+                    if pc >= self.prog.len() {
+                        return SeccompAction::Trap;
+                    }
                 }
                 SeccompInsn::Ret(action) => {
                     return action;

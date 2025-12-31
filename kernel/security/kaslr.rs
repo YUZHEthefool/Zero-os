@@ -6,9 +6,51 @@
 //! # Current Implementation (Phase A.4)
 //!
 //! - PCID detection and CR4.PCIDE enablement
+//! - PCID allocation/free for process-level TLB tagging
 //! - KASLR slide generation (2 MiB aligned, 0-512 MiB range)
 //! - KernelLayout: Provides runtime kernel location info
 //! - KPTI stubs: No-op hooks for future CR3 switching
+//!
+//! # Implementation Status
+//!
+//! | Feature | Status | Notes |
+//! |---------|--------|-------|
+//! | PCID detection | ✅ Complete | CR4.PCIDE enabled if CPU supports |
+//! | PCID allocation | ✅ Complete | Bitmap-based allocator (1-4095) |
+//! | KASLR slide gen | ✅ Complete | Uses CSPRNG, 2 MiB aligned |
+//! | KASLR actual | ❌ Requires bootloader | Kernel load at fixed address |
+//! | KPTI framework | 🚧 Stubs only | Needs dual page tables from MM |
+//! | KPTI CR3 switch | ❌ Blocked | Requires MM dual-root support |
+//!
+//! # Blocking Dependencies
+//!
+//! ## KASLR (Actual Kernel Relocation)
+//!
+//! The kernel is currently loaded at a fixed physical address (0x100000) by
+//! the UEFI bootloader. True KASLR requires:
+//!
+//! 1. Bootloader generates random slide value
+//! 2. Bootloader loads kernel at (base + slide)
+//! 3. Bootloader passes slide to kernel via boot info
+//! 4. Kernel adjusts all absolute addresses
+//!
+//! This requires bootloader cooperation - see bootloader/src/main.rs.
+//!
+//! ## KPTI (Dual Page Tables)
+//!
+//! Full KPTI requires separate page table hierarchies:
+//!
+//! - **User CR3**: User mappings + minimal trampoline (syscall entry/exit code)
+//! - **Kernel CR3**: User mappings + full kernel
+//!
+//! The memory manager (kernel/mm/) would need to:
+//!
+//! 1. Allocate two PML4 roots per process
+//! 2. Clone user mappings to both roots
+//! 3. Map full kernel only in kernel CR3
+//! 4. Map trampoline in both (USER | PRESENT | not-WRITABLE)
+//!
+//! Until MM provides dual-root support, KPTI hooks remain inert.
 //!
 //! # Design
 //!
@@ -55,6 +97,26 @@ static KPTI_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Whether PCID is enabled (set during init if CPU supports it)
 static PCID_ENABLED: AtomicBool = AtomicBool::new(false);
+
+// ============================================================================
+// PCID Allocation Constants
+// ============================================================================
+
+/// Minimum valid PCID (0 is reserved for non-PCID CR3 loads)
+const MIN_PCID: u16 = 1;
+
+/// Maximum valid PCID (12-bit field, 0-4095, but 0 is reserved)
+const MAX_PCID: u16 = 4095;
+
+/// Number of u64 words needed to track all PCIDs as a bitmap
+/// (4096 bits / 64 bits per word) = 64 words
+const PCID_BITMAP_WORDS: usize = 64;
+
+/// Bitmap tracking allocated PCIDs to avoid reuse collisions.
+///
+/// Each bit represents a PCID (0-4095). Bit set = allocated, clear = free.
+/// Protected by Mutex for concurrent access from process creation/destruction.
+static PCID_BITMAP: Mutex<[u64; PCID_BITMAP_WORDS]> = Mutex::new([0; PCID_BITMAP_WORDS]);
 
 // ============================================================================
 // KASLR Configuration Constants
@@ -672,6 +734,120 @@ pub fn is_pcid_enabled() -> bool {
 }
 
 // ============================================================================
+// PCID Allocation
+// ============================================================================
+
+/// Convert a PCID to its bitmap index and bit mask.
+///
+/// # Arguments
+///
+/// * `pcid` - The PCID value (0-4095)
+///
+/// # Returns
+///
+/// Tuple of (word index, bit mask) for the bitmap
+#[inline]
+fn pcid_index_and_mask(pcid: u16) -> (usize, u64) {
+    let idx = (pcid as usize) / 64;
+    let bit = (pcid as usize) % 64;
+    (idx, 1u64 << bit)
+}
+
+/// Allocate a new PCID for a process.
+///
+/// PCIDs (Process Context Identifiers) allow the CPU to tag TLB entries
+/// with a process ID, reducing TLB flushes on context switch when KPTI
+/// is enabled.
+///
+/// # Returns
+///
+/// * `Some(pcid)` - A valid PCID in the range 1-4095
+/// * `None` - If PCID is not enabled or all PCIDs are exhausted
+///
+/// # Note
+///
+/// PCID 0 is reserved and never allocated. When PCID is disabled in CR4,
+/// all CR3 loads implicitly use PCID 0.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// if let Some(pcid) = allocate_pcid() {
+///     process.kpti_ctx.pcid = pcid;
+/// }
+/// ```
+pub fn allocate_pcid() -> Option<u16> {
+    if !is_pcid_enabled() {
+        return None;
+    }
+
+    let mut bitmap = PCID_BITMAP.lock();
+
+    // Search for first free PCID (bit not set)
+    // Start from MIN_PCID to skip reserved PCID 0
+    for pcid in MIN_PCID..=MAX_PCID {
+        let (idx, mask) = pcid_index_and_mask(pcid);
+        if bitmap[idx] & mask == 0 {
+            // Mark as allocated
+            bitmap[idx] |= mask;
+            return Some(pcid);
+        }
+    }
+
+    // All PCIDs exhausted
+    None
+}
+
+/// Free a previously allocated PCID.
+///
+/// Returns the PCID to the pool for reuse by future processes.
+/// Invalid PCIDs (0 or >4095) are silently ignored.
+///
+/// # Arguments
+///
+/// * `pcid` - The PCID to free (must be 1-4095)
+///
+/// # Safety
+///
+/// The caller must ensure the PCID is no longer in use by any CPU's CR3
+/// and that all TLB entries for this PCID have been flushed.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // During process cleanup
+/// if process.kpti_ctx.pcid != 0 {
+///     free_pcid(process.kpti_ctx.pcid);
+/// }
+/// ```
+pub fn free_pcid(pcid: u16) {
+    // Validate PCID range (0 is reserved, >4095 is invalid)
+    if pcid < MIN_PCID || pcid > MAX_PCID {
+        return;
+    }
+
+    let (idx, mask) = pcid_index_and_mask(pcid);
+    let mut bitmap = PCID_BITMAP.lock();
+    bitmap[idx] &= !mask;
+}
+
+/// Get the number of currently allocated PCIDs.
+///
+/// Useful for debugging and monitoring PCID usage.
+///
+/// # Returns
+///
+/// Count of allocated PCIDs (0 if PCID is disabled)
+pub fn allocated_pcid_count() -> usize {
+    if !is_pcid_enabled() {
+        return 0;
+    }
+
+    let bitmap = PCID_BITMAP.lock();
+    bitmap.iter().map(|w| w.count_ones() as usize).sum()
+}
+
+// ============================================================================
 // KASLR Slide Generation
 // ============================================================================
 
@@ -886,5 +1062,43 @@ mod tests {
         // Max slots should be 256 (512 MiB / 2 MiB)
         let max_slots = KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY;
         assert_eq!(max_slots, 256);
+    }
+
+    #[test]
+    fn test_pcid_index_and_mask() {
+        // Test PCID 0
+        let (idx, mask) = pcid_index_and_mask(0);
+        assert_eq!(idx, 0);
+        assert_eq!(mask, 1);
+
+        // Test PCID 63 (last bit of first word)
+        let (idx, mask) = pcid_index_and_mask(63);
+        assert_eq!(idx, 0);
+        assert_eq!(mask, 1u64 << 63);
+
+        // Test PCID 64 (first bit of second word)
+        let (idx, mask) = pcid_index_and_mask(64);
+        assert_eq!(idx, 1);
+        assert_eq!(mask, 1);
+
+        // Test MAX_PCID (4095)
+        let (idx, mask) = pcid_index_and_mask(MAX_PCID);
+        assert_eq!(idx, 63);  // 4095 / 64 = 63
+        assert_eq!(mask, 1u64 << 63);  // 4095 % 64 = 63
+    }
+
+    #[test]
+    fn test_pcid_bitmap_size() {
+        // Verify bitmap has enough words for all PCIDs
+        assert_eq!(PCID_BITMAP_WORDS, 64);  // 4096 bits / 64 bits per word
+        assert!(PCID_BITMAP_WORDS * 64 >= (MAX_PCID as usize + 1));
+    }
+
+    #[test]
+    fn test_pcid_constants() {
+        // PCID 0 is reserved
+        assert_eq!(MIN_PCID, 1);
+        // PCID is a 12-bit field
+        assert_eq!(MAX_PCID, 4095);
     }
 }

@@ -22,6 +22,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spin::{Mutex, RwLock};
+use x86_64::{structures::paging::PhysFrame, PhysAddr};
+
+use crate::buddy_allocator;
 
 /// Page size constant (4KB)
 pub const PAGE_SIZE: usize = 4096;
@@ -182,6 +185,17 @@ impl PageCacheEntry {
         self.refcount.load(Ordering::Acquire) == 0
             && !self.is_dirty()
             && self.io_lock.try_lock().is_some()
+    }
+}
+
+// R36-FIX: Implement Drop to free physical frame when page cache entry is dropped.
+// This prevents memory leaks when pages are evicted from the cache during shrink().
+impl Drop for PageCacheEntry {
+    fn drop(&mut self) {
+        // Free the physical frame back to the buddy allocator
+        let phys_addr = self.pfn * PAGE_SIZE as u64;
+        let frame = PhysFrame::containing_address(PhysAddr::new(phys_addr));
+        buddy_allocator::free_physical_pages(frame, 1);
     }
 }
 
@@ -674,8 +688,7 @@ impl GlobalPageCache {
             self.nr_pages.fetch_sub(1, Ordering::Relaxed);
             reclaimed += 1;
 
-            // Note: The physical page frame should be freed by the caller
-            // when the Arc is dropped and refcount reaches 0
+            // R36-FIX: Physical frame is freed by Drop impl when Arc refcount reaches 0
         }
 
         reclaimed
@@ -756,8 +769,7 @@ pub fn find_or_create_page(
         Ok(p) => Some(p),
         Err(existing) => {
             // Race: another thread added the page first
-            // Free our allocated page and use the existing one
-            // (In real implementation, would free pfn here)
+            // Our page's Arc is dropped here, Drop impl frees the physical frame (R36-FIX)
             Some(existing)
         }
     }

@@ -32,7 +32,7 @@ security = { path = "security" }
 vfs = { path = "vfs" }
 audit = { path = "audit" }
 cap = { path = "cap" }
-lsm = { path = "lsm" }
+lsm = { path = "lsm", features = ["lsm"] }
 seccomp = { path = "seccomp" }
 block = { path = "block" }
 

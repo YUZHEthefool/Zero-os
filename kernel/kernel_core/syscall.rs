@@ -1510,6 +1510,21 @@ fn sys_clone(
     {
         let mut child = child_arc.lock();
 
+        // R33-2 FIX: When parent is installing seccomp, block any shared-VM clone
+        // (CLONE_VM with or without CLONE_THREAD) to prevent sandbox escape.
+        // An attacker could race seccomp installation by spawning a CLONE_VM child
+        // that shares the address space but escapes the pending filter.
+        if is_shared_space && parent_seccomp_installing {
+            child.state = ProcessState::Terminated;
+            drop(child);
+            crate::process::terminate_process(child_pid, -1);
+            println!(
+                "sys_clone: rejecting CLONE_VM during seccomp installation (pid={})",
+                parent_pid
+            );
+            return Err(SyscallError::EBUSY);
+        }
+
         // 设置线程标识
         child.tid = child_pid; // tid == pid (Linux 语义)
         if flags & CLONE_THREAD != 0 {
@@ -1737,12 +1752,31 @@ fn sys_exec(
     use crate::elf_loader::{load_elf, USER_STACK_SIZE};
     use crate::fork::create_fresh_address_space;
     use crate::process::{
-        activate_memory_space, current_pid, free_address_space, get_process, ProcessState,
+        activate_memory_space, current_pid, free_address_space, get_process, thread_group_size,
+        ProcessState,
     };
 
     // 获取当前进程
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // R33-1 FIX: Refuse exec while other threads share this address space.
+    // Calling exec in a multithreaded process would free the page tables while
+    // sibling threads are still executing, causing UAF/memory corruption.
+    // Linux behavior: exec in multithreaded process kills other threads first,
+    // but that requires complex thread group handling. For now, reject with EBUSY.
+    let tgid = {
+        let proc = process.lock();
+        proc.tgid
+    };
+    if thread_group_size(tgid) > 1 {
+        println!(
+            "sys_exec: refusing exec in multithreaded process (tgid={}, threads={})",
+            tgid,
+            thread_group_size(tgid)
+        );
+        return Err(SyscallError::EBUSY);
+    }
 
     // 验证参数：非空、合理大小
     if image.is_null() || image_len == 0 {
@@ -3166,8 +3200,13 @@ fn sys_mmap(
     // 对齐到页边界（使用 checked_add 防止整数溢出）
     let length_aligned = length.checked_add(0xfff).ok_or(SyscallError::EINVAL)? & !0xfff;
 
-    // 构建页表标志
-    let mut page_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    // R32-SC-1 FIX: PROT_NONE (prot=0) should create non-present mapping
+    // that faults on access (guard page behavior). Mirror sys_mprotect.
+    let mut page_flags = if prot == 0 {
+        PageTableFlags::empty()
+    } else {
+        PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE
+    };
 
     // PROT_WRITE
     if prot & 0x2 != 0 {

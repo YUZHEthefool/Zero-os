@@ -114,6 +114,9 @@ fn read_bar(bus: u8, dev: u8, func: u8, bar: u8) -> Option<u64> {
     let off = PCI_BAR0_OFFSET + bar * 4;
     let low = pci_config_read32(bus, dev, func, off);
 
+    // DEBUG: Print raw BAR value
+    // println!("      [BAR] bar{} raw low={:#x}", bar, low);
+
     // Check if this is an I/O BAR (bit 0 = 1)
     if low & 1 != 0 {
         return None;
@@ -193,6 +196,10 @@ fn read_virtio_pci_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
                     }
                     VIRTIO_PCI_CAP_NOTIFY_CFG => {
                         caps.notify_base = phys;
+                        // R34-VIRTIO-1 FIX: Read notify capability length for bounds checking
+                        // The length field is at offset 12-15 within the capability structure
+                        let notify_len = pci_config_read32(bus, dev, func, ptr + 12);
+                        caps.notify_len = notify_len;
                         // Notify capability has extra field at offset 16
                         if cap_len >= 20 {
                             caps.notify_off_multiplier =

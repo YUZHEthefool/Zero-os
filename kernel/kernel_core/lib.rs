@@ -43,6 +43,8 @@ pub use process::{
     evaluate_seccomp,
     has_no_new_privs,
     has_seccomp_enabled,
+    // Thread group support (R33-1 fix)
+    thread_group_size,
     // DAC support
     Credentials,
     FileDescriptor,

@@ -216,6 +216,8 @@ impl VirtioTransport {
                 write_volatile(&mut (*t.common_cfg).queue_desc, desc_phys);
                 write_volatile(&mut (*t.common_cfg).queue_avail, avail_phys);
                 write_volatile(&mut (*t.common_cfg).queue_used, used_phys);
+                // Memory barrier to ensure all writes complete
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             }
         }
     }
@@ -233,6 +235,8 @@ impl VirtioTransport {
             VirtioTransport::Pci(t) => {
                 write_volatile(&mut (*t.common_cfg).queue_select, queue);
                 write_volatile(&mut (*t.common_cfg).queue_enable, if ready { 1 } else { 0 });
+                // Memory barrier to ensure writes are flushed
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             }
         }
     }
@@ -251,10 +255,32 @@ impl VirtioTransport {
                 t.write_reg(mmio::QUEUE_NOTIFY, queue as u32);
             }
             VirtioTransport::Pci(t) => {
-                let offset = (notify_off as u32)
-                    .wrapping_mul(t.notify_off_multiplier) as usize;
-                let notify_ptr = t.notify_base.add(offset) as *mut u16;
+                // R34-VIRTIO-1 FIX: Check for overflow and bounds before MMIO write
+                // A malicious device could set notify_off_multiplier to cause overflow
+                // or point outside the mapped notify region.
+                let offset_bytes = match (notify_off as u32).checked_mul(t.notify_off_multiplier) {
+                    Some(off) => off,
+                    None => {
+                        // Overflow in offset calculation - drop the notify silently
+                        // This prevents writing to arbitrary memory locations
+                        return;
+                    }
+                };
+                // R35-VIRTIO-1 FIX: Zero-length notify regions are invalid. from_addrs()
+                // already rejects notify_len < 2, but add runtime check as defense-in-depth.
+                // This prevents OOB MMIO writes if device configuration is corrupted.
+                if t.notify_len == 0 {
+                    return;
+                }
+                // Bounds check: offset + 2 (u16 write) must fit within notify window
+                if offset_bytes > t.notify_len.saturating_sub(2) {
+                    // Offset exceeds notify window - drop the notify
+                    return;
+                }
+                let notify_ptr = t.notify_base.add(offset_bytes as usize) as *mut u16;
                 write_volatile(notify_ptr, queue);
+                // Memory barrier after notify
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             }
         }
     }
@@ -361,6 +387,8 @@ pub struct VirtioPciAddrs {
     pub common_cfg: u64,
     /// Notification structure base physical address
     pub notify_base: u64,
+    /// R34-VIRTIO-1 FIX: Notification capability length (bytes) for bounds checking
+    pub notify_len: u32,
     /// Notify offset multiplier (from notify capability)
     pub notify_off_multiplier: u32,
     /// ISR status register physical address
@@ -400,13 +428,11 @@ pub struct VirtioPciCommonCfg {
     pub queue_enable: u16,
     /// Queue notify offset
     pub queue_notify_off: u16,
-    /// Reserved for queue_notify_data in newer spec
-    _reserved: u16,
-    /// Queue descriptor table address
+    /// Queue descriptor table address (offset 0x20 in VirtIO 1.1 spec)
     pub queue_desc: u64,
-    /// Queue available ring address
+    /// Queue available ring address (offset 0x28)
     pub queue_avail: u64,
-    /// Queue used ring address
+    /// Queue used ring address (offset 0x30)
     pub queue_used: u64,
 }
 
@@ -418,6 +444,8 @@ pub struct VirtioPciTransport {
     pub(crate) common_cfg: *mut VirtioPciCommonCfg,
     /// Pointer to notification base
     pub(crate) notify_base: *mut u8,
+    /// R34-VIRTIO-1 FIX: Size of notification structure (bytes) for bounds checking
+    pub(crate) notify_len: u32,
     /// Notify offset multiplier
     pub(crate) notify_off_multiplier: u32,
     /// Pointer to ISR status
@@ -446,27 +474,33 @@ impl VirtioPciTransport {
     /// Caller must ensure the MMIO regions are properly mapped.
     pub unsafe fn from_addrs(addrs: VirtioPciAddrs, virt_offset: u64) -> Option<Self> {
         // Validate required capabilities
+        // R35-VIRTIO-1 FIX: Modern notify capability must advertise a usable window (>= 2 bytes)
+        // to allow at least one u16 notify write. Zero-length notify regions are rejected
+        // to prevent OOB MMIO writes from malicious/misconfigured devices.
         if addrs.virtio_device_type == 0
             || addrs.common_cfg == 0
             || addrs.notify_base == 0
             || addrs.device_cfg == 0
+            || addrs.notify_len < 2
         {
             return None;
         }
 
-        let common_cfg = (addrs.common_cfg + virt_offset) as *mut VirtioPciCommonCfg;
-        let notify_base = (addrs.notify_base + virt_offset) as *mut u8;
+        // Use wrapping_add for offset calculation (virt_offset may be negative when cast to u64)
+        let common_cfg = addrs.common_cfg.wrapping_add(virt_offset) as *mut VirtioPciCommonCfg;
+        let notify_base = addrs.notify_base.wrapping_add(virt_offset) as *mut u8;
         let isr = if addrs.isr != 0 {
-            (addrs.isr + virt_offset) as *mut u8
+            addrs.isr.wrapping_add(virt_offset) as *mut u8
         } else {
             core::ptr::null_mut()
         };
-        let device_cfg = (addrs.device_cfg + virt_offset) as *mut u8;
+        let device_cfg = addrs.device_cfg.wrapping_add(virt_offset) as *mut u8;
 
         Some(Self {
             virtio_device_type: addrs.virtio_device_type as u32,
             common_cfg,
             notify_base,
+            notify_len: addrs.notify_len,
             notify_off_multiplier: addrs.notify_off_multiplier,
             isr,
             device_cfg,
