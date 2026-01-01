@@ -43,7 +43,10 @@ const KSTACK_GUARD_PAGES: usize = 1;
 type SchedulerCleanupCallback = fn(ProcessId);
 
 /// IPC清理回调类型
-type IpcCleanupCallback = fn(ProcessId);
+/// R37-2 FIX (Codex review): Pass both PID and TGID to avoid deadlock.
+/// The callback is called from free_process_resources which already holds the process lock,
+/// so the callback must not try to lock the process again.
+type IpcCleanupCallback = fn(ProcessId, ProcessId); // (pid, tgid)
 
 /// 调度器添加进程回调类型
 ///
@@ -749,6 +752,58 @@ pub fn thread_group_size(tgid: ProcessId) -> usize {
         .count()
 }
 
+/// R37-1 FIX: Count live tasks sharing the same address space (CLONE_VM siblings).
+///
+/// Returns 0 if no valid memory_space is set.
+/// Used to detect CLONE_VM processes for seccomp TSYNC enforcement.
+pub fn address_space_share_count(memory_space: usize) -> usize {
+    if memory_space == 0 {
+        return 0;
+    }
+    let table = PROCESS_TABLE.lock();
+    table
+        .iter()
+        .filter(|slot| {
+            if let Some(p) = slot {
+                let p = p.lock();
+                p.memory_space == memory_space
+                    && p.state != ProcessState::Zombie
+                    && p.state != ProcessState::Terminated
+            } else {
+                false
+            }
+        })
+        .count()
+}
+
+/// R37-1 FIX (Codex review): Count CLONE_VM siblings that are NOT in the same thread group.
+///
+/// CLONE_THREAD siblings share memory_space AND have the same tgid - these can be TSYNC'd.
+/// Pure CLONE_VM siblings share memory_space but have DIFFERENT tgid - these cannot be TSYNC'd.
+///
+/// This function returns the count of processes that share the same memory_space but have
+/// a different tgid than the caller. If count > 0, TSYNC must be rejected.
+pub fn non_thread_group_vm_share_count(memory_space: usize, caller_tgid: ProcessId) -> usize {
+    if memory_space == 0 {
+        return 0;
+    }
+    let table = PROCESS_TABLE.lock();
+    table
+        .iter()
+        .filter(|slot| {
+            if let Some(p) = slot {
+                let p = p.lock();
+                p.memory_space == memory_space
+                    && p.tgid != caller_tgid // Different thread group = pure CLONE_VM sibling
+                    && p.state != ProcessState::Zombie
+                    && p.state != ProcessState::Terminated
+            } else {
+                false
+            }
+        })
+        .count()
+}
+
 /// 设置当前进程ID
 pub fn set_current_pid(pid: Option<ProcessId>) {
     *CURRENT_PID.lock() = pid;
@@ -1149,10 +1204,11 @@ fn notify_scheduler_process_removed(pid: ProcessId) {
 }
 
 /// 通知IPC子系统清理进程端点
-fn notify_ipc_process_cleanup(pid: ProcessId) {
+/// R37-2 FIX (Codex review): Pass TGID to avoid re-locking the process in callback.
+fn notify_ipc_process_cleanup(pid: ProcessId, tgid: ProcessId) {
     let callback = *IPC_CLEANUP.lock();
     if let Some(cb) = callback {
-        cb(pid);
+        cb(pid, tgid);
     }
 }
 
@@ -1479,7 +1535,8 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
     }
 
     // 通知 IPC 子系统清理进程端点（通过回调避免循环依赖）
-    notify_ipc_process_cleanup(proc.pid);
+    // R37-2 FIX (Codex review): Pass TGID to avoid deadlock from re-locking this process
+    notify_ipc_process_cleanup(proc.pid, proc.tgid);
 
     if region_count > 0 {
         println!(

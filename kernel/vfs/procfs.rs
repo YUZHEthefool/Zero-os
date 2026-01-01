@@ -1039,7 +1039,11 @@ fn get_current_creds() -> (u32, u32) {
 /// Allow access if any of the following conditions are met:
 /// - Accessing own process (self)
 /// - Caller is root (uid 0)
-/// - Caller has same owner UID or GID as target process
+/// - Caller has same owner UID as target process
+///
+/// R37-6 FIX: Removed same-GID check. Allowing same-GID access is a security
+/// vulnerability that lets group members snoop on each other's process info.
+/// Linux /proc only allows same-UID or root access for sensitive data.
 fn can_access_pid(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -1051,13 +1055,13 @@ fn can_access_pid(pid: u32) -> bool {
         }
     }
     // Root can access all processes
-    let (cur_uid, cur_gid) = get_current_creds();
+    let (cur_uid, _cur_gid) = get_current_creds();
     if cur_uid == 0 {
         return true;
     }
-    // Same owner/group can access
-    let (owner_uid, owner_gid) = get_process_owner(pid);
-    cur_uid == owner_uid || cur_gid == owner_gid
+    // R37-6 FIX: Only same UID can access; same GID is NOT sufficient
+    let (owner_uid, _owner_gid) = get_process_owner(pid);
+    cur_uid == owner_uid
 }
 
 /// Check if a process exists

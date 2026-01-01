@@ -453,6 +453,14 @@ impl Vfs {
         // 仅有 --x 权限的目录允许通过已知文件名访问，但不允许枚举内容
         // 防止信息泄漏（如枚举 /home 下其他用户的目录名）
         let dir_stat = inode.stat()?;
+
+        // R37-4 FIX: Enforce MAC via LSM before DAC for directory reads.
+        // Access mask 0x05 = MAY_READ | MAY_EXEC (required to enumerate directory).
+        if let Some(task) = LsmProcessCtx::from_current() {
+            lsm::hook_file_permission(&task, dir_stat.ino, 0x05)
+                .map_err(|_| FsError::PermDenied)?;
+        }
+
         if !check_access_permission(&dir_stat, true, false, true) {
             return Err(FsError::PermDenied);
         }
@@ -959,6 +967,14 @@ fn vfs_readdir_callback(fd: i32) -> Result<alloc::vec::Vec<kernel_core::DirEntry
 
     if !file_handle.inode.is_dir() {
         return Err(SyscallError::ENOTDIR);
+    }
+
+    // R37-4 FIX (Codex review): Add MAC check for sys_getdents64.
+    // The path-based readdir() has MAC check, but fd-based readdir must too.
+    let dir_stat = file_handle.inode.stat().map_err(fs_error_to_syscall)?;
+    if let Some(task) = LsmProcessCtx::from_current() {
+        lsm::hook_file_permission(&task, dir_stat.ino, 0x05)
+            .map_err(|_| SyscallError::EACCES)?;
     }
 
     // Read all directory entries

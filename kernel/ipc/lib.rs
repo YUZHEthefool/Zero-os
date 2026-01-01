@@ -266,14 +266,22 @@ fn futex_callback(
 
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
 
+    // R37-2 FIX: Use TGID so futex keys are shared across CLONE_THREAD siblings.
+    // This ensures pthread mutexes/condvars work correctly in multi-threaded programs.
+    let tgid = {
+        let proc_arc = process::get_process(pid).ok_or(SyscallError::ESRCH)?;
+        let proc = proc_arc.lock();
+        proc.tgid
+    };
+
     match op {
-        futex::FUTEX_WAIT => futex_wait(pid, uaddr, val, current_value).map_err(|e| match e {
+        futex::FUTEX_WAIT => futex_wait(tgid, uaddr, val, current_value).map_err(|e| match e {
             FutexError::WouldBlock => SyscallError::EAGAIN,
             FutexError::Fault => SyscallError::EFAULT,
             FutexError::NoProcess => SyscallError::ESRCH,
             FutexError::InvalidOperation => SyscallError::EINVAL,
         }),
-        futex::FUTEX_WAKE => Ok(futex_wake(pid, uaddr, val as usize)),
+        futex::FUTEX_WAKE => Ok(futex_wake(tgid, uaddr, val as usize)),
         _ => Err(SyscallError::EINVAL),
     }
 }
@@ -281,18 +289,22 @@ fn futex_callback(
 /// 进程退出时的 IPC 清理（端点 + futex 表）
 ///
 /// 注册到 kernel_core 的进程清理回调，确保进程退出时自动清理所有 IPC 资源
-fn ipc_cleanup(pid: process::ProcessId) {
+///
+/// R37-2 FIX (Codex review): Accept TGID directly to avoid re-locking the process.
+/// The caller (free_process_resources) already holds the process lock.
+fn ipc_cleanup(pid: process::ProcessId, tgid: process::ProcessId) {
     cleanup_process_endpoints(pid);
-    cleanup_process_futexes(pid);
+    cleanup_process_futexes(pid, tgid);
 }
 
 /// Futex 唤醒回调（用于线程退出时的 clear_child_tid 机制）
 ///
-/// 唤醒等待在指定地址上的进程
+/// 唤醒等待在指定地址上的进程。使用 TGID 作为键，以便线程组内的
+/// 线程能够互相唤醒，保持 pthread 语义。
 ///
 /// # Arguments
 ///
-/// * `tgid` - 线程组ID（用于定位 futex 表）
+/// * `tgid` - 线程组ID（R37-2 FIX: 用于定位 futex 表，确保线程间互操作）
 /// * `uaddr` - 用户空间 futex 地址
 /// * `max_wake` - 最大唤醒数量
 ///
@@ -300,7 +312,7 @@ fn ipc_cleanup(pid: process::ProcessId) {
 ///
 /// 实际唤醒的进程数量
 fn futex_wake_callback(tgid: process::ProcessId, uaddr: usize, max_wake: usize) -> usize {
-    // 使用 tgid 作为键唤醒等待者
+    // R37-2: 使用 tgid 作为键唤醒等待者，确保 CLONE_THREAD 兄弟可以互相唤醒
     futex_wake(tgid, uaddr, max_wake)
 }
 

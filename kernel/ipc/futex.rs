@@ -9,7 +9,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use kernel_core::process::ProcessId;
+use kernel_core::process::{self, ProcessId};
 use spin::Mutex;
 
 use crate::sync::WaitQueue;
@@ -31,7 +31,10 @@ pub enum FutexError {
     NoProcess,
 }
 
-/// Futex 键：(进程ID, 虚拟地址)
+/// Futex 键：(线程组ID, 虚拟地址)
+/// 使用 TGID 确保同一线程组内的线程共享同一个 futex 键，
+/// 保持 POSIX/pthread 语义的向后兼容性。
+/// R37-2 FIX: 修改为使用 TGID 而非 PID
 type FutexKey = (ProcessId, usize);
 
 /// 单个 futex 地址的等待状态
@@ -112,7 +115,7 @@ fn read_user_u32(uaddr: usize) -> Result<u32, FutexError> {
 ///
 /// # Arguments
 ///
-/// * `pid` - 进程 ID
+/// * `tgid` - 线程组 ID (R37-2 FIX: 使用 TGID 而非 PID)
 /// * `uaddr` - 用户空间 futex 地址（已验证）
 /// * `expected` - 期望的值
 /// * `current_value` - 当前从用户空间读取的值（调用者负责验证和读取）
@@ -121,7 +124,7 @@ fn read_user_u32(uaddr: usize) -> Result<u32, FutexError> {
 ///
 /// 成功阻塞并被唤醒后返回 Ok(0)，值不匹配返回 WouldBlock
 pub fn futex_wait(
-    pid: ProcessId,
+    tgid: ProcessId,
     uaddr: usize,
     expected: u32,
     current_value: u32,
@@ -131,7 +134,8 @@ pub fn futex_wait(
         return Err(FutexError::WouldBlock);
     }
 
-    let key = (pid, uaddr);
+    // R37-2 FIX: Futex key is scoped by TGID so CLONE_THREAD siblings can wake each other
+    let key = (tgid, uaddr);
 
     // 获取或创建此地址的等待桶
     let bucket = get_or_create_bucket(key);
@@ -200,15 +204,16 @@ pub fn futex_wait(
 ///
 /// # Arguments
 ///
-/// * `pid` - 进程 ID
+/// * `tgid` - 线程组 ID (R37-2 FIX: 使用 TGID 而非 PID)
 /// * `uaddr` - 用户空间 futex 地址
 /// * `n` - 最多唤醒的进程数量
 ///
 /// # Returns
 ///
 /// 实际唤醒的进程数量
-pub fn futex_wake(pid: ProcessId, uaddr: usize, n: usize) -> usize {
-    let key = (pid, uaddr);
+pub fn futex_wake(tgid: ProcessId, uaddr: usize, n: usize) -> usize {
+    // R37-2 FIX: Futex key is scoped by TGID
+    let key = (tgid, uaddr);
 
     // 查找此地址的等待桶
     let bucket = {
@@ -237,13 +242,29 @@ pub fn futex_wake(pid: ProcessId, uaddr: usize, n: usize) -> usize {
 
 /// 清理进程的所有 futex 等待队列
 ///
-/// 进程退出时调用，唤醒所有等待者并移除该进程的所有 futex 条目
-pub fn cleanup_process_futexes(pid: ProcessId) {
+/// 进程/线程退出时调用，唤醒所有等待者并移除该进程的所有 futex 条目。
+///
+/// R37-2 FIX: 如果退出的线程还有 CLONE_THREAD 兄弟线程存活，则保留 TGID 的
+/// futex 桶，避免清除正在使用的 futex。这保持了 pthread 语义。
+///
+/// R37-2 FIX (Codex review): Accept TGID directly from caller to avoid deadlock.
+/// The caller (free_process_resources) already holds the process lock, so we must
+/// not try to lock the process again.
+pub fn cleanup_process_futexes(_pid: ProcessId, tgid: ProcessId) {
+    // R37-2 FIX (Codex review): Use TGID provided by caller, not from process lock.
+    // Check thread group size without locking the current process.
+    let group_size = process::thread_group_size(tgid);
+
+    // 如果线程组还有其他活跃线程，不清理 futex
+    if group_size > 1 {
+        return;
+    }
+
     let mut table = FUTEX_TABLE.lock();
 
-    // 收集要移除的键
+    // 收集要移除的键 (使用 TGID 而非 PID)
     let keys_to_remove: alloc::vec::Vec<FutexKey> =
-        table.keys().filter(|(p, _)| *p == pid).cloned().collect();
+        table.keys().filter(|(p, _)| *p == tgid).cloned().collect();
 
     // 唤醒所有等待者并移除条目
     for key in keys_to_remove {

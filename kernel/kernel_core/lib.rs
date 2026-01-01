@@ -45,6 +45,9 @@ pub use process::{
     has_seccomp_enabled,
     // Thread group support (R33-1 fix)
     thread_group_size,
+    // CLONE_VM sibling detection (R37-1 fix)
+    address_space_share_count,
+    non_thread_group_vm_share_count,
     // DAC support
     Credentials,
     FileDescriptor,

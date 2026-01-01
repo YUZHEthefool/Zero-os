@@ -50,6 +50,85 @@ unsafe fn serial_write_str(s: &str) {
     }
 }
 
+/// Test block device write/read path end-to-end
+///
+/// Writes a test pattern to the last sectors of the device (safe area outside filesystem),
+/// reads it back, and verifies the data matches. This exercises the full write path
+/// through virtio-blk without requiring filesystem write support.
+fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
+    use alloc::vec;
+
+    // Skip if device is read-only
+    if device.is_read_only() {
+        println!("        [SKIP] Device is read-only");
+        return true;
+    }
+
+    let capacity = device.capacity_sectors();
+    let sector_size = device.sector_size() as usize;
+
+    // Need at least 2 sectors for test (use last 2 sectors)
+    if capacity < 4 {
+        println!("        [SKIP] Device too small for write test");
+        return true;
+    }
+
+    // Use last 2 sectors as scratch area (outside ext2 filesystem)
+    let test_sector = capacity - 2;
+    let test_pattern: [u8; 512] = {
+        let mut pattern = [0u8; 512];
+        for (i, byte) in pattern.iter_mut().enumerate() {
+            // Create a recognizable pattern: 0xDE, 0xAD, 0xBE, 0xEF repeating + offset
+            *byte = match i % 4 {
+                0 => 0xDE,
+                1 => 0xAD,
+                2 => 0xBE,
+                _ => 0xEF,
+            } ^ (i as u8);
+        }
+        pattern
+    };
+
+    // Write test pattern
+    println!("        Writing test pattern to sector {}...", test_sector);
+    match device.write_sync(test_sector, &test_pattern) {
+        Ok(n) if n == sector_size => {}
+        Ok(n) => {
+            println!("        [FAIL] Write returned {} bytes, expected {}", n, sector_size);
+            return false;
+        }
+        Err(e) => {
+            println!("        [FAIL] Write failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // Read back
+    let mut read_buf = vec![0u8; sector_size];
+    match device.read_sync(test_sector, &mut read_buf) {
+        Ok(n) if n == sector_size => {}
+        Ok(n) => {
+            println!("        [FAIL] Read returned {} bytes, expected {}", n, sector_size);
+            return false;
+        }
+        Err(e) => {
+            println!("        [FAIL] Read failed: {:?}", e);
+            return false;
+        }
+    }
+
+    // Verify
+    if read_buf[..512] == test_pattern {
+        println!("        [PASS] Write/read verification successful");
+        true
+    } else {
+        println!("        [FAIL] Data mismatch!");
+        println!("        Expected first 8: {:02x?}", &test_pattern[..8]);
+        println!("        Got first 8:      {:02x?}", &read_buf[..8]);
+        false
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // 禁用中断 - 必须首先做！
@@ -321,6 +400,15 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         match vfs::register_block_device(name, device_for_registration) {
             Ok(()) => {
                 println!("      ✓ Registered /dev/{} in devfs", name);
+
+                // Phase C: Test block write path (uses last sectors, outside filesystem)
+                println!("      [TEST] Block device write/read verification:");
+                if test_block_write(&device) {
+                    println!("      ✓ Block write path verified");
+                } else {
+                    println!("      ! Block write test failed");
+                }
+
                 // Phase C: Try to mount as ext2 filesystem
                 match vfs::Ext2Fs::mount(device) {
                     Ok(fs) => match vfs::mount("/mnt", fs) {

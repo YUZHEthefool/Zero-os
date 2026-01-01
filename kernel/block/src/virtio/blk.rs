@@ -39,6 +39,26 @@ const DEFAULT_QUEUE_SIZE: u16 = 128;
 const MAX_PENDING: usize = 64;
 
 // ============================================================================
+// R37-3 FIX (Codex review): Timeout Resource Tracking
+// ============================================================================
+//
+// KNOWN LIMITATION: When a request times out, we keep DMA buffers pinned to
+// prevent UAF (device may complete later, DMAing into freed memory). However,
+// this leaks resources permanently. A proper fix requires a device reset path
+// to safely reclaim the descriptors and buffers.
+//
+// FIXME: Implement virtio-blk device reset to recover from timeouts without
+// leaking resources. This counter tracks how many resources are leaked.
+use core::sync::atomic::AtomicUsize;
+static TIMEOUT_LEAKED_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Get the number of requests that have leaked due to timeouts.
+/// Each leaked request holds: 3 descriptors + header buffer + status buffer + data buffer.
+pub fn timeout_leaked_count() -> usize {
+    TIMEOUT_LEAKED_REQUESTS.load(Ordering::Relaxed)
+}
+
+// ============================================================================
 // DMA Address Translation (R28-1 Fix)
 // ============================================================================
 
@@ -731,14 +751,21 @@ impl VirtioBlkDevice {
                 _ => Err(BlockError::Io),
             }
         } else {
-            // Timeout
-            self.queue.free_desc(desc0);
-            self.queue.free_desc(desc1);
-            self.queue.free_desc(desc2);
-            Err(BlockError::Io)
+            // R37-3 FIX: Timeout - DO NOT free descriptors or DMA buffers.
+            // The device may complete the request later, causing DMA into freed memory (UAF).
+            // Keep buffers pinned; a device reset is required to safely recover.
+            // R37-3 FIX (Codex review): Track leaked resources for diagnostics.
+            let leaked = TIMEOUT_LEAKED_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+            println!(
+                "[virtio-blk] timeout waiting for request sector={} bytes={}, buffers pinned \
+                (reset required, total leaked={})",
+                sector, buf.len(), leaked
+            );
+            // Leave req_buffers[buf_idx].in_use = true to prevent reuse
+            return Err(BlockError::Io);
         };
 
-        // Free DMA bounce buffers
+        // Free DMA bounce buffers (only reached on successful completion)
         Self::free_dma_memory(dma_phys, buf.len());
         Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
 
@@ -774,10 +801,120 @@ impl BlockDevice for VirtioBlkDevice {
         self.read_only
     }
 
-    fn submit_bio(&self, bio: Bio) -> Result<(), BlockError> {
-        // For now, we only support synchronous operations
-        // A proper implementation would queue the BIO
-        Err(BlockError::NotSupported)
+    fn submit_bio(&self, mut bio: Bio) -> Result<(), BlockError> {
+        // Synchronous fallback: process the BIO immediately using do_request/flush.
+        // A proper async implementation would queue the BIO and use interrupt-driven
+        // completion. This fallback enables page cache writeback and basic BIO users.
+        let result: BioResult = match bio.op {
+            BioOp::Read => {
+                if bio.vecs.is_empty() {
+                    Err(BlockError::Invalid)
+                } else if bio.vecs.len() == 1 {
+                    // Single vector - use directly
+                    // SAFETY: Caller ensures the buffer is valid and writable for read data
+                    let buf = unsafe { bio.vecs[0].as_mut_slice() };
+                    self.do_request(bio.sector, buf, false)
+                } else {
+                    // Multi-vector scatter-gather: process sequentially
+                    let mut current_sector = bio.sector;
+                    let sector_size = self.sector_size as u64;
+                    let mut total_bytes = 0usize;
+                    let mut err: Option<BlockError> = None;
+
+                    for bv in bio.vecs.iter_mut() {
+                        // Read len before mutable borrow
+                        let bv_len = bv.len as u64;
+                        let sectors = match bv_len.checked_div(sector_size) {
+                            Some(s) if s > 0 => s,
+                            _ => {
+                                err = Some(BlockError::Invalid);
+                                break;
+                            }
+                        };
+
+                        // SAFETY: Caller ensures each buffer is valid
+                        let buf = unsafe { bv.as_mut_slice() };
+                        match self.do_request(current_sector, buf, false) {
+                            Ok(n) => {
+                                total_bytes += n;
+                                match current_sector.checked_add(sectors) {
+                                    Some(next) => current_sector = next,
+                                    None => {
+                                        err = Some(BlockError::Invalid);
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+
+                    err.map_or(Ok(total_bytes), Err)
+                }
+            }
+            BioOp::Write => {
+                if bio.vecs.is_empty() {
+                    Err(BlockError::Invalid)
+                } else if bio.vecs.len() == 1 {
+                    // SAFETY: Caller ensures the buffer is valid and contains write data
+                    let buf = unsafe { bio.vecs[0].as_mut_slice() };
+                    self.do_request(bio.sector, buf, true)
+                } else {
+                    // Multi-vector scatter-gather: process sequentially
+                    let mut current_sector = bio.sector;
+                    let sector_size = self.sector_size as u64;
+                    let mut total_bytes = 0usize;
+                    let mut err: Option<BlockError> = None;
+
+                    for bv in bio.vecs.iter_mut() {
+                        // Read len before mutable borrow
+                        let bv_len = bv.len as u64;
+                        let sectors = match bv_len.checked_div(sector_size) {
+                            Some(s) if s > 0 => s,
+                            _ => {
+                                err = Some(BlockError::Invalid);
+                                break;
+                            }
+                        };
+
+                        // SAFETY: Caller ensures each buffer is valid
+                        let buf = unsafe { bv.as_mut_slice() };
+                        match self.do_request(current_sector, buf, true) {
+                            Ok(n) => {
+                                total_bytes += n;
+                                match current_sector.checked_add(sectors) {
+                                    Some(next) => current_sector = next,
+                                    None => {
+                                        err = Some(BlockError::Invalid);
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+
+                    err.map_or(Ok(total_bytes), Err)
+                }
+            }
+            BioOp::Flush => self.flush().map(|_| 0),
+            BioOp::Discard => {
+                // TRIM/Discard not supported by this driver
+                Err(BlockError::NotSupported)
+            }
+        };
+
+        // Complete the BIO (calls completion callback if set)
+        bio.complete(result);
+
+        // Convert BioResult to submit_bio result
+        result.map(|_| ())
     }
 
     fn read_sync(&self, sector: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
@@ -903,13 +1040,20 @@ impl BlockDevice for VirtioBlkDevice {
                 _ => Err(BlockError::Io),
             }
         } else {
-            // Timeout
-            self.queue.free_desc(desc0);
-            self.queue.free_desc(desc1);
-            Err(BlockError::Io)
+            // R37-3 FIX: Timeout - DO NOT free descriptors or DMA buffers.
+            // The device may complete later, causing DMA into freed memory (UAF).
+            // Keep buffers pinned; a device reset is required to safely recover.
+            // R37-3 FIX (Codex review): Track leaked resources for diagnostics.
+            let leaked = TIMEOUT_LEAKED_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+            println!(
+                "[virtio-blk] flush timeout, buffers pinned (reset required, total leaked={})",
+                leaked
+            );
+            // Leave req_buffers[buf_idx].in_use = true to prevent reuse
+            return Err(BlockError::Io);
         };
 
-        // Free DMA buffer and release request slot
+        // Free DMA buffer and release request slot (only reached on successful completion)
         Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
         {
             let mut buffers = self.req_buffers.lock();

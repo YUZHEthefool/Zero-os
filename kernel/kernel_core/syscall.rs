@@ -1389,6 +1389,14 @@ fn sys_clone(
         if flags & CLONE_VM == 0 || flags & CLONE_SIGHAND == 0 {
             return Err(SyscallError::EINVAL);
         }
+        // R37-7 FIX: CLONE_THREAD requires a separate stack for the new thread.
+        // Sharing the parent's stack leads to data races and corruption.
+        if stack.is_null() {
+            println!(
+                "[sys_clone] CLONE_THREAD rejected: NULL stack would share parent's user stack"
+            );
+            return Err(SyscallError::EINVAL);
+        }
     }
 
     // 验证 parent_tid 指针
@@ -3073,7 +3081,8 @@ fn sys_brk(addr: usize) -> SyscallResult {
         // 释放锁后进行映射操作
         drop(proc);
 
-        // 分配并映射新的堆页
+        // R37-5 FIX: Track mapped pages for rollback on partial allocation failure.
+        // If allocation fails partway, we must unmap+free pages already mapped in this call.
         let map_result: Result<(), SyscallError> = unsafe {
             with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
                 let mut frame_alloc = FrameAllocator::new();
@@ -3081,6 +3090,7 @@ fn sys_brk(addr: usize) -> SyscallResult {
                     | PageTableFlags::WRITABLE
                     | PageTableFlags::USER_ACCESSIBLE
                     | PageTableFlags::NO_EXECUTE;
+                let mut mapped_pages: Vec<Page<x86_64::structures::paging::Size4KiB>> = Vec::new();
 
                 for offset in (0..grow_size).step_by(PAGE_SIZE) {
                     let vaddr = VirtAddr::new((old_top + offset) as u64);
@@ -3091,19 +3101,41 @@ fn sys_brk(addr: usize) -> SyscallResult {
                         continue;
                     }
 
-                    // 分配物理帧
-                    let frame = frame_alloc
-                        .allocate_frame()
-                        .ok_or(SyscallError::ENOMEM)?;
+                    // 分配物理帧 - with rollback on failure
+                    let frame = match frame_alloc.allocate_frame() {
+                        Some(f) => f,
+                        None => {
+                            // Rollback: unmap all pages we mapped in this call
+                            for &rollback_page in mapped_pages.iter().rev() {
+                                if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
+                                    frame_alloc.deallocate_frame(freed_frame);
+                                }
+                            }
+                            return Err(SyscallError::ENOMEM);
+                        }
+                    };
 
                     // 清零新分配的帧
                     let virt = mm::phys_to_virt(frame.start_address());
                     core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
 
-                    // 映射页
-                    manager
+                    // 映射页 - with rollback on failure
+                    if manager
                         .map_page(page, frame, flags, &mut frame_alloc)
-                        .map_err(|_| SyscallError::ENOMEM)?;
+                        .is_err()
+                    {
+                        // Free the frame we just allocated
+                        frame_alloc.deallocate_frame(frame);
+                        // Rollback: unmap all pages we mapped in this call
+                        for &rollback_page in mapped_pages.iter().rev() {
+                            if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
+                                frame_alloc.deallocate_frame(freed_frame);
+                            }
+                        }
+                        return Err(SyscallError::ENOMEM);
+                    }
+
+                    mapped_pages.push(page);
                 }
                 Ok(())
             })
@@ -3784,16 +3816,34 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             }
 
             // R25-6 FIX: Reject seccomp in multi-threaded processes without TSYNC
-            // This prevents security bypass where only one thread is sandboxed
+            // R37-1 FIX (Codex review): Correctly distinguish CLONE_THREAD vs pure CLONE_VM siblings.
+            // - CLONE_THREAD siblings (same tgid) can be synchronized with TSYNC
+            // - Pure CLONE_VM siblings (different tgid) cannot be synchronized with TSYNC
             let thread_count = crate::process::thread_group_size(proc.tgid);
+            let pure_vm_siblings = crate::process::non_thread_group_vm_share_count(
+                proc.memory_space,
+                proc.tgid,
+            );
             let tsync_requested = flags & seccomp::SeccompFlags::TSYNC.bits() != 0;
+
+            // Reject if multi-threaded without TSYNC (partial sandboxing)
             if thread_count > 1 && !tsync_requested {
-                // Multi-threaded but TSYNC not requested - refuse partial sandboxing
                 println!(
-                    "[sys_seccomp] PID={} REJECTED: {} threads but TSYNC not requested",
+                    "[sys_seccomp] PID={} REJECTED: threads={} without TSYNC",
                     pid, thread_count
                 );
                 return Err(SyscallError::EPERM);
+            }
+
+            // R37-1 FIX: If pure CLONE_VM siblings exist, reject regardless of TSYNC.
+            // TSYNC only synchronizes CLONE_THREAD siblings (same tgid), not CLONE_VM processes.
+            if pure_vm_siblings > 0 {
+                println!(
+                    "[sys_seccomp] PID={} REJECTED: {} CLONE_VM siblings (different tgid) present; \
+                    seccomp cannot secure shared address space",
+                    pid, pure_vm_siblings
+                );
+                return Err(SyscallError::EBUSY);
             }
 
             // R26-3 FIX: Mark installation in progress
