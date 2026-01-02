@@ -4,6 +4,7 @@
 //! - arch 模块通过此钩子调用调度器的定时器处理
 //! - syscall 模块通过此钩子触发重调度检查
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
@@ -13,8 +14,8 @@ pub type TimerCallback = fn();
 /// 重调度回调类型：force=true 强制调度，false 仅在需要时调度
 pub type ReschedCallback = fn(force: bool);
 
-/// 全局定时器回调
-static TIMER_CB: Mutex<Option<TimerCallback>> = Mutex::new(None);
+/// R39-6 FIX: 全局定时器回调列表（支持多个回调，按注册顺序依次调用）
+static TIMER_CBS: Mutex<Vec<TimerCallback>> = Mutex::new(Vec::new());
 
 /// 全局重调度回调
 static RESCHED_CB: Mutex<Option<ReschedCallback>> = Mutex::new(None);
@@ -27,9 +28,10 @@ static IRQ_RESCHED_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// 注册定时器回调
 ///
+/// R39-6 FIX: 支持多个回调注册，调度器和超时处理可以同时注册
 /// 调度器在初始化时调用此函数注册 on_clock_tick 处理器
 pub fn register_timer_callback(cb: TimerCallback) {
-    *TIMER_CB.lock() = Some(cb);
+    TIMER_CBS.lock().push(cb);
 }
 
 /// 注册重调度回调
@@ -39,13 +41,37 @@ pub fn register_resched_callback(cb: ReschedCallback) {
     *RESCHED_CB.lock() = Some(cb);
 }
 
+/// Maximum number of timer callbacks (prevents allocation in IRQ context)
+const MAX_TIMER_CALLBACKS: usize = 4;
+
 /// 调用定时器回调
 ///
+/// R39-6 FIX: 遍历所有注册的回调并依次调用
 /// 由 arch 模块的定时器中断处理器调用
+///
+/// # Codex Review Fix
+///
+/// Use fixed-size stack array instead of Vec::clone() to avoid heap
+/// allocation in IRQ context. MAX_TIMER_CALLBACKS limits the number
+/// of callbacks (typically just scheduler tick + waitqueue timeout).
 #[inline]
 pub fn on_scheduler_tick() {
-    if let Some(cb) = *TIMER_CB.lock() {
-        cb();
+    // Copy callbacks to fixed stack array (no heap allocation in IRQ context)
+    let mut callbacks: [Option<TimerCallback>; MAX_TIMER_CALLBACKS] = [None; MAX_TIMER_CALLBACKS];
+    let count = {
+        let guard = TIMER_CBS.lock();
+        let n = guard.len().min(MAX_TIMER_CALLBACKS);
+        for (i, cb) in guard.iter().take(n).enumerate() {
+            callbacks[i] = Some(*cb);
+        }
+        n
+    }; // Lock released here
+
+    // Call callbacks outside of lock
+    for cb in callbacks.iter().take(count) {
+        if let Some(f) = cb {
+            f();
+        }
     }
 }
 

@@ -182,11 +182,13 @@ run-clone-test: build-clone-test
 # -vga std: 强制使用标准VGA模式，确保0xB8000文本缓冲区可用
 # 使用默认的i440FX机器类型，其PCI内存布局将BAR放在4GB以下
 # (q35会将某些BAR放在高于4GB的地址，超出bootloader的identity mapping范围)
+# R39-8 FIX: Add CPU model with SMEP/SMAP/UMIP/RDRAND support
 QEMU_COMMON = -bios $(OVMF_PATH) \
 	-drive format=raw,file=fat:rw:esp \
 	-m 256M \
 	-vga std \
-	-no-reboot -no-shutdown
+	-no-reboot -no-shutdown \
+	-cpu qemu64,+smep,+smap,+umip,+rdrand
 
 # virtio-blk 块设备配置 (Phase C: Storage Foundation)
 # 默认使用PCI transport（x86 QEMU更可靠），可切换为MMIO

@@ -1,14 +1,14 @@
 use crate::fork::PAGE_REF_COUNT;
 use crate::signal::PendingSignals;
 use crate::time;
-use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::{BTreeMap, BTreeSet}, string::String, sync::Arc, vec, vec::Vec};
 use cap::CapTable;
 use core::any::Any;
 use lsm::ProcessCtx as LsmProcessCtx;  // R25-7 FIX: Import LSM for task_exit hook
 use mm::memory::FrameAllocator;
 use mm::page_table;
 use seccomp::{PledgeState, SeccompState};
-use spin::Mutex;
+use spin::{Mutex, RwLock};
 use x86_64::{
     registers::control::{Cr3, Cr3Flags},
     structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB},
@@ -373,6 +373,11 @@ pub struct Process {
     /// fd 0/1/2 分别保留给 stdin/stdout/stderr，新分配从 3 开始
     pub fd_table: BTreeMap<i32, FileDescriptor>,
 
+    /// R39-4 FIX: 带 FD_CLOEXEC 标记的文件描述符集合
+    ///
+    /// exec 时会关闭这些 fd，防止敏感句柄泄漏到新程序
+    pub cloexec_fds: BTreeSet<i32>,
+
     /// 能力表（Capability Table，管理进程持有的能力）
     ///
     /// 每个进程拥有独立的能力表。能力表中的条目（CapEntry）包含：
@@ -399,21 +404,13 @@ pub struct Process {
     pub created_at: u64,
 
     // ========== 进程凭证 (DAC支持) ==========
-    /// 真实用户ID (uid)
-    pub uid: u32,
-
-    /// 真实组ID (gid)
-    pub gid: u32,
-
-    /// 有效用户ID (euid) - 用于权限检查
-    pub euid: u32,
-
-    /// 有效组ID (egid) - 用于权限检查
-    pub egid: u32,
-
-    /// 附属组ID列表 (supplementary groups)
-    /// 用于扩展组权限检查，进程可以属于多个组
-    pub supplementary_groups: Vec<u32>,
+    /// R39-3 FIX: 共享凭证结构
+    ///
+    /// 使用 Arc<RwLock<Credentials>> 实现线程间共享凭证。
+    /// CLONE_THREAD 创建的线程共享同一个 Arc，因此 setuid/setgid
+    /// 等操作会影响所有同进程的线程（符合 POSIX 语义）。
+    /// 普通 fork 会 clone 凭证到新的 Arc。
+    pub credentials: Arc<RwLock<Credentials>>,
 
     /// 文件创建掩码 (umask)
     /// 新建文件的权限 = mode & !umask
@@ -499,18 +496,21 @@ impl Process {
             mmap_regions: BTreeMap::new(),
             next_mmap_addr: DEFAULT_MMAP_BASE,
             fd_table: BTreeMap::new(),
+            cloexec_fds: BTreeSet::new(),
             cap_table: Arc::new(CapTable::new()),
             exit_code: None,
             waiting_child: None,
             children: Vec::new(),
             cpu_time: 0,
             created_at: time::current_timestamp_ms(),
-            // 默认以root运行，标准umask
-            uid: 0,
-            gid: 0,
-            euid: 0,
-            egid: 0,
-            supplementary_groups: Vec::new(),
+            // R39-3 FIX: 默认以root运行，使用共享凭证结构
+            credentials: Arc::new(RwLock::new(Credentials {
+                uid: 0,
+                gid: 0,
+                euid: 0,
+                egid: 0,
+                supplementary_groups: Vec::new(),
+            })),
             umask: 0o022,
             // OOM killer 支持 - 默认中立设置
             nice: 0,
@@ -558,11 +558,38 @@ impl Process {
     /// 移除并返回指定 fd 的描述符
     ///
     /// 关闭文件描述符时使用，描述符的 Drop 会自动处理资源清理
+    /// R39-4 FIX: 同时清除 CLOEXEC 标记
     pub fn remove_fd(&mut self, fd: i32) -> Option<FileDescriptor> {
         if fd < 0 {
             return None;
         }
+        self.cloexec_fds.remove(&fd);
         self.fd_table.remove(&fd)
+    }
+
+    /// R39-4 FIX: 设置或清除指定 fd 的 FD_CLOEXEC 标记
+    ///
+    /// # Arguments
+    /// * `fd` - 文件描述符
+    /// * `cloexec` - true 设置 CLOEXEC，false 清除
+    pub fn set_fd_cloexec(&mut self, fd: i32, cloexec: bool) {
+        if cloexec {
+            self.cloexec_fds.insert(fd);
+        } else {
+            self.cloexec_fds.remove(&fd);
+        }
+    }
+
+    /// R39-4 FIX: 在 exec 期间关闭所有带 FD_CLOEXEC 的文件描述符
+    ///
+    /// SECURITY: 防止敏感句柄（如设备、管道）泄漏到 exec 后的新程序。
+    /// 这是 POSIX close-on-exec 语义的实现。
+    pub fn apply_fd_cloexec(&mut self) {
+        let to_close: Vec<i32> = self.cloexec_fds.iter().copied().collect();
+        for fd in to_close {
+            self.fd_table.remove(&fd);
+        }
+        self.cloexec_fds.clear();
     }
 
     /// 查找下一个可用的 fd（从 3 开始）
@@ -823,19 +850,15 @@ pub struct Credentials {
 
 /// 获取当前进程的凭证
 ///
+/// R39-3 FIX: 从共享凭证结构读取，线程间共享
 /// 返回 None 如果没有当前进程
 pub fn current_credentials() -> Option<Credentials> {
     let pid = current_pid()?;
     let table = PROCESS_TABLE.lock();
     let slot = table.get(pid)?;
     let proc = slot.as_ref()?.lock();
-    Some(Credentials {
-        uid: proc.uid,
-        gid: proc.gid,
-        euid: proc.euid,
-        egid: proc.egid,
-        supplementary_groups: proc.supplementary_groups.clone(),
-    })
+    let creds = proc.credentials.read().clone();
+    Some(creds)
 }
 
 /// 获取当前进程的有效用户ID
@@ -850,13 +873,15 @@ pub fn current_egid() -> Option<u32> {
 
 /// 获取当前进程的附属组列表
 ///
+/// R39-3 FIX: 从共享凭证结构读取
 /// 返回附属组ID的克隆列表，如果没有当前进程则返回 None
 pub fn current_supplementary_groups() -> Option<Vec<u32>> {
     let pid = current_pid()?;
     let table = PROCESS_TABLE.lock();
     let slot = table.get(pid)?;
     let proc = slot.as_ref()?.lock();
-    Some(proc.supplementary_groups.clone())
+    let groups = proc.credentials.read().supplementary_groups.clone();
+    Some(groups)
 }
 
 /// Maximum number of supplementary groups per process
@@ -884,20 +909,23 @@ pub fn set_current_supplementary_groups(groups: &[u32]) -> Option<()> {
     let pid = current_pid()?;
     let table = PROCESS_TABLE.lock();
     let slot = table.get(pid)?;
-    let mut proc = slot.as_ref()?.lock();
+    let proc = slot.as_ref()?.lock();
+
+    // R39-3 FIX: 使用共享凭证结构
+    let mut creds = proc.credentials.write();
 
     // Security: Only root can modify supplementary groups
-    if proc.euid != 0 {
+    if creds.euid != 0 {
         return None;
     }
 
-    proc.supplementary_groups.clear();
+    creds.supplementary_groups.clear();
     // Take only up to NGROUPS_MAX groups to prevent DoS
     let limit = groups.len().min(NGROUPS_MAX);
-    proc.supplementary_groups
+    creds.supplementary_groups
         .extend(groups[..limit].iter().copied());
-    proc.supplementary_groups.sort_unstable();
-    proc.supplementary_groups.dedup();
+    creds.supplementary_groups.sort_unstable();
+    creds.supplementary_groups.dedup();
     Some(())
 }
 
@@ -920,17 +948,20 @@ pub fn add_supplementary_group(gid: u32) -> Option<()> {
     let pid = current_pid()?;
     let table = PROCESS_TABLE.lock();
     let slot = table.get(pid)?;
-    let mut proc = slot.as_ref()?.lock();
+    let proc = slot.as_ref()?.lock();
+
+    // R39-3 FIX: 使用共享凭证结构
+    let mut creds = proc.credentials.write();
 
     // Security: Only root can modify supplementary groups
-    if proc.euid != 0 {
+    if creds.euid != 0 {
         return None;
     }
 
-    if !proc.supplementary_groups.contains(&gid) {
+    if !creds.supplementary_groups.contains(&gid) {
         // Enforce NGROUPS_MAX limit
-        if proc.supplementary_groups.len() < NGROUPS_MAX {
-            proc.supplementary_groups.push(gid);
+        if creds.supplementary_groups.len() < NGROUPS_MAX {
+            creds.supplementary_groups.push(gid);
         }
     }
     Some(())
@@ -954,14 +985,17 @@ pub fn remove_supplementary_group(gid: u32) -> Option<()> {
     let pid = current_pid()?;
     let table = PROCESS_TABLE.lock();
     let slot = table.get(pid)?;
-    let mut proc = slot.as_ref()?.lock();
+    let proc = slot.as_ref()?.lock();
+
+    // R39-3 FIX: 使用共享凭证结构
+    let mut creds = proc.credentials.write();
 
     // Security: Only root can modify supplementary groups
-    if proc.euid != 0 {
+    if creds.euid != 0 {
         return None;
     }
 
-    proc.supplementary_groups.retain(|&g| g != gid);
+    creds.supplementary_groups.retain(|&g| g != gid);
     Some(())
 }
 
@@ -1261,11 +1295,12 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             memory_space = proc.memory_space;
             // 清除 clear_child_tid 避免重复处理
             proc.clear_child_tid = 0;
-            // R25-7 FIX: Capture credentials before releasing lock
-            lsm_uid = proc.uid;
-            lsm_gid = proc.gid;
-            lsm_euid = proc.euid;
-            lsm_egid = proc.egid;
+            // R25-7 + R39-3 FIX: Capture credentials from shared structure
+            let creds = proc.credentials.read();
+            lsm_uid = creds.uid;
+            lsm_gid = creds.gid;
+            lsm_euid = creds.euid;
+            lsm_egid = creds.egid;
         }
 
         // R25-7 FIX: Call LSM task_exit hook for forced terminations (kill/seccomp paths)
@@ -1795,11 +1830,13 @@ pub fn oom_snapshot() -> Vec<mm::OomProcessInfo> {
             // 计算 RSS（简化实现：使用 mmap 区域大小估算）
             let rss_pages = (proc.mmap_regions.values().sum::<usize>() / 4096) as u64;
 
+            // R39-3 FIX: 使用共享凭证获取 uid/gid
+            let creds = proc.credentials.read();
             result.push(mm::OomProcessInfo {
                 pid: proc.pid,
                 tgid: proc.tgid,
-                uid: proc.uid,
-                gid: proc.gid,
+                uid: creds.uid,
+                gid: creds.gid,
                 rss_pages,
                 nice: proc.nice,
                 oom_score_adj: proc.oom_score_adj,

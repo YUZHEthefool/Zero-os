@@ -181,6 +181,12 @@ fn fork_inner(
             child.fd_table.insert(fd, desc.clone_box());
         }
 
+        // R39-4 FIX: 克隆 close-on-exec 标记集合
+        //
+        // fork 时子进程继承父进程的 CLOEXEC 标记，
+        // 这些 fd 会在子进程 exec 时自动关闭
+        child.cloexec_fds = parent.cloexec_fds.clone();
+
         // 克隆能力表（尊重 CLOFORK 标志）
         //
         // clone_for_fork() 会过滤掉带有 CLOFORK 标志的能力条目，
@@ -190,12 +196,13 @@ fn fork_inner(
         child.time_slice = parent.time_slice;
         child.cpu_time = 0;
 
-        // 继承父进程的凭证 (DAC支持)
-        child.uid = parent.uid;
-        child.gid = parent.gid;
-        child.euid = parent.euid;
-        child.egid = parent.egid;
-        child.supplementary_groups = parent.supplementary_groups.clone();
+        // R39-3 FIX: 继承父进程的凭证（fork 创建独立副本）
+        //
+        // fork() 创建的子进程获得父进程凭证的克隆副本（独立 Arc）。
+        // 这意味着子进程后续的 setuid/setgid 不会影响父进程。
+        // 对于 CLONE_THREAD，sys_clone 中会处理共享凭证。
+        let parent_creds = parent.credentials.read().clone();
+        child.credentials = Arc::new(RwLock::new(parent_creds));
         child.umask = parent.umask;
 
         // 复制堆管理状态

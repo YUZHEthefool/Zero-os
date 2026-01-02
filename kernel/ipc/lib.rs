@@ -22,7 +22,7 @@ pub use ipc::{
     send_message, send_message_notify, EndpointId, IpcError, Message, ReceivedMessage,
 };
 
-pub use sync::{CondVar, KMutex, Semaphore, WaitQueue};
+pub use sync::{init_waitqueue_timers, CondVar, KMutex, Semaphore, WaitOutcome, WaitQueue};
 
 pub use pipe::{
     create_pipe, create_pipe_with_capacity, PipeEndType, PipeError, PipeFlags, PipeHandle, PipeId,
@@ -31,7 +31,7 @@ pub use pipe::{
 
 pub use futex::{
     active_futex_count, cleanup_process_futexes, futex_wait, futex_wake, FutexError, FutexTable,
-    FUTEX_WAIT, FUTEX_WAKE,
+    FUTEX_WAIT, FUTEX_WAIT_TIMEOUT, FUTEX_WAKE,
 };
 
 // ============================================================================
@@ -201,18 +201,19 @@ fn fs_error_to_syscall(err: vfs::types::FsError) -> SyscallError {
 
 /// Futex 操作回调
 ///
-/// 根据操作码执行 FUTEX_WAIT 或 FUTEX_WAKE
+/// 根据操作码执行 FUTEX_WAIT / FUTEX_WAIT_TIMEOUT / FUTEX_WAKE
 ///
 /// # Arguments
 ///
 /// * `uaddr` - 用户空间 futex 地址
-/// * `op` - 操作码 (FUTEX_WAIT=0, FUTEX_WAKE=1)
+/// * `op` - 操作码 (FUTEX_WAIT=0, FUTEX_WAKE=1, FUTEX_WAIT_TIMEOUT=2)
 /// * `val` - FUTEX_WAIT 时为期望值，FUTEX_WAKE 时为唤醒数量
 /// * `current_value` - 调用者从用户空间读取的当前值（仅 FUTEX_WAIT 使用）
+/// * `timeout_ns` - R39-6 FIX: 可选超时时间（纳秒），仅 FUTEX_WAIT_TIMEOUT 使用
 ///
 /// # Returns
 ///
-/// FUTEX_WAIT: 成功返回 0，值不匹配返回 EAGAIN
+/// FUTEX_WAIT/FUTEX_WAIT_TIMEOUT: 成功返回 0，值不匹配返回 EAGAIN，超时返回 ETIMEDOUT
 /// FUTEX_WAKE: 返回实际唤醒的进程数量
 ///
 /// # Security (R32-IPC-2 fix)
@@ -224,6 +225,7 @@ fn futex_callback(
     op: i32,
     val: u32,
     current_value: u32,
+    timeout_ns: Option<u64>,
 ) -> Result<usize, SyscallError> {
     use mm::page_table::{with_current_manager, PHYSICAL_MEMORY_OFFSET};
     use process::current_pid;
@@ -275,12 +277,22 @@ fn futex_callback(
     };
 
     match op {
-        futex::FUTEX_WAIT => futex_wait(tgid, uaddr, val, current_value).map_err(|e| match e {
-            FutexError::WouldBlock => SyscallError::EAGAIN,
-            FutexError::Fault => SyscallError::EFAULT,
-            FutexError::NoProcess => SyscallError::ESRCH,
-            FutexError::InvalidOperation => SyscallError::EINVAL,
-        }),
+        // R39-6 FIX: FUTEX_WAIT 和 FUTEX_WAIT_TIMEOUT 统一处理
+        futex::FUTEX_WAIT | futex::FUTEX_WAIT_TIMEOUT => {
+            // FUTEX_WAIT 使用 None（无限等待），FUTEX_WAIT_TIMEOUT 使用传入的超时
+            let effective_timeout = if op == futex::FUTEX_WAIT_TIMEOUT {
+                timeout_ns
+            } else {
+                None
+            };
+            futex_wait(tgid, uaddr, val, current_value, effective_timeout).map_err(|e| match e {
+                FutexError::WouldBlock => SyscallError::EAGAIN,
+                FutexError::Fault => SyscallError::EFAULT,
+                FutexError::NoProcess => SyscallError::ESRCH,
+                FutexError::InvalidOperation => SyscallError::EINVAL,
+                FutexError::TimedOut => SyscallError::ETIMEDOUT,
+            })
+        }
         futex::FUTEX_WAKE => Ok(futex_wake(tgid, uaddr, val as usize)),
         _ => Err(SyscallError::EINVAL),
     }
@@ -322,6 +334,9 @@ fn futex_wake_callback(tgid: process::ProcessId, uaddr: usize, max_wake: usize) 
 /// 同时注册系统调用回调，使 kernel_core 的 sys_pipe/sys_read/sys_write/sys_close
 /// 能够操作管道。
 pub fn init() {
+    // R39-6 FIX: 初始化 WaitQueue 超时定时器
+    sync::init_waitqueue_timers();
+
     // 注册IPC清理回调到进程管理子系统（包括端点和 futex 清理）
     kernel_core::register_ipc_cleanup(ipc_cleanup);
 
@@ -338,6 +353,6 @@ pub fn init() {
     ipc::init();
     println!("  Synchronization primitives loaded (WaitQueue, KMutex, Semaphore, CondVar)");
     println!("  Pipe support loaded (anonymous pipes with blocking I/O)");
-    println!("  Futex support loaded (user-space fast mutex)");
+    println!("  Futex support loaded (user-space fast mutex with timeout)");
     println!("  Syscall callbacks registered (pipe, read, write, close, futex)");
 }

@@ -283,8 +283,9 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     }
 
     // KASLR/KPTI/PCID initialization
+    // R39-7 FIX: Pass KASLR slide from bootloader to kernel
     println!("[2.65/3] Initializing KASLR/KPTI/PCID...");
-    security::init_kaslr();
+    security::init_kaslr(boot_info.map(|info| info.kaslr_slide));
 
     // CPU 硬件保护特性启用 (SMEP/SMAP/UMIP)
     println!("[2.7/3] Enabling CPU protection features...");

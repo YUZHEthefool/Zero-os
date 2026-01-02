@@ -249,11 +249,16 @@ impl KernelLayout {
     ///
     /// The slide value must be page-aligned and must not cause the kernel
     /// to overlap with other memory regions.
+    ///
+    /// # R39-7 FIX
+    ///
+    /// phys_base is now also adjusted by the slide value to match
+    /// the actual kernel load address.
     #[allow(dead_code)]
     pub const fn with_slide(slide: u64) -> Self {
         Self {
             virt_base: KERNEL_VIRT_BASE + slide,
-            phys_base: KERNEL_PHYS_BASE,
+            phys_base: KERNEL_PHYS_BASE + slide, // R39-7 FIX: Include slide in physical base
             kaslr_slide: slide,
             text_start: KERNEL_VIRT_BASE + KERNEL_ENTRY_OFFSET + slide,
             text_size: 0,
@@ -327,6 +332,11 @@ unsafe fn sym_addr(sym: &u8) -> u64 {
 /// This function reads the actual section boundaries from linker symbols
 /// and populates the KernelLayout structure. This allows accurate bounds
 /// checking even without bootloader-assisted KASLR.
+///
+/// # R39-7 FIX
+///
+/// phys_base is now calculated as KERNEL_PHYS_BASE + runtime_slide to match
+/// the actual physical load address when KASLR is enabled.
 fn build_kernel_layout_from_linker() -> KernelLayout {
     // Safety: symbols are provided by kernel.ld and valid after kernel load
     let kernel_start_addr = unsafe { sym_addr(&kernel_start) };
@@ -345,7 +355,7 @@ fn build_kernel_layout_from_linker() -> KernelLayout {
 
     KernelLayout {
         virt_base: KERNEL_VIRT_BASE + runtime_slide,
-        phys_base: KERNEL_PHYS_BASE,
+        phys_base: KERNEL_PHYS_BASE + runtime_slide, // R39-7 FIX: Include slide in physical base
         kaslr_slide: runtime_slide,
         text_start: text_start_addr,
         text_size: text_end_addr.saturating_sub(text_start_addr),
@@ -944,21 +954,38 @@ impl TrampolineDesc {
 
 /// Initialize KASLR/KPTI subsystem
 ///
-/// Currently just logs status; will perform actual initialization
-/// when features are implemented.
+/// # Arguments
+///
+/// * `boot_slide` - Optional KASLR slide value from bootloader (R39-7 FIX)
 ///
 /// # R25-11 Fix
 ///
 /// Until bootloader cooperation enables actual kernel relocation,
 /// KASLR is always disabled and reported as such. The slide value
 /// is set to 0 to prevent KernelLayout from containing incorrect addresses.
-pub fn init() {
+///
+/// # R39-7 FIX
+///
+/// Now accepts the KASLR slide from the bootloader's BootInfo structure
+/// and verifies it matches the runtime-detected slide from linker symbols.
+pub fn init(boot_slide: Option<u64>) {
     // Step 1: Enable PCID if CPU supports it
     let pcid_enabled = enable_pcid_if_supported();
 
     // Step 2: Build kernel layout from linker symbols
     // This populates section bounds accurately even without bootloader-assisted KASLR
     let layout = build_kernel_layout_from_linker();
+
+    // R39-7 FIX: Verify bootloader slide matches runtime-detected slide
+    if let Some(expected) = boot_slide {
+        if expected != 0 && expected != layout.kaslr_slide {
+            println!(
+                "  ! KASLR slide mismatch: bootloader=0x{:x}, runtime=0x{:x}",
+                expected, layout.kaslr_slide
+            );
+        }
+    }
+
     set_kernel_layout(layout);
 
     // Report status

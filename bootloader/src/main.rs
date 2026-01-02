@@ -14,6 +14,73 @@ use uefi::Identify;
 use xmas_elf::program::Type;
 use xmas_elf::ElfFile;
 
+// ============================================================================
+// R39-7 FIX: KASLR Configuration
+// ============================================================================
+
+/// Kernel load base physical address (matches kernel/security/kaslr.rs)
+const KERNEL_PHYS_BASE: u64 = 0x100000;
+
+/// Maximum KASLR slide (512 MiB, within the 1GB high-half mapping)
+const KASLR_MAX_SLIDE: u64 = 512 * 1024 * 1024;
+
+/// KASLR slide granularity (2 MiB aligned for huge page compatibility)
+const KASLR_SLIDE_GRANULARITY: u64 = 2 * 1024 * 1024;
+
+/// Generate a random KASLR slide using RDRAND
+///
+/// Returns 0 if RDRAND is unavailable or fails
+///
+/// # Note (R39-7)
+///
+/// KASLR is currently disabled because the kernel is not compiled as
+/// position-independent code (PIE). The kernel has absolute addresses
+/// that don't work when relocated. To enable KASLR, the kernel must be:
+/// 1. Compiled with -C relocation-model=pie
+/// 2. Have relocation information in the ELF
+/// 3. Have the bootloader apply relocations at load time
+///
+/// The infrastructure is in place for future PIE kernel support.
+fn generate_kaslr_slide() -> u64 {
+    // R39-7: KASLR disabled - kernel is not PIE
+    // TODO: Enable once kernel is built as PIE with relocation support
+    #[cfg(feature = "kaslr")]
+    {
+        let max_slots = KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY;
+        if max_slots == 0 {
+            return 0;
+        }
+
+        let mut val: u64 = 0;
+        let success: u8;
+
+        // Use RDRAND instruction to get random value
+        unsafe {
+            core::arch::asm!(
+                "rdrand {val}",
+                "setc {success}",
+                val = out(reg) val,
+                success = out(reg_byte) success,
+                options(nostack, nomem),
+            );
+        }
+
+        if success == 1 {
+            // Generate slide as multiple of granularity
+            (val % (max_slots + 1)) * KASLR_SLIDE_GRANULARITY
+        } else {
+            // RDRAND failed, disable KASLR
+            0
+        }
+    }
+
+    #[cfg(not(feature = "kaslr"))]
+    {
+        // KASLR disabled: return 0 slide
+        0
+    }
+}
+
 /// 内存映射信息，传递给内核
 #[repr(C)]
 pub struct MemoryMapInfo {
@@ -58,6 +125,8 @@ pub struct FramebufferInfo {
 pub struct BootInfo {
     pub memory_map: MemoryMapInfo,
     pub framebuffer: FramebufferInfo,
+    /// R39-7 FIX: KASLR slide value (0 if KASLR disabled)
+    pub kaslr_slide: u64,
 }
 
 #[entry]
@@ -67,7 +136,9 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     info!("Rust Microkernel Bootloader v0.1");
     info!("Initializing...");
 
-    let entry_point = {
+    // R39-7 FIX: Get entry point, KASLR slide, and kernel size from loading block
+    // Codex Review Fix: kernel_size needed for accurate page table setup
+    let (entry_point, kaslr_slide, kernel_size) = {
         let boot_services = system_table.boot_services();
 
         let fs_handle = boot_services
@@ -167,34 +238,60 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         }
 
         // 分配一块连续的内存来容纳整个内核
-        let kernel_phys_base = 0x100000u64;
+        // R39-7 FIX: KASLR - try to allocate at randomized address first
+        let mut kaslr_slide = generate_kaslr_slide();
+        let mut kernel_phys_base = KERNEL_PHYS_BASE + kaslr_slide;
         let kernel_size = (max_addr - min_addr) as usize;
         let pages = (kernel_size + 0xFFF) / 0x1000;
 
         info!(
-            "Allocating {} pages ({} bytes) for kernel at 0x{:x}",
-            pages, kernel_size, kernel_phys_base
+            "Allocating {} pages ({} bytes) for kernel at 0x{:x} (KASLR slide=0x{:x})",
+            pages, kernel_size, kernel_phys_base, kaslr_slide
         );
 
         // 尝试在指定地址分配整块内存
-        // 注意：页表映射硬编码依赖内核在 0x100000，因此必须在此地址分配成功
+        // R39-7 FIX: Try KASLR address first, fall back to fixed address if unavailable
         let result = boot_services.allocate_pages(
             AllocateType::Address(kernel_phys_base),
             MemoryType::LOADER_DATA,
             pages,
         );
 
-        if result.is_err() {
-            panic!(
-                "FATAL: Cannot allocate kernel memory at required address 0x{:x}. \
-                    Page table mappings require kernel at this fixed address. \
-                    Ensure no UEFI runtime or reserved regions overlap.",
-                kernel_phys_base
-            );
-        }
+        let actual_phys_base = match result {
+            Ok(_) => kernel_phys_base,
+            Err(status) => {
+                if kaslr_slide != 0 {
+                    // KASLR address unavailable, retry without slide
+                    info!(
+                        "KASLR slide 0x{:x} unavailable ({:?}), retrying at fixed address",
+                        kaslr_slide, status
+                    );
+                    kaslr_slide = 0;
+                    kernel_phys_base = KERNEL_PHYS_BASE;
 
-        // 使用固定的物理基址（页表映射依赖此值）
-        let actual_phys_base = kernel_phys_base;
+                    let fallback = boot_services.allocate_pages(
+                        AllocateType::Address(kernel_phys_base),
+                        MemoryType::LOADER_DATA,
+                        pages,
+                    );
+
+                    if fallback.is_err() {
+                        panic!(
+                            "FATAL: Cannot allocate kernel memory at fixed address 0x{:x}",
+                            kernel_phys_base
+                        );
+                    }
+                    kernel_phys_base
+                } else {
+                    panic!(
+                        "FATAL: Cannot allocate kernel memory at required address 0x{:x}. \
+                            Page table mappings require kernel at this fixed address. \
+                            Ensure no UEFI runtime or reserved regions overlap.",
+                        kernel_phys_base
+                    );
+                }
+            }
+        };
 
         info!("Kernel memory allocated at 0x{:x}", actual_phys_base);
 
@@ -263,8 +360,13 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
         // 链接脚本现在将入口点设置为 0xffffffff80100000
         // 这对应物理地址 0x100000，通过页表映射正确
-        info!("Using ELF entry point: 0x{:x}", entry_point);
-        entry_point
+        // R39-7 FIX: Apply KASLR slide to entry point
+        let adjusted_entry = entry_point + kaslr_slide;
+        info!(
+            "Using ELF entry point: 0x{:x} (slide applied: 0x{:x}, final: 0x{:x})",
+            entry_point, kaslr_slide, adjusted_entry
+        );
+        (adjusted_entry, kaslr_slide, kernel_size) // R39-7: Return entry, slide, and size
     };
 
     // 测试 VGA 缓冲区是否可访问 - 在 info! 之前
@@ -331,20 +433,29 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         core::ptr::write_bytes(pd_ptr as *mut u8, 0, 4096);
 
         // 使用2MB大页映射内核
-        // 虚拟地址 0xffffffff80000000 映射到物理地址 0x100000
+        // 虚拟地址 0xffffffff80000000 映射到物理地址 0
         // 由于使用2MB大页，必须从2MB边界开始，所以实际映射：
-        // 虚拟 0xffffffff80000000 → 物理 0x0 (包含0x100000)
-        // 这样内核在物理 0x100000 处的代码对应虚拟地址 0xffffffff80100000
+        // 虚拟 0xffffffff80000000 → 物理 0x0
+        // 内核在物理 KERNEL_PHYS_BASE + kaslr_slide 处
         //
         // W^X 安全说明：
-        // - PD[0] (0x0-0x200000) 包含内核所有段（.text/.rodata/.data/.bss）
+        // - R39-7 FIX: 计算哪些 PD 条目包含内核（基于 KASLR slide）
+        //   只有包含内核的条目设为可执行，其他设为 NX
         //   由于 2MB 粒度太粗，无法正确分离代码和数据
         //   暂时保持 RWX，由内核启动后通过 enforce_nx_for_kernel() 拆分为 4KB 页
-        // - 其他 PD 条目设为 RW+NX
+        //
+        // R39-7 FIX: Calculate which PD entries contain the kernel
+        // Kernel is loaded at physical address KERNEL_PHYS_BASE + kaslr_slide
+        // Codex Review Fix: Use actual kernel_size instead of hardcoded value
+        let kernel_phys_start = KERNEL_PHYS_BASE + kaslr_slide;
+        let kernel_phys_end = kernel_phys_start + (kernel_size as u64);
+        let start_pd_idx = (kernel_phys_start / 0x200000) as usize;
+        let end_pd_idx = (kernel_phys_end / 0x200000) as usize;
+
         for i in 0..512usize {
             let phys_addr = PhysAddr::new((i as u64) * 0x200000);
-            let flags = if i == 0 {
-                // 内核映像所在区域：暂时 RWX，由内核后续加固
+            let flags = if i >= start_pd_idx && i <= end_pd_idx {
+                // R39-7 FIX: 内核映像所在区域：暂时 RWX，由内核后续加固
                 Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE
             } else {
                 // 数据区域：可写不可执行
@@ -536,6 +647,7 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 descriptor_version: memory_map_meta.desc_version,
             },
             framebuffer: framebuffer_info,
+            kaslr_slide, // R39-7 FIX: Pass KASLR slide to kernel
         };
         // 阻止 memory_map 被释放，因为内核需要访问它
         core::mem::forget(memory_map);

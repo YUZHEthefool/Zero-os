@@ -314,6 +314,55 @@ struct RequestBuffer {
     status: u8,
     /// In use flag.
     in_use: bool,
+    /// R39-1 FIX: In-flight tracking metadata for safe completion handling.
+    pending: Option<RequestMeta>,
+}
+
+/// R39-1 FIX: Metadata tracked per in-flight request to safely pair completions.
+///
+/// This structure stores all information needed to correctly free resources
+/// when a completion arrives, preventing UAF on stale completions.
+struct RequestMeta {
+    /// Head descriptor index (matches used.id from the device).
+    head: u16,
+    /// Descriptor indices used by this request.
+    desc_chain: [u16; 3],
+    /// Number of valid descriptors in desc_chain.
+    desc_count: usize,
+    /// Physical address of the header+status DMA buffer.
+    header_status_dma_phys: u64,
+    /// Allocated size of the header+status DMA buffer.
+    header_status_dma_size: usize,
+    /// Virtual address of the header+status DMA buffer.
+    header_status_dma_virt: *mut u8,
+    /// Size of the request header in bytes.
+    header_size: usize,
+    /// Request kind (I/O or flush) with data buffer tracking.
+    kind: RequestKind,
+    /// Marked when timed out so late completions are treated as stale.
+    abandoned: bool,
+}
+
+/// R39-1 FIX: Type of request for proper resource cleanup.
+enum RequestKind {
+    /// I/O request (read or write) with data buffer.
+    Io {
+        data_dma_phys: u64,
+        data_dma_len: usize,
+        data_dma_virt: *mut u8,
+        data_buf: *mut u8,
+        is_write: bool,
+    },
+    /// Flush request (no data buffer).
+    Flush,
+}
+
+/// R39-1 FIX: Completion result types.
+enum RequestCompletion {
+    /// I/O request completed with result.
+    Io(Result<usize, BlockError>),
+    /// Flush request completed with result.
+    Flush(Result<(), BlockError>),
 }
 
 // SAFETY: VirtioBlkDevice is designed for single-threaded access
@@ -480,6 +529,7 @@ impl VirtioBlkDevice {
                 header: VirtioBlkReqHeader::default(),
                 status: 0,
                 in_use: false,
+                pending: None,  // R39-1 FIX: Initialize pending metadata
             });
         }
 
@@ -541,6 +591,137 @@ impl VirtioBlkDevice {
         unsafe {
             self.transport.notify(0, self.queue.notify_off);
         }
+    }
+
+    /// R39-1 FIX: Match a used ring entry to the correct request and complete it.
+    ///
+    /// This method finds the request that corresponds to the given `used.id`,
+    /// frees its resources correctly, and returns the completion result.
+    /// For abandoned (timed-out) requests, it cleans up silently and returns None.
+    fn complete_used_entry(&self, used: VringUsedElem) -> Option<RequestCompletion> {
+        let mut buffers = self.req_buffers.lock();
+
+        // Find the request buffer matching this completion's head descriptor
+        let (_idx, buffer) = match buffers.iter_mut().enumerate().find(|(_, b)| {
+            b.in_use
+                && b.pending
+                    .as_ref()
+                    .map(|meta| meta.head as u32 == used.id)
+                    .unwrap_or(false)
+        }) {
+            Some(entry) => entry,
+            None => {
+                println!(
+                    "[virtio-blk] completion for unknown descriptor head={} ignored",
+                    used.id
+                );
+                return None;
+            }
+        };
+
+        // Take ownership of the metadata
+        let meta = match buffer.pending.take() {
+            Some(m) => m,
+            None => {
+                println!(
+                    "[virtio-blk] completion for descriptor head={} without metadata",
+                    used.id
+                );
+                return None;
+            }
+        };
+
+        let RequestMeta {
+            head,
+            desc_chain,
+            desc_count,
+            header_status_dma_phys,
+            header_status_dma_size,
+            header_status_dma_virt,
+            header_size,
+            kind,
+            abandoned,
+        } = meta;
+
+        // Read status from DMA buffer
+        let status = unsafe { core::ptr::read(header_status_dma_virt.add(header_size)) };
+
+        // Process based on request kind
+        let (completion, data_dma_phys, data_dma_len) = match kind {
+            RequestKind::Io {
+                data_dma_phys,
+                data_dma_len,
+                data_dma_virt,
+                data_buf,
+                is_write,
+            } => {
+                // For successful reads on non-abandoned requests, copy data back
+                if !abandoned
+                    && status == blk_status::VIRTIO_BLK_S_OK
+                    && !is_write
+                    && data_dma_len > 0
+                {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(data_dma_virt, data_buf, data_dma_len);
+                    }
+                }
+
+                let res = if abandoned {
+                    None
+                } else {
+                    Some(RequestCompletion::Io(match status {
+                        blk_status::VIRTIO_BLK_S_OK => Ok(data_dma_len),
+                        blk_status::VIRTIO_BLK_S_IOERR => Err(BlockError::Io),
+                        blk_status::VIRTIO_BLK_S_UNSUPP => Err(BlockError::NotSupported),
+                        _ => Err(BlockError::Io),
+                    }))
+                };
+                (res, data_dma_phys, data_dma_len)
+            }
+            RequestKind::Flush => {
+                let res = if abandoned {
+                    None
+                } else {
+                    Some(RequestCompletion::Flush(match status {
+                        blk_status::VIRTIO_BLK_S_OK => Ok(()),
+                        blk_status::VIRTIO_BLK_S_UNSUPP => Err(BlockError::NotSupported),
+                        _ => Err(BlockError::Io),
+                    }))
+                };
+                (res, 0, 0)
+            }
+        };
+
+        // Free descriptors back to the pool
+        for idx in desc_chain.iter().take(desc_count) {
+            self.queue.free_desc(*idx);
+        }
+
+        // Free DMA buffers
+        if data_dma_len > 0 {
+            Self::free_dma_memory(data_dma_phys, data_dma_len);
+        }
+        Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
+
+        // Release the request buffer slot
+        buffer.in_use = false;
+
+        // Handle abandoned requests (late completions)
+        if abandoned {
+            // Decrement leaked counter since we've now recovered the resources
+            let _ = TIMEOUT_LEAKED_REQUESTS.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| v.checked_sub(1),
+            );
+            println!(
+                "[virtio-blk] late completion for abandoned request head={} status={}",
+                head, status
+            );
+            return None;
+        }
+
+        completion
     }
 
     /// Process a single synchronous request.
@@ -710,7 +891,32 @@ impl VirtioBlkDevice {
             d2.len = 1;
             d2.flags = VRING_DESC_F_WRITE;
             d2.next = 0;
+        }
 
+        // R39-1 FIX: Store request metadata BEFORE pushing to available ring
+        // This ensures we can properly match completions to requests
+        {
+            let mut buffers = self.req_buffers.lock();
+            buffers[buf_idx].pending = Some(RequestMeta {
+                head: desc0,
+                desc_chain: [desc0, desc1, desc2],
+                desc_count: 3,
+                header_status_dma_phys,
+                header_status_dma_size,
+                header_status_dma_virt,
+                header_size,
+                kind: RequestKind::Io {
+                    data_dma_phys: dma_phys,
+                    data_dma_len: buf.len(),
+                    data_dma_virt: dma_virt,
+                    data_buf: buf.as_mut_ptr(),
+                    is_write,
+                },
+                abandoned: false,
+            });
+        }
+
+        unsafe {
             // Push to available ring
             self.queue.push_avail(desc0);
         }
@@ -719,61 +925,65 @@ impl VirtioBlkDevice {
         mb();
         self.notify();
 
-        // Poll for completion
+        // R39-1 FIX: Poll for completion using proper request matching
         let mut timeout = 1_000_000u32;
-        while !self.queue.has_used() && timeout > 0 {
-            core::hint::spin_loop();
-            timeout -= 1;
+        let mut completion: Option<Result<usize, BlockError>> = None;
+
+        while timeout > 0 && completion.is_none() {
+            // Process all pending completions
+            while let Some(used) = self.queue.pop_used() {
+                match self.complete_used_entry(used) {
+                    Some(RequestCompletion::Io(res)) => {
+                        completion = Some(res);
+                        break;
+                    }
+                    Some(RequestCompletion::Flush(_)) => {
+                        // Unexpected flush completion during I/O wait
+                        println!(
+                            "[virtio-blk] unexpected flush completion while waiting for I/O head={}",
+                            desc0
+                        );
+                    }
+                    None => {
+                        // Stale completion handled, continue polling
+                    }
+                }
+            }
+
+            if completion.is_some() {
+                break;
+            }
+
+            if !self.queue.has_used() {
+                core::hint::spin_loop();
+                timeout -= 1;
+            }
         }
 
-        // Process completion
-        let result = if let Some(_used) = self.queue.pop_used() {
-            // Free descriptors
-            self.queue.free_desc(desc0);
-            self.queue.free_desc(desc1);
-            self.queue.free_desc(desc2);
-
-            // Read status from DMA buffer (device wrote to status_phys)
-            let status = unsafe { core::ptr::read(header_status_dma_virt.add(header_size)) };
-
-            match status {
-                blk_status::VIRTIO_BLK_S_OK => {
-                    // For reads: copy from DMA buffer back to caller buffer
-                    if !is_write {
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(dma_virt, buf.as_mut_ptr(), buf.len());
-                        }
+        // R39-1 FIX: Handle timeout by marking request as abandoned
+        let result = match completion {
+            Some(res) => res,
+            None => {
+                // Timeout - mark request as abandoned (resources freed on late completion)
+                let leaked = TIMEOUT_LEAKED_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+                {
+                    let mut buffers = self.req_buffers.lock();
+                    if let Some(meta) = buffers[buf_idx].pending.as_mut() {
+                        meta.abandoned = true;
                     }
-                    Ok(buf.len())
                 }
-                blk_status::VIRTIO_BLK_S_IOERR => Err(BlockError::Io),
-                blk_status::VIRTIO_BLK_S_UNSUPP => Err(BlockError::NotSupported),
-                _ => Err(BlockError::Io),
+                println!(
+                    "[virtio-blk] timeout waiting for request head={} sector={} bytes={}, \
+                     buffers pinned (reset required, total leaked={})",
+                    desc0, sector, buf.len(), leaked
+                );
+                // Leave req_buffers[buf_idx].in_use = true to prevent reuse until device completes
+                return Err(BlockError::Io);
             }
-        } else {
-            // R37-3 FIX: Timeout - DO NOT free descriptors or DMA buffers.
-            // The device may complete the request later, causing DMA into freed memory (UAF).
-            // Keep buffers pinned; a device reset is required to safely recover.
-            // R37-3 FIX (Codex review): Track leaked resources for diagnostics.
-            let leaked = TIMEOUT_LEAKED_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
-            println!(
-                "[virtio-blk] timeout waiting for request sector={} bytes={}, buffers pinned \
-                (reset required, total leaked={})",
-                sector, buf.len(), leaked
-            );
-            // Leave req_buffers[buf_idx].in_use = true to prevent reuse
-            return Err(BlockError::Io);
         };
 
-        // Free DMA bounce buffers (only reached on successful completion)
-        Self::free_dma_memory(dma_phys, buf.len());
-        Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
-
-        // Release buffer
-        {
-            let mut buffers = self.req_buffers.lock();
-            buffers[buf_idx].in_use = false;
-        }
+        // R39-1 FIX: Resources are now freed by complete_used_entry()
+        // No need to free DMA buffers or release buffer slot here
 
         result
     }
@@ -1010,7 +1220,25 @@ impl BlockDevice for VirtioBlkDevice {
             d1.len = 1;
             d1.flags = VRING_DESC_F_WRITE;
             d1.next = 0;
+        }
 
+        // R39-1 FIX: Store request metadata BEFORE pushing to available ring
+        {
+            let mut buffers = self.req_buffers.lock();
+            buffers[buf_idx].pending = Some(RequestMeta {
+                head: desc0,
+                desc_chain: [desc0, desc1, 0],  // Only 2 descriptors for flush
+                desc_count: 2,
+                header_status_dma_phys,
+                header_status_dma_size,
+                header_status_dma_virt,
+                header_size,
+                kind: RequestKind::Flush,
+                abandoned: false,
+            });
+        }
+
+        unsafe {
             // Push to available ring
             self.queue.push_avail(desc0);
         }
@@ -1019,46 +1247,64 @@ impl BlockDevice for VirtioBlkDevice {
         mb();
         self.notify();
 
-        // Poll for completion
+        // R39-1 FIX: Poll for completion using proper request matching
         let mut timeout = 1_000_000u32;
-        while !self.queue.has_used() && timeout > 0 {
-            core::hint::spin_loop();
-            timeout -= 1;
+        let mut completion: Option<Result<(), BlockError>> = None;
+
+        while timeout > 0 && completion.is_none() {
+            // Process all pending completions
+            while let Some(used) = self.queue.pop_used() {
+                match self.complete_used_entry(used) {
+                    Some(RequestCompletion::Flush(res)) => {
+                        completion = Some(res);
+                        break;
+                    }
+                    Some(RequestCompletion::Io(_)) => {
+                        // Unexpected I/O completion during flush wait
+                        println!(
+                            "[virtio-blk] unexpected I/O completion while waiting for flush head={}",
+                            desc0
+                        );
+                    }
+                    None => {
+                        // Stale completion handled, continue polling
+                    }
+                }
+            }
+
+            if completion.is_some() {
+                break;
+            }
+
+            if !self.queue.has_used() {
+                core::hint::spin_loop();
+                timeout -= 1;
+            }
         }
 
-        // Process completion
-        let result = if let Some(_used) = self.queue.pop_used() {
-            // Free descriptors
-            self.queue.free_desc(desc0);
-            self.queue.free_desc(desc1);
-
-            // Read status from DMA buffer
-            let status = unsafe { core::ptr::read(header_status_dma_virt.add(header_size)) };
-            match status {
-                blk_status::VIRTIO_BLK_S_OK => Ok(()),
-                blk_status::VIRTIO_BLK_S_UNSUPP => Err(BlockError::NotSupported),
-                _ => Err(BlockError::Io),
+        // R39-1 FIX: Handle timeout by marking request as abandoned
+        let result = match completion {
+            Some(res) => res,
+            None => {
+                // Timeout - mark request as abandoned (resources freed on late completion)
+                let leaked = TIMEOUT_LEAKED_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+                {
+                    let mut buffers = self.req_buffers.lock();
+                    if let Some(meta) = buffers[buf_idx].pending.as_mut() {
+                        meta.abandoned = true;
+                    }
+                }
+                println!(
+                    "[virtio-blk] flush timeout head={}, buffers pinned (reset required, total leaked={})",
+                    desc0, leaked
+                );
+                // Leave req_buffers[buf_idx].in_use = true to prevent reuse
+                return Err(BlockError::Io);
             }
-        } else {
-            // R37-3 FIX: Timeout - DO NOT free descriptors or DMA buffers.
-            // The device may complete later, causing DMA into freed memory (UAF).
-            // Keep buffers pinned; a device reset is required to safely recover.
-            // R37-3 FIX (Codex review): Track leaked resources for diagnostics.
-            let leaked = TIMEOUT_LEAKED_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
-            println!(
-                "[virtio-blk] flush timeout, buffers pinned (reset required, total leaked={})",
-                leaked
-            );
-            // Leave req_buffers[buf_idx].in_use = true to prevent reuse
-            return Err(BlockError::Io);
         };
 
-        // Free DMA buffer and release request slot (only reached on successful completion)
-        Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
-        {
-            let mut buffers = self.req_buffers.lock();
-            buffers[buf_idx].in_use = false;
-        }
+        // R39-1 FIX: Resources are now freed by complete_used_entry()
+        // No need to free DMA buffers or release buffer slot here
 
         result
     }

@@ -364,6 +364,7 @@ pub enum SyscallError {
     ERANGE = -34,  // 结果超出范围
     ENOSYS = -38,  // 功能未实现
     ENOTEMPTY = -39, // 目录非空
+    ETIMEDOUT = -110, // R39-6 FIX: 操作超时
 }
 
 impl SyscallError {
@@ -456,7 +457,8 @@ pub type FdCloseCallback = fn(i32) -> Result<(), SyscallError>;
 ///
 /// 由 ipc 模块注册，处理 FUTEX_WAIT 和 FUTEX_WAKE 操作
 /// 参数: (uaddr, op, val, current_value) -> result 或错误
-pub type FutexCallback = fn(usize, i32, u32, u32) -> Result<usize, SyscallError>;
+/// R39-6 FIX: 增加 timeout_ns 参数支持 FUTEX_WAIT_TIMEOUT
+pub type FutexCallback = fn(usize, i32, u32, u32, Option<u64>) -> Result<usize, SyscallError>;
 
 /// VFS 打开文件回调类型
 ///
@@ -968,13 +970,15 @@ fn lsm_current_process_ctx() -> Option<lsm::ProcessCtx> {
 /// Build an LSM ProcessCtx from a locked Process struct.
 #[inline]
 fn lsm_process_ctx_from(proc: &crate::process::Process) -> lsm::ProcessCtx {
+    // R39-3 FIX: 使用共享凭证读取 uid/gid/euid/egid
+    let creds = proc.credentials.read();
     lsm::ProcessCtx::new(
         proc.pid,
         proc.tgid,
-        proc.uid,
-        proc.gid,
-        proc.euid,
-        proc.egid,
+        creds.uid,
+        creds.gid,
+        creds.euid,
+        creds.egid,
     )
 }
 
@@ -1036,7 +1040,11 @@ pub fn syscall_dispatcher(
 
     match verdict.action {
         seccomp::SeccompAction::Kill => {
-            // R25-4 FIX: Kill process with SIGSYS semantics - audit and terminate
+            // R25-4 + R39-2 FIX: Kill process with SIGSYS semantics and NEVER return
+            //
+            // SECURITY: After terminating the process, we must not return to userspace.
+            // The process state is now invalid (PCB cleaned up, memory potentially freed).
+            // Returning would cause UAF and complete seccomp bypass.
             if let Some(creds) = crate::current_credentials() {
                 if let Some(pid) = crate::process::current_pid() {
                     seccomp::notify_violation(
@@ -1047,15 +1055,24 @@ pub fn syscall_dispatcher(
                         &verdict,
                         timestamp,
                     );
-                    // Actually terminate the process (SIGSYS exit code: 128 + 31)
+                    // Terminate with SIGSYS exit code (128 + 31 = 159)
                     crate::process::terminate_process(pid, 128 + 31);
                     crate::process::cleanup_zombie(pid);
                 }
             }
-            return SyscallError::EPERM as i64;
+            // R39-2 FIX: Never return to userspace after fatal seccomp action.
+            // Force scheduler to pick another task. If no tasks exist, CPU halts.
+            crate::scheduler_hook::force_reschedule();
+            // Safety: If reschedule returns (no other tasks), spin forever.
+            // This path should not be reached in normal operation.
+            loop {
+                core::hint::spin_loop();
+            }
         }
         seccomp::SeccompAction::Trap => {
-            // R25-4 FIX: Trap treated as fatal until SIGSYS delivery is implemented
+            // R25-4 + R39-2 FIX: Trap treated as fatal until SIGSYS delivery exists
+            //
+            // SECURITY: Same rationale as Kill - process is terminated, never return.
             if let Some(creds) = crate::current_credentials() {
                 if let Some(pid) = crate::process::current_pid() {
                     seccomp::notify_violation(
@@ -1071,7 +1088,11 @@ pub fn syscall_dispatcher(
                     crate::process::cleanup_zombie(pid);
                 }
             }
-            return SyscallError::EPERM as i64;
+            // R39-2 FIX: Never return to userspace after fatal seccomp action.
+            crate::scheduler_hook::force_reschedule();
+            loop {
+                core::hint::spin_loop();
+            }
         }
         seccomp::SeccompAction::Errno(e) => {
             // Return the error code - audit the violation
@@ -1195,7 +1216,8 @@ pub fn syscall_dispatcher(
         158 => sys_arch_prctl(arg0 as i32, arg1 as u64),
 
         // Futex
-        202 => sys_futex(arg0 as usize, arg1 as i32, arg2 as u32),
+        // R39-6 FIX: 传递第4个参数用于超时
+        202 => sys_futex(arg0 as usize, arg1 as i32, arg2 as u32, arg3 as usize),
 
         // 安全/沙箱 (Seccomp/Prctl)
         157 => sys_prctl(arg0 as i32, arg1, arg2, arg3, arg4),
@@ -1445,10 +1467,7 @@ fn sys_clone(
         parent_user_stack,
         parent_fs_base,
         parent_gs_base,
-        parent_uid,
-        parent_gid,
-        parent_euid,
-        parent_egid,
+        parent_credentials_arc,  // R39-3 FIX: 共享凭证 Arc
         parent_umask,
         parent_seccomp_state,
         parent_pledge_state,
@@ -1474,10 +1493,7 @@ fn sys_clone(
             parent.user_stack,
             parent.fs_base,
             parent.gs_base,
-            parent.uid,
-            parent.gid,
-            parent.euid,
-            parent.egid,
+            parent.credentials.clone(),  // R39-3 FIX: 获取凭证 Arc
             parent.umask,
             parent.seccomp_state.clone(),
             parent.pledge_state.clone(),
@@ -1662,11 +1678,19 @@ fn sys_clone(
             child.clear_child_tid = child_tid as u64;
         }
 
-        // 复制凭证
-        child.uid = parent_uid;
-        child.gid = parent_gid;
-        child.euid = parent_euid;
-        child.egid = parent_egid;
+        // R39-3 FIX: 复制/共享凭证
+        //
+        // CLONE_THREAD: 共享父进程的凭证 Arc（符合 POSIX 线程语义）
+        // 非 CLONE_THREAD: 克隆凭证到新的 Arc（进程隔离）
+        //
+        // 这确保同一进程的线程共享 setuid/setgid 变更，
+        // 而不同进程保持凭证独立。
+        if flags & CLONE_THREAD != 0 {
+            child.credentials = parent_credentials_arc.clone();
+        } else {
+            let creds_copy = parent_credentials_arc.read().clone();
+            child.credentials = Arc::new(spin::RwLock::new(creds_copy));
+        }
         child.umask = parent_umask;
 
         // 继承 Seccomp/Pledge 沙箱状态
@@ -2083,6 +2107,18 @@ fn sys_exec(
         // 返回到空闲列表，同时递增生成计数器防止旧 CapId 被复用。
         proc.cap_table.apply_cloexec();
 
+        // R39-4 FIX: 应用 FD_CLOEXEC：关闭带有 close-on-exec 标志的文件描述符
+        //
+        // POSIX 语义：exec 成功后，所有标记为 O_CLOEXEC/FD_CLOEXEC 的文件描述符
+        // 必须被关闭。这防止敏感句柄（如特权设备、安全令牌）泄漏到新程序。
+        //
+        // 典型攻击场景：
+        // 1. 父进程以 root 权限打开 /dev/vda 但忘记设置 CLOEXEC
+        // 2. exec 不可信程序后，该程序意外获得块设备访问权限
+        //
+        // 注意：此操作必须在 commit 之前执行，确保 exec 回滚时 fd 不变
+        proc.apply_fd_cloexec();
+
         proc.state = ProcessState::Ready;
 
         old_space
@@ -2357,8 +2393,9 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
             let sender_creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
 
             // 获取目标进程凭证
+            // R39-3 FIX: 使用共享凭证读取目标进程 uid
             let target = get_process(pid).ok_or(SyscallError::ESRCH)?;
-            let target_uid = target.lock().uid;
+            let target_uid = target.lock().credentials.read().uid;
 
             // POSIX 权限检查：
             // 1. Root (euid == 0) 可以发信号给任何进程
@@ -2756,10 +2793,22 @@ fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
         }
     }
 
+    // R39-4 FIX: O_CLOEXEC 常量定义
+    const O_CLOEXEC: u32 = 0x80000;
+
     // 分配文件描述符并存入 fd_table
     let fd = {
         let mut proc = process.lock();
-        proc.allocate_fd(file_ops).ok_or(SyscallError::EMFILE)?
+        let fd = proc.allocate_fd(file_ops).ok_or(SyscallError::EMFILE)?;
+
+        // R39-4 FIX: 如果 flags 包含 O_CLOEXEC，标记 fd 为 close-on-exec
+        //
+        // 这样 exec 时会自动关闭此 fd，防止敏感句柄泄漏到子进程
+        if open_flags & O_CLOEXEC != 0 {
+            proc.set_fd_cloexec(fd, true);
+        }
+
+        fd
     };
 
     Ok(fd as usize)
@@ -4094,16 +4143,19 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
 /// # Arguments
 ///
 /// * `uaddr` - 用户空间 futex 地址（指向 u32）
-/// * `op` - 操作码：0=FUTEX_WAIT, 1=FUTEX_WAKE
+/// * `op` - 操作码：0=FUTEX_WAIT, 1=FUTEX_WAKE, 2=FUTEX_WAIT_TIMEOUT
 /// * `val` - FUTEX_WAIT: 期望值；FUTEX_WAKE: 最大唤醒数量
+/// * `timeout_ptr` - R39-6 FIX: 超时结构指针（仅 FUTEX_WAIT_TIMEOUT 使用）
 ///
 /// # Returns
 ///
 /// * FUTEX_WAIT: 成功阻塞并被唤醒返回 0，值不匹配返回 EAGAIN
+/// * FUTEX_WAIT_TIMEOUT: 同上，超时返回 ETIMEDOUT
 /// * FUTEX_WAKE: 返回实际唤醒的进程数量
-fn sys_futex(uaddr: usize, op: i32, val: u32) -> SyscallResult {
+fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: usize) -> SyscallResult {
     const FUTEX_WAIT: i32 = 0;
     const FUTEX_WAKE: i32 = 1;
+    const FUTEX_WAIT_TIMEOUT: i32 = 2;
 
     // 验证用户指针
     if uaddr == 0 {
@@ -4119,7 +4171,7 @@ fn sys_futex(uaddr: usize, op: i32, val: u32) -> SyscallResult {
     verify_user_memory(
         uaddr as *const u8,
         core::mem::size_of::<u32>(),
-        op == FUTEX_WAIT,
+        op == FUTEX_WAIT || op == FUTEX_WAIT_TIMEOUT,
     )?;
 
     // 获取回调函数
@@ -4128,8 +4180,8 @@ fn sys_futex(uaddr: usize, op: i32, val: u32) -> SyscallResult {
         *callback.as_ref().ok_or(SyscallError::ENOSYS)?
     };
 
-    // 对于 FUTEX_WAIT，需要先读取当前值
-    let current_value = if op == FUTEX_WAIT {
+    // 对于 FUTEX_WAIT/FUTEX_WAIT_TIMEOUT，需要先读取当前值
+    let current_value = if op == FUTEX_WAIT || op == FUTEX_WAIT_TIMEOUT {
         // 读取 futex 字（安全：已验证用户内存）
         let mut value_bytes = [0u8; 4];
         copy_from_user(&mut value_bytes, uaddr as *const u8)?;
@@ -4138,8 +4190,40 @@ fn sys_futex(uaddr: usize, op: i32, val: u32) -> SyscallResult {
         0 // FUTEX_WAKE 不需要当前值
     };
 
+    // R39-6 FIX: 解析可选超时（纳秒）
+    let timeout_ns = if op == FUTEX_WAIT_TIMEOUT && timeout_ptr != 0 {
+        // 验证 timespec 结构可读
+        verify_user_memory(
+            timeout_ptr as *const u8,
+            core::mem::size_of::<TimeSpec>(),
+            false,
+        )?;
+
+        // 读取 timespec
+        let mut ts_bytes = [0u8; 16]; // sizeof(TimeSpec) = 16
+        copy_from_user(&mut ts_bytes, timeout_ptr as *const u8)?;
+
+        // 解析 timespec (tv_sec: i64, tv_nsec: i64)
+        let tv_sec = i64::from_ne_bytes(ts_bytes[0..8].try_into().unwrap());
+        let tv_nsec = i64::from_ne_bytes(ts_bytes[8..16].try_into().unwrap());
+
+        // 验证 timespec 有效性
+        if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 {
+            return Err(SyscallError::EINVAL);
+        }
+
+        // 转换为纳秒
+        Some(
+            (tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(tv_nsec as u64),
+        )
+    } else {
+        None
+    };
+
     // 调用 IPC 模块的 futex 实现
-    futex_fn(uaddr, op, val, current_value)
+    futex_fn(uaddr, op, val, current_value, timeout_ns)
 }
 
 // ============================================================================
@@ -4588,9 +4672,13 @@ fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
     let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
     let cloned = src.clone_box();
 
-    // 如果newfd已打开，先关闭它
-    proc.fd_table.remove(&newfd);
+    // R39-4 FIX: 使用 remove_fd 代替直接操作 fd_table
+    // 这样会同时清除 newfd 的 CLOEXEC 标记
+    //
+    // POSIX: dup2 创建的新 fd 不继承 CLOEXEC 标志
+    proc.remove_fd(newfd);
     proc.fd_table.insert(newfd, cloned);
+    // newfd 不设置 CLOEXEC（这是 dup2 的标准行为）
 
     Ok(newfd as usize)
 }
@@ -4620,10 +4708,16 @@ fn sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> SyscallResult {
     let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
     let cloned = src.clone_box();
 
-    proc.fd_table.remove(&newfd);
+    // R39-4 FIX: 使用 remove_fd 清除旧 fd 的 CLOEXEC 标记
+    proc.remove_fd(newfd);
     proc.fd_table.insert(newfd, cloned);
 
-    // TODO: 如果flags包含O_CLOEXEC，标记fd为close-on-exec
+    // R39-4 FIX: 如果 flags 包含 O_CLOEXEC，标记 fd 为 close-on-exec
+    //
+    // dup3 相比 dup2 的唯一区别就是可以原子地设置 CLOEXEC
+    if flags & O_CLOEXEC != 0 {
+        proc.set_fd_cloexec(newfd, true);
+    }
 
     Ok(newfd as usize)
 }

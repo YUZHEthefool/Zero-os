@@ -1028,7 +1028,9 @@ fn get_current_creds() -> (u32, u32) {
     match table.get(pid) {
         Some(Some(proc)) => {
             let p = proc.lock();
-            (p.uid, p.gid)
+            // R39-3 FIX: 使用共享凭证读取 uid/gid
+            let creds = p.credentials.read();
+            (creds.uid, creds.gid)
         }
         _ => (0, 0),
     }
@@ -1116,7 +1118,9 @@ fn get_process_owner(pid: u32) -> (u32, u32) {
     match table.get(pid as usize) {
         Some(Some(proc)) => {
             let p = proc.lock();
-            (p.uid, p.gid)
+            // R39-3 FIX: 使用共享凭证读取 uid/gid
+            let creds = p.credentials.read();
+            (creds.uid, creds.gid)
         }
         _ => (0, 0),
     }
@@ -1211,6 +1215,8 @@ fn generate_status(pid: u32) -> String {
                 ProcessState::Zombie => "zombie",
                 ProcessState::Terminated => "dead",
             };
+            // R39-3 FIX: 使用共享凭证读取 uid/gid/euid/egid
+            let creds = p.credentials.read();
             format!(
                 "Name:\t{}\n\
                  Umask:\t{:04o}\n\
@@ -1227,8 +1233,8 @@ fn generate_status(pid: u32) -> String {
                 p.tgid,
                 p.pid,
                 p.ppid,
-                p.uid, p.euid, p.uid, p.uid,  // real, effective, saved, fs
-                p.gid, p.egid, p.gid, p.gid,
+                creds.uid, creds.euid, creds.uid, creds.uid,  // real, effective, saved, fs
+                creds.gid, creds.egid, creds.gid, creds.gid,
             )
         }
         _ => String::new(),

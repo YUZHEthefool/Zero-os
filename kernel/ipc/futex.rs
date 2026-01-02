@@ -2,6 +2,7 @@
 //!
 //! 提供用户空间快速互斥锁的内核支持，包括：
 //! - FUTEX_WAIT: 如果 *uaddr == val，阻塞当前进程；否则返回 EAGAIN
+//! - FUTEX_WAIT_TIMEOUT: 同上，但支持超时（R39-6 FIX）
 //! - FUTEX_WAKE: 唤醒最多 n 个在 uaddr 上等待的进程
 //!
 //! 使用全局 FutexTable，以 (pid, vaddr) 为键索引等待队列。
@@ -12,11 +13,13 @@ use alloc::sync::Arc;
 use kernel_core::process::{self, ProcessId};
 use spin::Mutex;
 
-use crate::sync::WaitQueue;
+use crate::sync::{WaitOutcome, WaitQueue};
 
 /// Futex 操作码
 pub const FUTEX_WAIT: i32 = 0;
 pub const FUTEX_WAKE: i32 = 1;
+/// R39-6 FIX: 带超时的等待
+pub const FUTEX_WAIT_TIMEOUT: i32 = 2;
 
 /// Futex 错误类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +32,8 @@ pub enum FutexError {
     Fault,
     /// 无当前进程
     NoProcess,
+    /// R39-6 FIX: 等待超时
+    TimedOut,
 }
 
 /// Futex 键：(线程组ID, 虚拟地址)
@@ -109,7 +114,7 @@ fn read_user_u32(uaddr: usize) -> Result<u32, FutexError> {
     }
 }
 
-/// FUTEX_WAIT 操作
+/// FUTEX_WAIT / FUTEX_WAIT_TIMEOUT 操作
 ///
 /// 如果 *uaddr == expected，则阻塞当前进程；否则返回 WouldBlock。
 ///
@@ -119,15 +124,17 @@ fn read_user_u32(uaddr: usize) -> Result<u32, FutexError> {
 /// * `uaddr` - 用户空间 futex 地址（已验证）
 /// * `expected` - 期望的值
 /// * `current_value` - 当前从用户空间读取的值（调用者负责验证和读取）
+/// * `timeout_ns` - R39-6 FIX: 可选超时时间（纳秒），None 表示无限等待
 ///
 /// # Returns
 ///
-/// 成功阻塞并被唤醒后返回 Ok(0)，值不匹配返回 WouldBlock
+/// 成功阻塞并被唤醒后返回 Ok(0)，值不匹配返回 WouldBlock，超时返回 TimedOut
 pub fn futex_wait(
     tgid: ProcessId,
     uaddr: usize,
     expected: u32,
     current_value: u32,
+    timeout_ns: Option<u64>,
 ) -> Result<usize, FutexError> {
     // 值不匹配，立即返回
     if current_value != expected {
@@ -176,9 +183,10 @@ pub fn futex_wait(
         }
     }
 
-    // 阻塞等待（WaitQueue::wait 会设置进程状态并触发调度）
+    // R39-6 FIX: 阻塞等待（支持可选超时）
+    // WaitQueue::wait_with_timeout 会设置进程状态并触发调度
     // 此时不持有桶锁，唤醒者可以安全地获取锁并调用 wake_n
-    let waited = queue.wait();
+    let outcome = queue.wait_with_timeout(timeout_ns);
 
     // 被唤醒后减少等待者计数
     {
@@ -191,10 +199,11 @@ pub fn futex_wait(
     // 尝试清理空桶
     cleanup_empty_bucket(key, &bucket);
 
-    if waited {
-        Ok(0)
-    } else {
-        Err(FutexError::NoProcess)
+    // R39-6 FIX: 根据等待结果返回
+    match outcome {
+        WaitOutcome::Woken => Ok(0),
+        WaitOutcome::TimedOut => Err(FutexError::TimedOut),
+        WaitOutcome::Closed | WaitOutcome::NoProcess => Err(FutexError::NoProcess),
     }
 }
 

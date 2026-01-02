@@ -277,8 +277,9 @@ pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, Signa
             let sender_creds = process::current_credentials().ok_or(SignalError::NoSuchProcess)?;
 
             // 获取目标进程凭证
+            // R39-3 FIX: 使用共享凭证读取目标进程 uid
             let target_arc = process::get_process(pid).ok_or(SignalError::NoSuchProcess)?;
-            let target_uid = target_arc.lock().uid;
+            let target_uid = target_arc.lock().credentials.read().uid;
 
             // POSIX 权限检查：
             // 1. Root (euid == 0) 可以发信号给任何进程

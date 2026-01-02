@@ -55,6 +55,8 @@ pub struct FramebufferInfo {
 pub struct BootInfo {
     pub memory_map: MemoryMapInfo,
     pub framebuffer: FramebufferInfo,
+    /// R39-7 FIX: KASLR slide value (0 if KASLR disabled)
+    pub kaslr_slide: u64,
 }
 
 /// UEFI 内存描述符（按 UEFI 规范布局）

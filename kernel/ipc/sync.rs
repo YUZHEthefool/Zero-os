@@ -7,11 +7,45 @@
 //!
 //! 这些原语是管道、消息队列阻塞操作的基础
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeSet, VecDeque};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use kernel_core::process::{self, ProcessId, ProcessState};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
+
+/// R39-6 FIX: 纳秒到毫秒 Tick 的转换常量（时钟频率 1kHz）
+const NS_PER_MS: u64 = 1_000_000;
+
+/// R39-6 FIX: 等待结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// 被正常唤醒
+    Woken,
+    /// 等待超时
+    TimedOut,
+    /// 队列已关闭
+    Closed,
+    /// 无当前进程
+    NoProcess,
+}
+
+/// R39-6 FIX: 定时等待者记录
+#[derive(Debug, Clone, Copy)]
+struct TimedWaiter {
+    /// 等待队列指针（用于匹配）
+    queue: usize,
+    /// 等待的进程ID
+    pid: ProcessId,
+    /// 超时截止时间（tick）
+    deadline_tick: u64,
+}
+
+/// R39-6 FIX: 全局定时等待者列表
+static TIMED_WAITERS: Mutex<Vec<TimedWaiter>> = Mutex::new(Vec::new());
+
+/// R39-6 FIX: 定时器回调是否已注册
+static WAITQUEUE_TIMER_INIT: AtomicBool = AtomicBool::new(false);
 
 /// 等待队列
 ///
@@ -22,20 +56,27 @@ use x86_64::instructions::interrupts;
 ///
 /// 添加 `closed` 标志防止在端点销毁后新的等待者加入，
 /// 避免永久阻塞和资源泄漏。
-#[derive(Debug)]
+///
+/// # R39-6 FIX: 超时支持
+///
+/// 添加 `timed_out` 集合记录因超时被唤醒的进程，
+/// 用于区分正常唤醒与超时唤醒。
 pub struct WaitQueue {
     /// 等待的进程ID列表
     waiters: Mutex<VecDeque<ProcessId>>,
     /// 当为 true 时不再接受新的等待者（用于端点销毁时取消阻塞）
     closed: AtomicBool,
+    /// R39-6 FIX: 标记因超时被唤醒的进程
+    timed_out: Mutex<BTreeSet<ProcessId>>,
 }
 
 impl WaitQueue {
     /// 创建新的等待队列
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         WaitQueue {
             waiters: Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
+            timed_out: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -48,15 +89,40 @@ impl WaitQueue {
     /// 如果队列已关闭（如端点被销毁），立即返回 false 而不阻塞，
     /// 防止进程在已销毁的端点上永久阻塞。
     pub fn wait(&self) -> bool {
+        matches!(self.wait_with_timeout(None), WaitOutcome::Woken)
+    }
+
+    /// R39-6 FIX: 将当前进程加入等待队列并阻塞（可选超时）
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout_ns` - 超时时间（纳秒），None 表示无限等待
+    ///
+    /// # Returns
+    ///
+    /// 返回等待结果，用于区分正常唤醒与超时唤醒。
+    pub fn wait_with_timeout(&self, timeout_ns: Option<u64>) -> WaitOutcome {
         let pid = match process::current_pid() {
             Some(p) => p,
-            None => return false,
+            None => return WaitOutcome::NoProcess,
         };
 
         // X-6: 快速检查 - 如果已关闭则不阻塞
         if self.closed.load(Ordering::Acquire) {
-            return false;
+            return WaitOutcome::Closed;
         }
+
+        // 零超时：直接返回超时
+        if matches!(timeout_ns, Some(0)) {
+            return WaitOutcome::TimedOut;
+        }
+
+        // 计算超时截止时间（tick）
+        let deadline_tick = timeout_ns.map(|ns| {
+            let ticks = (ns + NS_PER_MS - 1) / NS_PER_MS;
+            let ticks = if ticks == 0 { 1 } else { ticks };
+            kernel_core::get_ticks().saturating_add(ticks)
+        });
 
         let mut enqueued = false;
 
@@ -81,13 +147,54 @@ impl WaitQueue {
 
         // X-6: 如果未能入队（队列已关闭），直接返回
         if !enqueued {
-            return false;
+            return WaitOutcome::Closed;
+        }
+
+        // 注册超时
+        if let Some(deadline) = deadline_tick {
+            ensure_waitqueue_timer_registered();
+            register_timed_wait(self as *const _ as usize, pid, deadline);
         }
 
         // 触发调度，让出CPU
         kernel_core::force_reschedule();
 
-        true
+        // 唤醒后清理超时登记
+        if deadline_tick.is_some() {
+            cancel_timed_wait(self as *const _ as usize, pid);
+        }
+
+        // 检查是否因超时唤醒
+        if self.consume_timeout_flag(pid) {
+            WaitOutcome::TimedOut
+        } else {
+            WaitOutcome::Woken
+        }
+    }
+
+    /// R39-6 FIX: 标记指定进程因超时唤醒（从队列移除并设置为 Ready）
+    fn timeout_wake(&self, pid: ProcessId) {
+        interrupts::without_interrupts(|| {
+            let mut waiters = self.waiters.lock();
+            if let Some(pos) = waiters.iter().position(|&p| p == pid) {
+                waiters.remove(pos);
+            }
+            drop(waiters);
+
+            if let Some(proc_arc) = process::get_process(pid) {
+                let mut proc = proc_arc.lock();
+                if proc.state == ProcessState::Blocked {
+                    proc.state = ProcessState::Ready;
+                }
+            }
+
+            self.timed_out.lock().insert(pid);
+        });
+    }
+
+    /// R39-6 FIX: 消费超时标记
+    fn consume_timeout_flag(&self, pid: ProcessId) -> bool {
+        self.timed_out.lock().remove(&pid)
     }
 
     /// 唤醒等待队列中的一个进程
@@ -96,6 +203,8 @@ impl WaitQueue {
     pub fn wake_one(&self) -> Option<ProcessId> {
         interrupts::without_interrupts(|| {
             let pid = self.waiters.lock().pop_front()?;
+            // R39-6 FIX: 取消该进程的定时等待
+            cancel_timed_wait(self as *const _ as usize, pid);
 
             // 将进程状态设为就绪
             if let Some(proc_arc) = process::get_process(pid) {
@@ -118,6 +227,8 @@ impl WaitQueue {
             let count = waiters.len();
 
             while let Some(pid) = waiters.pop_front() {
+                // R39-6 FIX: 取消该进程的定时等待
+                cancel_timed_wait(self as *const _ as usize, pid);
                 if let Some(proc_arc) = process::get_process(pid) {
                     let mut proc = proc_arc.lock();
                     if proc.state == ProcessState::Blocked {
@@ -152,6 +263,8 @@ impl WaitQueue {
 
             while woken < n {
                 if let Some(pid) = waiters.pop_front() {
+                    // R39-6 FIX: 取消该进程的定时等待
+                    cancel_timed_wait(self as *const _ as usize, pid);
                     if let Some(proc_arc) = process::get_process(pid) {
                         let mut proc = proc_arc.lock();
                         if proc.state == ProcessState::Blocked {
@@ -246,6 +359,8 @@ impl WaitQueue {
             // 从队列中移除当前进程
             if let Some(pos) = waiters.iter().position(|&p| p == pid) {
                 waiters.remove(pos);
+                // R39-6 FIX: 取消定时等待
+                cancel_timed_wait(self as *const _ as usize, pid);
 
                 // 恢复进程状态为就绪
                 if let Some(proc_arc) = process::get_process(pid) {
@@ -300,7 +415,7 @@ pub struct KMutex {
 
 impl KMutex {
     /// 创建新的互斥锁
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         KMutex {
             locked: AtomicBool::new(false),
             wait_queue: WaitQueue::new(),
@@ -386,7 +501,7 @@ impl Semaphore {
     /// # Arguments
     ///
     /// * `initial` - 初始计数值
-    pub const fn new(initial: u32) -> Self {
+    pub fn new(initial: u32) -> Self {
         Semaphore {
             count: AtomicU32::new(initial),
             wait_queue: WaitQueue::new(),
@@ -460,7 +575,7 @@ pub struct CondVar {
 
 impl CondVar {
     /// 创建新的条件变量
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         CondVar {
             wait_queue: WaitQueue::new(),
         }
@@ -500,4 +615,84 @@ impl Default for CondVar {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// =============================================================================
+// R39-6 FIX: WaitQueue 超时支持辅助函数
+// =============================================================================
+
+/// R39-6 FIX: 初始化 WaitQueue 定时器回调
+///
+/// 在 IPC 模块初始化时调用，注册定时器回调以处理超时唤醒。
+pub fn init_waitqueue_timers() {
+    ensure_waitqueue_timer_registered();
+}
+
+/// 确保定时器回调已注册（只注册一次）
+fn ensure_waitqueue_timer_registered() {
+    if WAITQUEUE_TIMER_INIT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        kernel_core::register_timer_callback(waitqueue_timer_tick);
+    }
+}
+
+/// 注册定时等待
+fn register_timed_wait(queue: usize, pid: ProcessId, deadline_tick: u64) {
+    TIMED_WAITERS.lock().push(TimedWaiter {
+        queue,
+        pid,
+        deadline_tick,
+    });
+}
+
+/// 取消定时等待
+fn cancel_timed_wait(queue: usize, pid: ProcessId) {
+    let mut waits = TIMED_WAITERS.lock();
+    waits.retain(|w| !(w.queue == queue && w.pid == pid));
+}
+
+/// Maximum number of timeouts to process per tick (prevents allocation in IRQ context)
+const MAX_TIMEOUTS_PER_TICK: usize = 16;
+
+/// 处理超时的等待者
+///
+/// # Codex Review Fix
+///
+/// Use fixed-size stack array instead of Vec to avoid heap allocation
+/// in IRQ context. MAX_TIMEOUTS_PER_TICK limits how many timeouts
+/// are processed per tick; excess will be caught in next tick.
+fn process_waitqueue_timeouts(now_ticks: u64) {
+    let mut expired: [Option<TimedWaiter>; MAX_TIMEOUTS_PER_TICK] = [None; MAX_TIMEOUTS_PER_TICK];
+    let count = {
+        let mut waits = TIMED_WAITERS.lock();
+        let mut expired_count = 0;
+        let mut i = 0;
+        while i < waits.len() && expired_count < MAX_TIMEOUTS_PER_TICK {
+            if waits[i].deadline_tick <= now_ticks {
+                expired[expired_count] = Some(waits.remove(i));
+                expired_count += 1;
+            } else {
+                i += 1;
+            }
+        }
+        expired_count
+    };
+
+    for waiter in expired.iter().take(count).flatten() {
+        // 安全性：waiter.queue 来源于 &WaitQueue 的地址，
+        // 调用者需确保 WaitQueue 在超时期间仍然有效
+        unsafe {
+            if let Some(queue) = (waiter.queue as *const WaitQueue).as_ref() {
+                queue.timeout_wake(waiter.pid);
+            }
+        }
+    }
+}
+
+/// 定时器回调：每个 tick 检查超时
+fn waitqueue_timer_tick() {
+    let now = kernel_core::get_ticks();
+    process_waitqueue_timeouts(now);
 }
