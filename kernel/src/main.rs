@@ -11,6 +11,7 @@ use mm::memory::BootInfo;
 extern crate drivers;
 extern crate arch;
 extern crate block;
+extern crate cap;
 extern crate ipc;
 extern crate kernel_core;
 extern crate mm;
@@ -19,6 +20,10 @@ extern crate security;
 extern crate vfs;
 #[macro_use]
 extern crate audit;
+
+// A.3 Audit capability gate imports
+use cap::CapRights;
+use kernel_core::process::{current_credentials, with_current_cap_table};
 
 // 演示模块
 mod demo;
@@ -441,6 +446,28 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 audit::DEFAULT_CAPACITY
             );
             println!("      ✓ Hash-chained tamper evidence enabled");
+
+            // A.3: Register audit snapshot authorizer (capability gate)
+            // Policy: Allow root (euid == 0) OR holders of CAP_AUDIT_READ
+            audit::register_snapshot_authorizer(|| {
+                // Allow root users
+                if let Some(creds) = current_credentials() {
+                    if creds.euid == 0 {
+                        return Ok(());
+                    }
+                }
+                // Allow processes with CAP_AUDIT_READ capability
+                if let Some(has_cap) =
+                    with_current_cap_table(|table| table.has_rights(CapRights::AUDIT_READ))
+                {
+                    if has_cap {
+                        return Ok(());
+                    }
+                }
+                // Deny all others
+                Err(audit::AuditError::AccessDenied)
+            });
+            println!("      ✓ Audit capability gate registered (CAP_AUDIT_READ)");
         }
         Err(e) => {
             println!("      ! Audit initialization failed: {:?}", e);

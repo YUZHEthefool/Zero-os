@@ -220,6 +220,8 @@ pub enum FsError {
     NotEmpty,
     /// Cross-device link
     CrossDev,
+    /// Too many symbolic links or symlink traversal disallowed
+    SymlinkLoop,
     /// Illegal seek (e.g., on pipe)
     Seek,
 }
@@ -244,6 +246,7 @@ impl FsError {
             FsError::NameTooLong => -36,  // ENAMETOOLONG
             FsError::NotEmpty => -39,     // ENOTEMPTY
             FsError::CrossDev => -18,     // EXDEV
+            FsError::SymlinkLoop => -40,  // ELOOP
             FsError::Seek => -29,         // ESPIPE
         }
     }
@@ -274,6 +277,10 @@ impl OpenFlags {
     pub const O_NONBLOCK: u32 = 0o4000;
     /// Open directory
     pub const O_DIRECTORY: u32 = 0o200000;
+    /// Do not follow the final symlink in path
+    pub const O_NOFOLLOW: u32 = 0o400000;
+    /// Path-only open (no read/write operations allowed)
+    pub const O_PATH: u32 = 0o10000000;
 
     /// Create new flags
     pub const fn new(flags: u32) -> Self {
@@ -320,6 +327,92 @@ impl OpenFlags {
     /// Check if exclusive creation is requested (O_EXCL)
     pub fn is_exclusive(&self) -> bool {
         (self.0 & Self::O_EXCL) != 0
+    }
+
+    /// Check if final symlink should not be followed (O_NOFOLLOW)
+    pub fn is_nofollow(&self) -> bool {
+        (self.0 & Self::O_NOFOLLOW) != 0
+    }
+
+    /// Check if this is a path-only open (O_PATH)
+    pub fn is_path(&self) -> bool {
+        (self.0 & Self::O_PATH) != 0
+    }
+
+    /// Check if directory is required (O_DIRECTORY)
+    pub fn is_directory(&self) -> bool {
+        (self.0 & Self::O_DIRECTORY) != 0
+    }
+}
+
+// ============================================================================
+// Path Resolution Flags (openat2-compatible)
+// ============================================================================
+
+/// Path resolution flags for openat2-style operations
+///
+/// These flags control how symbolic links and mount boundaries
+/// are handled during path resolution. Compatible with Linux openat2(2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResolveFlags(pub u64);
+
+impl ResolveFlags {
+    /// Disallow crossing mount points during resolution
+    pub const RESOLVE_NO_XDEV: u64 = 0x01;
+    /// Reject /proc-style "magic" symlinks (e.g., /proc/self/fd/N)
+    pub const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    /// Reject all symbolic links (fail with ELOOP if any symlink encountered)
+    pub const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    /// Reject paths that escape the starting directory (go above via ..)
+    pub const RESOLVE_BENEATH: u64 = 0x08;
+    /// Treat the starting directory as the filesystem root
+    pub const RESOLVE_IN_ROOT: u64 = 0x10;
+    /// Treat trailing symlinks as final (don't follow even without O_NOFOLLOW)
+    pub const RESOLVE_CACHED: u64 = 0x20;
+
+    /// Empty flag set (default behavior)
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Create from raw bits
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    /// Get raw bits
+    pub const fn bits(&self) -> u64 {
+        self.0
+    }
+
+    /// Check if no symlinks allowed
+    pub const fn no_symlinks(&self) -> bool {
+        (self.0 & Self::RESOLVE_NO_SYMLINKS) != 0
+    }
+
+    /// Check if no mount crossing allowed
+    pub const fn no_xdev(&self) -> bool {
+        (self.0 & Self::RESOLVE_NO_XDEV) != 0
+    }
+
+    /// Check if magic links blocked
+    pub const fn no_magiclinks(&self) -> bool {
+        (self.0 & Self::RESOLVE_NO_MAGICLINKS) != 0
+    }
+
+    /// Check if path must stay beneath starting point
+    pub const fn beneath(&self) -> bool {
+        (self.0 & Self::RESOLVE_BENEATH) != 0
+    }
+
+    /// Check if starting directory is treated as root
+    pub const fn in_root(&self) -> bool {
+        (self.0 & Self::RESOLVE_IN_ROOT) != 0
+    }
+
+    /// Check if any resolve flags are set
+    pub const fn is_empty(&self) -> bool {
+        self.0 == 0
     }
 }
 

@@ -30,6 +30,9 @@ extern crate seccomp;
 // LSM hook infrastructure
 extern crate lsm;
 
+// Security RNG for cryptographically secure random number generation
+use security::rng;
+
 /// 最大参数数量（防止恶意用户传递过多参数）
 const MAX_ARG_COUNT: usize = 256;
 
@@ -111,6 +114,21 @@ struct UserSeccompProg {
 
 /// AT_FDCWD sentinel for *at() syscalls (openat, fstatat, etc.)
 const AT_FDCWD: i32 = -100;
+
+/// struct open_how (Linux openat2 ABI)
+///
+/// Used by the openat2(2) syscall to specify open flags, mode, and resolve flags.
+/// Compatible with Linux 5.6+ ABI.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct OpenHow {
+    /// Open flags (O_RDONLY, O_WRONLY, O_CREAT, O_NOFOLLOW, etc.)
+    flags: u64,
+    /// File creation mode (only used with O_CREAT)
+    mode: u64,
+    /// Path resolution flags (RESOLVE_NO_SYMLINKS, RESOLVE_BENEATH, etc.)
+    resolve: u64,
+}
 
 /// struct timeval (Linux ABI)
 #[repr(C)]
@@ -354,6 +372,7 @@ pub enum SyscallError {
     EFAULT = -14,  // 地址错误
     EBUSY = -16,   // 设备或资源忙
     EEXIST = -17,  // 文件已存在
+    EXDEV = -18,   // 跨设备链接 (cross-device link)
     ENOTDIR = -20, // 不是目录
     EISDIR = -21,  // 是目录
     EINVAL = -22,  // 无效参数
@@ -364,6 +383,7 @@ pub enum SyscallError {
     ERANGE = -34,  // 结果超出范围
     ENOSYS = -38,  // 功能未实现
     ENOTEMPTY = -39, // 目录非空
+    ELOOP = -40,   // 符号链接过多或禁止符号链接
     ETIMEDOUT = -110, // R39-6 FIX: 操作超时
 }
 
@@ -468,6 +488,13 @@ pub type FutexCallback = fn(usize, i32, u32, u32, Option<u64>) -> Result<usize, 
 pub type VfsOpenCallback =
     fn(&str, u32, u32) -> Result<crate::process::FileDescriptor, SyscallError>;
 
+/// VFS 打开文件回调类型（带 resolve 标志，用于 openat2）
+///
+/// 由 vfs 模块注册，处理带 resolve 标志的文件打开
+/// 参数: (path, flags, mode, resolve_flags) -> FileOps box 或错误
+pub type VfsOpenWithResolveCallback =
+    fn(&str, u32, u32, u64) -> Result<crate::process::FileDescriptor, SyscallError>;
+
 /// VFS 获取文件状态回调类型
 ///
 /// 由 vfs 模块注册，处理 stat 系统调用
@@ -560,6 +587,8 @@ lazy_static::lazy_static! {
     static ref FUTEX_CALLBACK: spin::Mutex<Option<FutexCallback>> = spin::Mutex::new(None);
     /// VFS 打开文件回调
     static ref VFS_OPEN_CALLBACK: spin::Mutex<Option<VfsOpenCallback>> = spin::Mutex::new(None);
+    /// VFS 带 resolve 标志的打开文件回调 (openat2)
+    static ref VFS_OPEN_WITH_RESOLVE_CALLBACK: spin::Mutex<Option<VfsOpenWithResolveCallback>> = spin::Mutex::new(None);
     /// VFS stat 回调
     static ref VFS_STAT_CALLBACK: spin::Mutex<Option<VfsStatCallback>> = spin::Mutex::new(None);
     /// VFS lseek 回调
@@ -602,6 +631,11 @@ pub fn register_futex_callback(cb: FutexCallback) {
 /// 注册 VFS 打开文件回调
 pub fn register_vfs_open_callback(cb: VfsOpenCallback) {
     *VFS_OPEN_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 VFS 带 resolve 标志的打开文件回调 (openat2)
+pub fn register_vfs_open_with_resolve_callback(cb: VfsOpenWithResolveCallback) {
+    *VFS_OPEN_WITH_RESOLVE_CALLBACK.lock() = Some(cb);
 }
 
 /// 注册 VFS stat 回调
@@ -1173,6 +1207,7 @@ pub fn syscall_dispatcher(
         1 => sys_write(arg0 as i32, arg1 as *const u8, arg2 as usize),
         2 => sys_open(arg0 as *const u8, arg1 as i32, arg2 as u32),
         257 => sys_openat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as u32),
+        437 => sys_openat2(arg0 as i32, arg1 as *const u8, arg2 as *const OpenHow, arg3 as usize),
         3 => sys_close(arg0 as i32),
         4 => sys_stat(arg0 as *const u8, arg1 as *mut VfsStat),
         5 => sys_fstat(arg0 as i32, arg1 as *mut VfsStat),
@@ -4282,61 +4317,27 @@ fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> SyscallResult {
     validate_user_ptr_mut(buf, count)?;
     verify_user_memory(buf as *const u8, count, true)?;
 
-    // 生成随机数据到临时缓冲区
+    // R40-1 FIX: 使用 CSPRNG (ChaCha20) 生成随机数据
+    //
+    // 之前的实现使用时间戳混合 RDRAND，在启动早期可能是可预测的。
+    // 现在使用 security::rng 模块的 ChaCha20 CSPRNG，它：
+    // - 由 RDRAND/RDSEED 播种
+    // - 定期重新播种
+    // - 提供密码学安全的随机数
     let mut tmp = vec![0u8; count];
-    let mut offset = 0usize;
-
-    while offset < count {
-        // 混合时间戳和 RDRAND（如果可用）
-        let mut word = crate::time::get_ticks() as u64;
-
-        // 尝试使用 RDRAND 指令（需要 CPUID 检查）
-        #[cfg(target_arch = "x86_64")]
-        {
-            // 检查 CPU 是否支持 RDRAND (CPUID.01H:ECX.RDRAND[bit 30])
-            // 注意：RBX 被 LLVM 保留，需要手动保存/恢复
-            let rdrand_supported: bool = {
-                let ecx: u32;
-                unsafe {
-                    core::arch::asm!(
-                        "push rbx",      // 保存 RBX
-                        "mov eax, 1",
-                        "cpuid",
-                        "mov {0:e}, ecx",
-                        "pop rbx",       // 恢复 RBX
-                        out(reg) ecx,
-                        out("eax") _,
-                        out("ecx") _,
-                        out("edx") _,
-                        options(nostack),
-                    );
-                }
-                (ecx & (1 << 30)) != 0
-            };
-
-            if rdrand_supported {
-                let rand_result: u64;
-                let success: u8;
-                unsafe {
-                    core::arch::asm!(
-                        "rdrand {0}",
-                        "setc {1}",
-                        out(reg) rand_result,
-                        out(reg_byte) success,
-                        options(nostack, nomem),
-                    );
-                }
-                if success != 0 {
-                    word ^= rand_result;
-                }
+    match rng::fill_random(&mut tmp) {
+        Ok(()) => {}
+        Err(rng::RngError::NotInitialized) => {
+            // 懒初始化 CSPRNG；非阻塞模式遵循 Linux 语义返回 EAGAIN
+            if flags & GRND_NONBLOCK != 0 {
+                return Err(SyscallError::EAGAIN);
             }
+            // 尝试初始化 CSPRNG
+            rng::init_global().map_err(|_| SyscallError::EAGAIN)?;
+            rng::fill_random(&mut tmp).map_err(|_| SyscallError::EIO)?
         }
-
-        // 将 word 拆分为字节并填充缓冲区
-        let bytes = word.to_ne_bytes();
-        let chunk = core::cmp::min(bytes.len(), count - offset);
-        tmp[offset..offset + chunk].copy_from_slice(&bytes[..chunk]);
-        offset += chunk;
+        Err(_) if flags & GRND_NONBLOCK != 0 => return Err(SyscallError::EAGAIN),
+        Err(_) => return Err(SyscallError::EIO),
     }
 
     // 复制到用户空间
@@ -4627,6 +4628,132 @@ fn sys_openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -> SyscallResu
     }
 
     sys_open(path, flags, mode)
+}
+
+/// sys_openat2 - open with extended flags and resolve options (Linux 5.6+)
+///
+/// # Arguments
+/// * `dirfd` - Base directory fd (AT_FDCWD for current directory)
+/// * `path` - File path (user space pointer)
+/// * `how` - Pointer to struct open_how (flags, mode, resolve)
+/// * `size` - Size of the open_how structure
+///
+/// # Returns
+/// File descriptor on success, error code on failure
+///
+/// # Security
+/// - RESOLVE_NO_SYMLINKS: Reject any symlink in path (ELOOP)
+/// - RESOLVE_BENEATH: Reject paths escaping starting point (EXDEV)
+/// - RESOLVE_NO_MAGICLINKS: Block /proc magic symlinks (ELOOP)
+/// - RESOLVE_NO_XDEV: Don't cross mount boundaries (EXDEV)
+fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) -> SyscallResult {
+    use crate::usercopy::{copy_from_user, copy_user_cstring, UserPtr};
+
+    // Validate pointers
+    if path.is_null() || how.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // Validate size (must be at least as large as our struct)
+    if size < core::mem::size_of::<OpenHow>() {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Copy open_how from user space
+    let mut how_local = OpenHow::default();
+    let how_ptr = UserPtr::<OpenHow>::new(how as *mut OpenHow).map_err(|_| SyscallError::EFAULT)?;
+    copy_from_user(&mut how_local, how_ptr).map_err(|_| SyscallError::EFAULT)?;
+
+    // Copy path from user space
+    let path_bytes = copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    if path_bytes.is_empty() {
+        return Err(SyscallError::EINVAL);
+    }
+    let path_str = core::str::from_utf8(&path_bytes)
+        .map_err(|_| SyscallError::EINVAL)?
+        .to_string();
+
+    // Check relative path with non-AT_FDCWD dirfd (not yet supported)
+    if dirfd != AT_FDCWD && !path_str.starts_with('/') {
+        return Err(SyscallError::ENOSYS);
+    }
+
+    // Get current process
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // Validate flags: reject unknown flags
+    let known_flags: u64 = 0o17777777; // All valid O_* flags
+    if how_local.flags & !known_flags != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Validate resolve: reject unknown resolve flags
+    let known_resolve: u64 = 0x3F; // RESOLVE_NO_XDEV | NO_MAGICLINKS | NO_SYMLINKS | BENEATH | IN_ROOT | CACHED
+    if how_local.resolve & !known_resolve != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let open_flags = how_local.flags as u32;
+    let mode = how_local.mode as u32;
+    let resolve = how_local.resolve;
+
+    // LSM hook: check file create permission if O_CREAT is set
+    let path_hash = audit::hash_path(&path_str);
+
+    if let Some(proc_ctx) = lsm_current_process_ctx() {
+        if open_flags & lsm::OpenFlags::O_CREAT != 0 {
+            let (parent_hash, name_hash) = match path_str.rfind('/') {
+                Some(0) => (audit::hash_path("/"), audit::hash_path(&path_str[1..])),
+                Some(idx) => (
+                    audit::hash_path(&path_str[..idx]),
+                    audit::hash_path(&path_str[idx + 1..]),
+                ),
+                None => (audit::hash_path("."), path_hash),
+            };
+
+            if let Err(err) = lsm::hook_file_create(&proc_ctx, parent_hash, name_hash, mode & 0o7777)
+            {
+                return Err(lsm_error_to_syscall(err));
+            }
+        }
+    }
+
+    // Get VFS callback with resolve support
+    let open_fn = {
+        let callback = VFS_OPEN_WITH_RESOLVE_CALLBACK.lock();
+        *callback.as_ref().ok_or(SyscallError::ENOSYS)?
+    };
+
+    // Call VFS with resolve flags
+    let file_ops = open_fn(&path_str, open_flags, mode, resolve)?;
+
+    // LSM hook: check file open permission
+    if let Some(proc_ctx) = lsm_current_process_ctx() {
+        let file_ctx = lsm::FileCtx::new(path_hash, mode, path_hash);
+        if let Err(err) =
+            lsm::hook_file_open(&proc_ctx, path_hash, lsm::OpenFlags(open_flags), &file_ctx)
+        {
+            return Err(lsm_error_to_syscall(err));
+        }
+    }
+
+    // O_CLOEXEC flag
+    const O_CLOEXEC: u32 = 0x80000;
+
+    // Allocate fd
+    let fd = {
+        let mut proc = process.lock();
+        let fd = proc.allocate_fd(file_ops).ok_or(SyscallError::EMFILE)?;
+
+        if open_flags & O_CLOEXEC != 0 {
+            proc.set_fd_cloexec(fd, true);
+        }
+
+        fd
+    };
+
+    Ok(fd as usize)
 }
 
 // ============================================================================

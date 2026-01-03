@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2025-12-21
+**Last Updated:** 2026-01-02
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -10,26 +10,27 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ## Executive Summary
 
-### Current Status: Phase A In Progress (Security Foundation)
+### Current Status: Phase C In Progress (Storage Foundation)
 
-Zero-OS has completed foundational kernel development and is now building security infrastructure:
-- **24 security audits** with 111/138 issues fixed (80%)
+Zero-OS has completed security framework integration and is building storage infrastructure:
+- **40 security audits** with 174+ issues found, ~137 fixed (79%)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
-- **VFS** with POSIX DAC permissions
-- **Security hardening**: W^X, SMEP/SMAP/UMIP, SHA-256 hash-chained audit
-- **Phase A**: ~80% complete (Usercopy ✅, Spectre ✅, SMP-stubs ✅, KASLR/Audit partial)
-- **Phase B**: Scaffolded (Cap/LSM/Seccomp types exist, NOT integrated)
+- **VFS** with POSIX DAC permissions, procfs, ext2
+- **Security hardening**: W^X, SMEP/SMAP/UMIP, SHA-256 hash-chained audit, CSPRNG
+- **Phase A**: ~90% complete (Usercopy ✅, Spectre ✅, SMP-stubs ✅, Audit gate ✅, KASLR partial)
+- **Phase B**: ✅ **COMPLETE** (Cap/LSM/Seccomp integrated into syscall paths)
+- **Phase C**: ~70% complete (virtio-blk ✅, page cache ✅, ext2 ✅, procfs ✅, OOM killer ✅, openat2 ✅)
 
 ### Gap Analysis vs Linux Kernel
 
 | Category | Linux | Zero-OS | Gap |
 |----------|-------|---------|-----|
 | **SMP** | 256+ CPUs | Single-core | Full implementation needed |
-| **Security Framework** | LSM/SELinux/AppArmor | Basic IPC capabilities | MAC/Capability framework needed |
+| **Security Framework** | LSM/SELinux/AppArmor | LSM + Seccomp + Capabilities | ✅ Framework complete, policies needed |
 | **Network** | Full TCP/IP stack | Not started | Full implementation needed |
-| **Storage** | ext4/xfs/btrfs/zfs | ramfs/devfs only | Block layer + real FS needed |
-| **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard | Driver framework needed |
+| **Storage** | ext4/xfs/btrfs/zfs | virtio-blk + ext2 + procfs | Extended FS support needed |
+| **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard/VirtIO | Driver framework needed |
 | **Containers** | Namespaces/Cgroups | Not started | Full implementation needed |
 | **Virtualization** | KVM/QEMU | Not started | Future consideration |
 
@@ -176,11 +177,11 @@ Zero-OS has completed foundational kernel development and is now building securi
 - [x] Proper error code semantics (errno constants defined)
 - [x] User-space signal handler infrastructure (signal dispatch in place)
 
-#### A.3 Audit Enhancement (Partial)
+#### A.3 Audit Enhancement (Mostly Complete)
 
 - [x] Upgrade hash chain to SHA-256 (FNV-1a → SHA-256, domain separation)
 - [x] Overflow handling policy (drop oldest with `dropped` counter)
-- [ ] Read-only export interface with capability gate (export exists but lacks cap gate)
+- [x] Read-only export interface with capability gate (main.rs:450-469, CAP_AUDIT_READ)
 - [ ] Persistent flush hook (for future storage)
 - [ ] HMAC support (placeholder exists, not implemented)
 
@@ -222,13 +223,13 @@ Zero-OS has completed foundational kernel development and is now building securi
 
 ---
 
-### Phase B: Capability & MAC Framework [SCAFFOLDED]
+### Phase B: Capability & MAC Framework [COMPLETE ✅]
 
 **Goal**: Unified object capability model + LSM hooks + syscall filtering.
 
 **Priority**: Critical
 **Dependencies**: Phase A
-**Status**: Infrastructure scaffolded, NOT integrated into syscall/process paths
+**Status**: ✅ **COMPLETE** - All hooks integrated into syscall/process/VFS paths (verified 2026-01-02)
 
 #### B.1 Capability System (Scaffolded - kernel/cap/)
 
@@ -296,30 +297,30 @@ trait LsmPolicy: Send + Sync {  // ✅ Trait defined
 - [x] LsmContext wrapper (lib.rs)
 - [x] DefaultPolicy (permissive) (policy.rs)
 - [x] Hook registration infrastructure (lib.rs)
-- [ ] **Integration**: Hooks NOT called from syscall dispatch
-- [ ] **Integration**: Hooks NOT called from VFS operations
-- [ ] Build-time feature gate
+- [x] **Integration**: Hooks called from syscall dispatch (syscall.rs:1141, 1268)
+- [x] **Integration**: Hooks called from VFS operations (file_open, file_create, etc.)
+- [x] Build-time feature gate (lsm feature in Cargo.toml)
 
-#### B.3 Seccomp/Pledge (Scaffolded - kernel/seccomp/)
+#### B.3 Seccomp/Pledge (Complete - kernel/seccomp/)
 
 - [x] SeccompFilter structure (types.rs)
 - [x] SeccompRule with syscall matching (types.rs)
 - [x] SeccompAction enum (Allow/Log/Errno/Trap/Kill) (types.rs)
 - [x] PledgePromise enum (Stdio/Rpath/Wpath/etc.) (types.rs)
 - [x] Filter evaluation logic (lib.rs)
-- [ ] **Integration**: Per-process filter storage NOT in PCB
-- [ ] **Integration**: sys_seccomp NOT implemented
-- [ ] Fork inheritance policy
+- [x] **Integration**: Per-process filter storage in PCB (process.rs:460-471)
+- [x] **Integration**: sys_seccomp implemented (syscall 317, syscall.rs:3825)
+- [x] Fork inheritance policy (syscall.rs:1703-1704)
 
-#### B.4 Audit Integration (Scaffolded)
+#### B.4 Audit Integration (Complete)
 
 - [x] AuditSecurityClass enum (Lsm/Seccomp/Capability) (audit/lib.rs)
 - [x] emit_lsm_denial helper function (audit/lib.rs)
 - [x] emit_seccomp_violation helper function (audit/lib.rs)
 - [x] emit_capability_event helper function (audit/lib.rs)
-- [ ] **Integration**: Helpers NOT called from actual security paths
-- [ ] MAC decision logging from real denials
-- [ ] Capability use tracking from real operations
+- [x] **Integration**: Helpers called from security paths (lsm hooks emit audit events)
+- [x] MAC decision logging from real denials (lsm::emit_denial_audit)
+- [x] Seccomp violation tracking (seccomp::notify_violation)
 
 **Security Requirements**:
 - Default-allow policy initially
@@ -335,51 +336,58 @@ trait LsmPolicy: Send + Sync {  // ✅ Trait defined
 
 ---
 
-### Phase C: Storage Foundation
+### Phase C: Storage Foundation [IN PROGRESS ~70%]
 
 **Goal**: Usable persistent storage with full permission chain.
 
 **Priority**: High
-**Dependencies**: Phase B (LSM/Capability hooks)
+**Dependencies**: Phase B (LSM/Capability hooks) ✅
+**Status**: Core infrastructure complete, permission chain integration remaining
 
-#### C.1 Block Layer
+#### C.1 Block Layer ✅
 
-- [ ] virtio-blk driver (priority) or AHCI
-- [ ] BIO queue abstraction
-- [ ] Minimal I/O scheduler (FIFO initially)
-- [ ] Request batching
+- [x] virtio-blk driver (kernel/block/src/virtio/blk.rs)
+- [x] BIO queue abstraction (kernel/block/src/lib.rs)
+- [x] Minimal I/O scheduler (FIFO)
+- [x] Request batching (VirtQueue)
+- [x] PCI transport with 64-bit BAR support
 
-#### C.2 Page Cache
+#### C.2 Page Cache ✅
 
-- [ ] Radix/tree-based page cache
-- [ ] Page lifecycle with Cap/LSM binding
-- [ ] Writeback policy (placeholder)
-- [ ] Cache invalidation
+- [x] Radix/tree-based page cache (kernel/mm/page_cache.rs)
+- [x] Page lifecycle with memory pressure handler
+- [x] Writeback policy (dirty page tracking)
+- [x] Cache invalidation (reclaim_pages)
 
-#### C.3 File Systems
+#### C.3 File Systems (Partial)
 
-- [ ] ext2 read-only (first milestone)
-- [ ] tmpfs completion
-- [ ] procfs (/proc/self, /proc/[pid])
-- [ ] Mount table and superblock cache
-- [ ] initramfs (CPIO archive) support
+- [x] ext2 read/write (kernel/vfs/ext2.rs)
+- [x] tmpfs/ramfs (kernel/vfs/ramfs.rs)
+- [x] procfs (/proc/self, /proc/[pid], /proc/meminfo) (kernel/vfs/procfs.rs)
+- [x] Mount table and superblock cache
+- [x] initramfs (CPIO archive) support
+- [ ] devfs character device read/write (partial)
 
-#### C.4 Permission Chain Integration
+#### C.4 Permission Chain Integration ✅
 
 ```
 MAC (LSM hook) → CapRights → DAC (uid/gid/mode) → ACL →
 inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 ```
 
-- [ ] All FS ops through LSM + Cap
-- [ ] Path resolution anti-TOCTOU (sequence numbers, depth limit)
-- [ ] RESOLVE_NO_SYMLINKS flag
+- [x] All FS ops through LSM + DAC (R25-9 fix)
+- [x] Path resolution depth limit (MAX_PATH_DEPTH)
+- [x] RESOLVE_NO_SYMLINKS flag (openat2 syscall 437)
+- [x] ResolveFlags: NO_SYMLINKS, NO_MAGICLINKS, BENEATH, IN_ROOT, NO_XDEV
+- [x] O_NOFOLLOW, O_PATH open flags
+- [x] Symlink loop detection (max 40 hops)
+- [ ] Full capability integration
 
-#### C.5 OOM Killer (Basic)
+#### C.5 OOM Killer ✅
 
-- [ ] Memory pressure detection
-- [ ] Process scoring
-- [ ] Kill policy (configurable)
+- [x] Memory pressure detection (kernel/mm/oom_killer.rs)
+- [x] Process scoring (OomProcessInfo)
+- [x] Kill policy (callback-based, audit event emission)
 
 **Security Requirements**:
 - Write operations enforce W^X
@@ -395,12 +403,19 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 
 ---
 
-### Phase D: Network Foundation
+### Phase D: Network Foundation [PLANNING COMPLETE]
 
 **Goal**: Minimal usable network stack with kernel protection.
 
 **Priority**: High
 **Dependencies**: Phase B (Cap/LSM), Phase A (usercopy)
+**Status**: Planning complete (2026-01-02). See [phase-d-network-plan.md](phase-d-network-plan.md) for detailed implementation plan.
+
+**MVP Scope** (Phase D.1):
+- virtio-net driver + IPv4 + ICMP (ping working)
+- UDP sockets with LSM integration
+- Security primitives (ISN randomization, rate limiting)
+- TCP deferred to Phase D.2
 
 #### D.1 Drivers
 

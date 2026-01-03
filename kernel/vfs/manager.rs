@@ -9,9 +9,10 @@
 //! - LSM (Linux Security Module) hook integration (R25-9 fix)
 
 use crate::devfs::DevFs;
+use crate::procfs::ProcFs;
 use crate::ramfs::RamFs;
 use crate::traits::{FileHandle, FileSystem, Inode};
-use crate::types::{DirEntry, FileMode, FsError, OpenFlags, Stat};
+use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, ResolveFlags, Stat};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -201,7 +202,11 @@ impl Vfs {
             .expect("Failed to mount devfs");
         *self.devfs.write() = Some(devfs);
 
-        println!("VFS initialized: ramfs at /, devfs at /dev");
+        // Create and mount procfs at /proc
+        let procfs = ProcFs::new();
+        self.mount("/proc", procfs).expect("Failed to mount procfs");
+
+        println!("VFS initialized: ramfs at /, devfs at /dev, procfs at /proc");
     }
 
     /// Mount a filesystem at the given path
@@ -275,47 +280,172 @@ impl Vfs {
         }
     }
 
-    /// Resolve a path to an inode
+    /// Resolve a path to an inode (default behavior: follow symlinks)
     ///
     /// Enforces execute/search permission on each directory component during traversal.
     /// This prevents unauthorized access to files in directories without "x" permission.
     pub fn lookup_path(&self, path: &str) -> Result<Arc<dyn Inode>, FsError> {
-        let path = normalize_path(path)?;
+        self.lookup_path_with_flags(path, ResolveFlags::empty(), true)
+    }
 
-        // Find the mount point that covers this path
-        let (_mount_path, fs, relative_path) = self.find_mount(&path)?;
+    /// Resolve a path with optional symlink following and resolve flags
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The path to resolve
+    /// * `resolve_flags` - Flags controlling symlink and mount behavior
+    /// * `follow_final_symlink` - Whether to follow the final path component if it's a symlink
+    ///
+    /// # Security
+    ///
+    /// - Enforces execute/search permission on each directory component
+    /// - Limits symlink resolution to MAX_SYMLINK_DEPTH (40) to prevent loops
+    /// - RESOLVE_NO_SYMLINKS rejects any symlink in the path
+    /// - RESOLVE_BENEATH prevents escaping the starting directory
+    /// - RESOLVE_NO_MAGICLINKS blocks /proc magic symlinks
+    /// - RESOLVE_NO_XDEV prevents crossing mount boundaries
+    pub fn lookup_path_with_flags(
+        &self,
+        path: &str,
+        resolve_flags: ResolveFlags,
+        follow_final_symlink: bool,
+    ) -> Result<Arc<dyn Inode>, FsError> {
+        const MAX_SYMLINK_DEPTH: usize = 40;
 
-        // Start from the filesystem root
-        let mut current = fs.root_inode();
+        let mut symlink_count: usize = 0;
+        let mut path_to_resolve = normalize_path(path)?;
 
-        // Handle empty relative path (mount point itself)
-        if relative_path.is_empty() || relative_path == "/" {
+        // Capture the starting filesystem for RESOLVE_NO_XDEV
+        let (anchor_mount, anchor_fs, _) = self.find_mount(&path_to_resolve)?;
+        let anchor_fs_id = anchor_fs.fs_id();
+
+        'resolve: loop {
+            // RESOLVE_BENEATH / RESOLVE_IN_ROOT: check path stays within anchor
+            if (resolve_flags.beneath() || resolve_flags.in_root())
+                && !path_to_resolve.starts_with(&anchor_mount)
+            {
+                return Err(FsError::CrossDev);
+            }
+
+            let (mount_path, fs, relative_path) = self.find_mount(&path_to_resolve)?;
+
+            // RESOLVE_NO_XDEV: reject if we crossed a mount boundary
+            if resolve_flags.no_xdev() && fs.fs_id() != anchor_fs_id {
+                return Err(FsError::CrossDev);
+            }
+
+            let mut current = fs.root_inode();
+
+            // Handle empty relative path (mount point itself)
+            if relative_path.is_empty() || relative_path == "/" {
+                return Ok(current);
+            }
+
+            // Track resolved prefix for relative symlink resolution
+            let mut resolved_prefix: Vec<String> = mount_path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+
+            let components: Vec<&str> =
+                relative_path.split('/').filter(|s| !s.is_empty()).collect();
+
+            for (idx, component) in components.iter().enumerate() {
+                if !current.is_dir() {
+                    return Err(FsError::NotDir);
+                }
+
+                // Check execute/search permission on directory before traversing
+                if idx < components.len() - 1 || components.len() == 1 {
+                    let dir_stat = current.stat()?;
+                    if !check_access_permission(&dir_stat, false, false, true) {
+                        return Err(FsError::PermDenied);
+                    }
+                }
+
+                let next = fs.lookup(&current, component)?;
+                let next_stat = next.stat()?;
+                let is_final = idx == components.len() - 1;
+
+                // Check if this is a symlink
+                if next_stat.mode.file_type == FileType::Symlink {
+                    // RESOLVE_NO_SYMLINKS: reject any symlink
+                    if resolve_flags.no_symlinks() {
+                        return Err(FsError::SymlinkLoop);
+                    }
+
+                    // Final symlink + nofollow: return ELOOP
+                    if is_final && !follow_final_symlink {
+                        return Err(FsError::SymlinkLoop);
+                    }
+
+                    // RESOLVE_NO_MAGICLINKS: block procfs magic symlinks
+                    if resolve_flags.no_magiclinks() && fs.fs_type() == "proc" {
+                        return Err(FsError::SymlinkLoop);
+                    }
+
+                    // Symlink loop detection
+                    symlink_count += 1;
+                    if symlink_count > MAX_SYMLINK_DEPTH {
+                        return Err(FsError::SymlinkLoop);
+                    }
+
+                    // Read symlink target
+                    let target_len = next_stat.size.min(4096) as usize;
+                    let mut buf = Vec::with_capacity(target_len.max(1));
+                    buf.resize(target_len.max(1), 0u8);
+                    let read_len = next.read_at(0, &mut buf)?;
+                    let target = core::str::from_utf8(&buf[..read_len])
+                        .map_err(|_| FsError::Invalid)?
+                        .to_string();
+
+                    // Build new path based on symlink target
+                    let new_path = if target.starts_with('/') {
+                        // Absolute symlink
+                        if resolve_flags.in_root() && anchor_mount != "/" {
+                            // Reroot absolute symlinks within the anchor
+                            let mut path = String::from(anchor_mount.trim_end_matches('/'));
+                            path.push('/');
+                            path.push_str(target.trim_start_matches('/'));
+                            path
+                        } else {
+                            target
+                        }
+                    } else {
+                        // Relative symlink: resolve from current directory
+                        let mut prefix = String::from("/");
+                        if !resolved_prefix.is_empty() {
+                            prefix.push_str(&resolved_prefix.join("/"));
+                        }
+                        if !prefix.ends_with('/') {
+                            prefix.push('/');
+                        }
+                        prefix.push_str(&target);
+                        prefix
+                    };
+
+                    // Append remaining path components
+                    let remaining: Vec<&str> = components.iter().skip(idx + 1).copied().collect();
+                    let full_path = if remaining.is_empty() {
+                        new_path
+                    } else {
+                        let mut path = String::from(new_path.trim_end_matches('/'));
+                        path.push('/');
+                        path.push_str(&remaining.join("/"));
+                        path
+                    };
+
+                    path_to_resolve = normalize_path(&full_path)?;
+                    continue 'resolve;
+                }
+
+                current = next;
+                resolved_prefix.push((*component).to_string());
+            }
+
             return Ok(current);
         }
-
-        // Walk path components
-        let components: Vec<&str> = relative_path.split('/').filter(|s| !s.is_empty()).collect();
-
-        for (idx, component) in components.iter().enumerate() {
-            if !current.is_dir() {
-                return Err(FsError::NotDir);
-            }
-
-            // Check execute/search permission on directory before traversing
-            // This is required for all intermediate directories (not the final component)
-            // For the final component, we only need execute if it will be traversed further
-            if idx < components.len() - 1 || components.len() == 1 {
-                // For intermediate dirs, or single-component paths that are dirs
-                let dir_stat = current.stat()?;
-                if !check_access_permission(&dir_stat, false, false, true) {
-                    return Err(FsError::PermDenied);
-                }
-            }
-
-            current = fs.lookup(&current, component)?;
-        }
-
-        Ok(current)
     }
 
     /// Open a file by path
@@ -327,10 +457,37 @@ impl Vfs {
         flags: OpenFlags,
         create_mode: u16,
     ) -> Result<Box<dyn FileOps>, FsError> {
+        self.open_with_resolve(path, flags, create_mode, ResolveFlags::empty())
+    }
+
+    /// Open a file by path with resolve flags (openat2-compatible)
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The path to open
+    /// * `flags` - Open flags (O_RDONLY, O_WRONLY, O_CREAT, O_NOFOLLOW, etc.)
+    /// * `create_mode` - Permission mode for file creation
+    /// * `resolve_flags` - Flags controlling symlink and mount behavior
+    ///
+    /// # Security
+    ///
+    /// - O_NOFOLLOW: Returns ELOOP if final component is a symlink
+    /// - RESOLVE_NO_SYMLINKS: Returns ELOOP for any symlink in path
+    /// - Full DAC and LSM permission checks
+    pub fn open_with_resolve(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        create_mode: u16,
+        resolve_flags: ResolveFlags,
+    ) -> Result<Box<dyn FileOps>, FsError> {
         let path = normalize_path(path)?;
 
+        // O_NOFOLLOW: don't follow the final symlink
+        let follow_final = !flags.is_nofollow();
+
         // Resolve existing path or create on demand
-        let inode = match self.lookup_path(&path) {
+        let inode = match self.lookup_path_with_flags(&path, resolve_flags, follow_final) {
             Ok(inode) => {
                 // File exists - check O_EXCL
                 if flags.is_create() && flags.is_exclusive() {
@@ -341,7 +498,8 @@ impl Vfs {
             Err(FsError::NotFound) if flags.is_create() => {
                 // File doesn't exist and O_CREAT is set - create it
                 let (parent_path, filename) = split_path(&path)?;
-                let parent = self.lookup_path(&parent_path)?;
+                // Parent lookup should always follow symlinks (the parent must be a real dir)
+                let parent = self.lookup_path_with_flags(&parent_path, resolve_flags, true)?;
                 if !parent.is_dir() {
                     return Err(FsError::NotDir);
                 }
@@ -834,9 +992,9 @@ fn fs_error_to_syscall(e: FsError) -> SyscallError {
         FsError::ReadOnly => SyscallError::EACCES,
         FsError::NoSpace | FsError::NoMem => SyscallError::ENOMEM,
         FsError::Io => SyscallError::EIO,
-        FsError::Invalid | FsError::NameTooLong | FsError::CrossDev | FsError::Seek => {
-            SyscallError::EINVAL
-        }
+        FsError::Invalid | FsError::NameTooLong | FsError::Seek => SyscallError::EINVAL,
+        FsError::CrossDev => SyscallError::EXDEV,
+        FsError::SymlinkLoop => SyscallError::ELOOP,
         FsError::NotSupported => SyscallError::ENOSYS,
         FsError::BadFd => SyscallError::EBADF,
         FsError::Pipe => SyscallError::EPIPE,
@@ -851,6 +1009,23 @@ fn vfs_open_callback(path: &str, flags: u32, mode: u32) -> Result<FileDescriptor
     let perm = (mode & 0o7777) as u16;
 
     VFS.open(path, open_flags, perm)
+        .map_err(fs_error_to_syscall)
+}
+
+/// VFS open with resolve flags callback (openat2 support)
+///
+/// Called by sys_openat2 to open a file with resolve flags through VFS
+fn vfs_open_with_resolve_callback(
+    path: &str,
+    flags: u32,
+    mode: u32,
+    resolve: u64,
+) -> Result<FileDescriptor, SyscallError> {
+    let open_flags = OpenFlags::from_bits(flags);
+    let resolve_flags = ResolveFlags::from_bits(resolve);
+    let perm = (mode & 0o7777) as u16;
+
+    VFS.open_with_resolve(path, open_flags, perm, resolve_flags)
         .map_err(fs_error_to_syscall)
 }
 
@@ -915,13 +1090,14 @@ fn vfs_lseek_callback(
 /// Register VFS callbacks with kernel_core
 pub fn register_syscall_callbacks() {
     kernel_core::register_vfs_open_callback(vfs_open_callback);
+    kernel_core::register_vfs_open_with_resolve_callback(vfs_open_with_resolve_callback);
     kernel_core::register_vfs_stat_callback(vfs_stat_callback);
     kernel_core::register_vfs_lseek_callback(vfs_lseek_callback);
     kernel_core::register_vfs_create_callback(vfs_create_callback);
     kernel_core::register_vfs_unlink_callback(vfs_unlink_callback);
     kernel_core::register_vfs_readdir_callback(vfs_readdir_callback);
     kernel_core::register_vfs_truncate_callback(vfs_truncate_callback);
-    println!("VFS syscall callbacks registered");
+    println!("VFS syscall callbacks registered (openat2 enabled)");
 }
 
 /// VFS create callback for syscall registration

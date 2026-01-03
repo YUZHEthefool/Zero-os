@@ -18,3 +18,4 @@ audit = { path = "../audit" }
 seccomp = { path = "../seccomp" }
 cap = { path = "../cap" }
 lsm = { path = "../lsm", features = ["lsm"] }
+security = { path = "../security" }
