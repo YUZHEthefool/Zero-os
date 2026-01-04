@@ -9,7 +9,7 @@
 //!
 //! Based on ext2 specification (https://www.nongnu.org/ext2-doc/)
 
-use crate::traits::{FileSystem, Inode};
+use crate::traits::{FileHandle, FileSystem, Inode};
 use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -20,7 +20,7 @@ use core::any::Any;
 use core::cmp;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
-use kernel_core::FileOps;
+use kernel_core::{FileOps, SyscallError, VfsStat};
 use mm::{buddy_allocator, page_cache, PageCacheEntry, PageState, PAGE_CACHE, PAGE_SIZE, PHYSICAL_MEMORY_OFFSET};
 use spin::{Mutex, RwLock};
 
@@ -953,10 +953,22 @@ impl Inode for Ext2Inode {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
         let raw = *self.raw.read();
+        let fs = self.fs.upgrade().ok_or(FsError::Invalid)?;
+
+        // Directories can only be opened for read-only operations (getdents64)
+        if self.is_dir_inner() {
+            if flags.is_writable() {
+                return Err(FsError::IsDir);
+            }
+            // Return directory handle with seekable=false
+            let inode = fs.wrap_inode(self.ino, raw);
+            return Ok(Box::new(FileHandle::new(inode, flags, false)));
+        }
+
         Ok(Box::new(Ext2File {
-            inode: self.fs.upgrade().ok_or(FsError::Invalid)?.wrap_inode(self.ino, raw),
+            inode: fs.wrap_inode(self.ino, raw),
             offset: Mutex::new(0),
         }))
     }
@@ -1201,5 +1213,11 @@ impl FileOps for Ext2File {
 
     fn type_name(&self) -> &'static str {
         "Ext2File"
+    }
+
+    /// R41-1 FIX: Return actual inode metadata for fstat.
+    fn stat(&self) -> Result<VfsStat, SyscallError> {
+        let inode_stat = self.inode.stat().map_err(SyscallError::from)?;
+        Ok(VfsStat::from(inode_stat))
     }
 }

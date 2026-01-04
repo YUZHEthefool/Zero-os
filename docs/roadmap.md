@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-02
+**Last Updated:** 2026-01-03
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -13,7 +13,7 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 ### Current Status: Phase C In Progress (Storage Foundation)
 
 Zero-OS has completed security framework integration and is building storage infrastructure:
-- **40 security audits** with 174+ issues found, ~137 fixed (79%)
+- **41 security audits** with 178+ issues found, ~145 fixed (81%) - R41 issues fixed
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -645,16 +645,21 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2025-12-15-16 | 16-19 | 11 | 10 | VFS, W^X, audit subsystem |
 | 2025-12-17-18 | 20-22 | 29 | 19 | Ring 3, SYSCALL/SYSRET |
 | 2025-12-20 | 23-24 | 12 | 12 | Thread/Clone, TLS, usercopy |
-| **Total** | **24** | **138** | **111 (80%)** | **27 deferred (mostly SMP)** |
+| 2025-12-23 to 2026-01-02 | 25-40 | 36 | 32 | Cap/LSM/Seccomp integration, VirtIO |
+| 2026-01-03 | 41 | 4 | 4 | sys_fstat, sys_execve LSM, openat2 - **ALL FIXED** |
+| **Total** | **41** | **178** | **145 (81%)** | **33 open (R41 fixed)** |
 
 ### Current Status
 
-- **Fixed**: 111 issues (80%)
-- **Open**: 27 issues (20%)
-  - Mostly SMP-related (A-3, H-25, H-26, W-3, W-4, etc.)
-  - Deferred to Phase E
+- **Fixed**: 145 issues (81%)
+- **Open**: 33 issues (19%)
+  - ~~R41-1: sys_fstat fabricated metadata (HIGH)~~ ✅ Fixed
+  - ~~R41-4: sys_execve LSM bypass (HIGH)~~ ✅ Fixed
+  - ~~R41-2: openat2 RESOLVE_BENEATH ineffective (MEDIUM)~~ ✅ Fixed
+  - ~~R41-3: fd I/O under process lock (MEDIUM)~~ ✅ Fixed
+  - SMP-related issues deferred to Phase E
 
-See [qa-2025-12-20.md](qa-2025-12-20.md) for latest audit report.
+See [qa-2026-01-03.md](review/qa-2026-01-03.md) for latest audit report.
 
 ---
 

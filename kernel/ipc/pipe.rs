@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::sync::WaitQueue;
-use kernel_core::FileOps;
+use kernel_core::{FileOps, SyscallError, VfsStat};
 
 /// 默认管道缓冲区大小（4KB）
 pub const DEFAULT_PIPE_CAPACITY: usize = 4096;
@@ -478,6 +478,30 @@ impl FileOps for PipeHandle {
             PipeEndType::Read => "PipeRead",
             PipeEndType::Write => "PipeWrite",
         }
+    }
+
+    /// R41-1 FIX: Return S_IFIFO mode for pipe fstat.
+    ///
+    /// Returns pipe metadata with FIFO type (S_IFIFO = 0o010000) and rw-rw-rw- permissions.
+    fn stat(&self) -> Result<VfsStat, SyscallError> {
+        Ok(VfsStat {
+            dev: 0,
+            ino: self.pipe_id() as u64,
+            mode: 0o010000 | 0o666, // S_IFIFO | rw-rw-rw-
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+        })
     }
 }
 

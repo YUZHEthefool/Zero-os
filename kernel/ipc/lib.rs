@@ -86,6 +86,10 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
 ///
 /// R32-IPC-1 FIX: Single lookup to avoid TOCTOU - determine fd type and
 /// get handle in one lock acquisition.
+///
+/// R41-3 FIX: Clone file handle and drop process lock before I/O.
+/// This prevents holding the lock during potentially blocking device I/O,
+/// avoiding DoS vectors and deadlock risks.
 fn fd_read_callback(fd: i32, buf: &mut [u8]) -> Result<usize, SyscallError> {
     use process::{current_pid, get_process};
     use vfs::traits::FileHandle;
@@ -104,12 +108,14 @@ fn fd_read_callback(fd: i32, buf: &mut [u8]) -> Result<usize, SyscallError> {
         return pipe_clone.read(buf).map_err(pipe_error_to_syscall);
     }
 
-    // Check for file (operates under lock - VFS reads are non-blocking)
+    // R41-3 FIX: Clone FileHandle and drop lock before I/O
     if let Some(file) = fd_obj.as_any().downcast_ref::<FileHandle>() {
         if file.inode.is_dir() {
             return Err(SyscallError::EISDIR);
         }
-        return file.read(buf).map_err(fs_error_to_syscall);
+        let file_clone = file.clone();
+        drop(proc); // Release lock before VFS I/O
+        return file_clone.read(buf).map_err(fs_error_to_syscall);
     }
 
     Err(SyscallError::EBADF)
@@ -121,6 +127,10 @@ fn fd_read_callback(fd: i32, buf: &mut [u8]) -> Result<usize, SyscallError> {
 ///
 /// R32-IPC-1 FIX: Single lookup to avoid TOCTOU - determine fd type and
 /// get handle in one lock acquisition.
+///
+/// R41-3 FIX: Clone file handle and drop process lock before I/O.
+/// This prevents holding the lock during potentially blocking device I/O,
+/// avoiding DoS vectors and deadlock risks.
 fn fd_write_callback(fd: i32, buf: &[u8]) -> Result<usize, SyscallError> {
     use process::{current_pid, get_process};
     use vfs::traits::FileHandle;
@@ -139,12 +149,14 @@ fn fd_write_callback(fd: i32, buf: &[u8]) -> Result<usize, SyscallError> {
         return pipe_clone.write(buf).map_err(pipe_error_to_syscall);
     }
 
-    // Check for file (operates under lock - VFS writes are non-blocking)
+    // R41-3 FIX: Clone FileHandle and drop lock before I/O
     if let Some(file) = fd_obj.as_any().downcast_ref::<FileHandle>() {
         if file.inode.is_dir() {
             return Err(SyscallError::EISDIR);
         }
-        return file.write(buf).map_err(fs_error_to_syscall);
+        let file_clone = file.clone();
+        drop(proc); // Release lock before VFS I/O
+        return file_clone.write(buf).map_err(fs_error_to_syscall);
     }
 
     Err(SyscallError::EBADF)

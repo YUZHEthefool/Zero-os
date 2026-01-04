@@ -6,7 +6,7 @@ use crate::types::{DirEntry, FileMode, FsError, OpenFlags, Stat};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
-use kernel_core::FileOps;
+use kernel_core::{FileOps, SyscallError, VfsStat};
 
 /// Filesystem trait
 ///
@@ -153,12 +153,29 @@ pub trait Inode: Send + Sync {
 pub struct FileHandle {
     /// The underlying inode
     pub inode: Arc<dyn Inode>,
-    /// Current file offset
-    pub offset: spin::Mutex<u64>,
+    /// Current file offset (shared via Arc for clone to share offset)
+    pub offset: Arc<spin::Mutex<u64>>,
     /// Open flags
     pub flags: OpenFlags,
     /// Whether this handle supports seeking
     pub seekable: bool,
+}
+
+/// R41-3 FIX: Implement Clone for FileHandle to allow dropping process lock before I/O.
+///
+/// Cloning a FileHandle shares the same offset via Arc, ensuring that
+/// reads/writes from a clone update the original handle's position.
+/// This enables fd_read/fd_write to release the process lock before performing
+/// potentially blocking I/O operations while maintaining correct file position.
+impl Clone for FileHandle {
+    fn clone(&self) -> Self {
+        Self {
+            inode: Arc::clone(&self.inode),
+            offset: Arc::clone(&self.offset),
+            flags: self.flags,
+            seekable: self.seekable,
+        }
+    }
 }
 
 impl FileHandle {
@@ -166,7 +183,7 @@ impl FileHandle {
     pub fn new(inode: Arc<dyn Inode>, flags: OpenFlags, seekable: bool) -> Self {
         Self {
             inode,
-            offset: spin::Mutex::new(0),
+            offset: Arc::new(spin::Mutex::new(0)),
             flags,
             seekable,
         }
@@ -255,7 +272,7 @@ impl FileOps for FileHandle {
     fn clone_box(&self) -> Box<dyn FileOps> {
         Box::new(FileHandle {
             inode: Arc::clone(&self.inode),
-            offset: spin::Mutex::new(*self.offset.lock()),
+            offset: Arc::clone(&self.offset),
             flags: self.flags,
             seekable: self.seekable,
         })
@@ -267,5 +284,11 @@ impl FileOps for FileHandle {
 
     fn type_name(&self) -> &'static str {
         "FileHandle"
+    }
+
+    /// R41-1 FIX: Return actual inode metadata for fstat.
+    fn stat(&self) -> Result<VfsStat, SyscallError> {
+        let inode_stat = self.inode.stat().map_err(SyscallError::from)?;
+        Ok(VfsStat::from(inode_stat))
     }
 }

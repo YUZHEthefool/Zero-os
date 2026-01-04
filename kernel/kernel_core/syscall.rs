@@ -694,6 +694,12 @@ const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
 /// 防止恶意用户请求过大的内存分配导致内核资源耗尽
 const MAX_EXEC_IMAGE_SIZE: usize = 16 * 1024 * 1024;
 
+/// R41-4 FIX: 用于 LSM 策略检查的 ELF 前缀哈希长度
+///
+/// 对 ELF 二进制内容的前 4KB 计算 SHA-256 哈希，替代使用 argv[0] 路径。
+/// 这防止了攻击者通过伪造 argv[0] 绕过 LSM 策略。
+const EXEC_HASH_WINDOW: usize = 4096;
+
 // mmap 跟踪已移至 Process 结构体的 mmap_regions 和 next_mmap_addr 字段
 
 /// 验证用户空间指针
@@ -1866,16 +1872,16 @@ fn sys_exec(
     let argv_vec = copy_user_str_array(argv)?;
     let envp_vec = copy_user_str_array(envp)?;
 
-    // LSM hook: check if policy allows this exec
-    // Use path hash from first argv element (program name) for policy check
-    let path_hash = argv_vec
-        .first()
-        .and_then(|bytes| core::str::from_utf8(bytes).ok())
-        .map(|s| audit::hash_path(s))
-        .unwrap_or(0);
+    // R41-4 FIX: LSM hook uses SHA-256 of ELF content instead of argv[0]
+    //
+    // SECURITY: Previously used argv[0] (user-controlled) for policy checks,
+    // allowing attackers to bypass MAC by setting argv[0] to an allowed program.
+    // Now we hash the actual binary content to ensure policy is checked against
+    // what will actually be executed.
+    let bin_hash = audit::hash_binary_prefix(&elf_data, EXEC_HASH_WINDOW);
 
     if let Some(exec_ctx) = lsm_current_process_ctx() {
-        if let Err(err) = lsm::hook_task_exec(&exec_ctx, path_hash) {
+        if let Err(err) = lsm::hook_task_exec(&exec_ctx, bin_hash) {
             return Err(lsm_error_to_syscall(err));
         }
     }
@@ -2907,8 +2913,11 @@ fn sys_stat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
 
 /// sys_fstat - 获取文件描述符状态
 ///
-/// 为 musl libc 提供最小化实现，返回基本文件状态信息。
-/// 标准流 (0/1/2) 返回字符设备模式，其他 fd 返回普通文件模式。
+/// R41-1 FIX: 现在返回真实的 inode 元数据，而非虚假数据。
+/// - 标准流 (0/1/2) 返回字符设备模式 (S_IFCHR | 0666)
+/// - FileHandle: 查询底层 inode.stat() 获取真实元数据
+/// - PipeHandle: 返回 S_IFIFO | 0666 模式
+/// - 其他类型: 返回 EBADF
 ///
 /// # Arguments
 /// * `fd` - 文件描述符
@@ -2916,6 +2925,11 @@ fn sys_stat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
 ///
 /// # Returns
 /// 成功返回 0，失败返回错误码
+///
+/// # Security
+/// 此修复解决了 R41-1 安全漏洞：之前的实现返回虚假的 S_IFREG|0644
+/// 给所有 fd>2，导致类型混淆和安全策略绕过。现在正确返回文件
+/// 类型（普通文件、FIFO 等），使安全检查能够正确判断 fd 类型。
 fn sys_fstat(fd: i32, statbuf: *mut VfsStat) -> SyscallResult {
     // 验证 statbuf 指针
     if statbuf.is_null() {
@@ -2930,42 +2944,34 @@ fn sys_fstat(fd: i32, statbuf: *mut VfsStat) -> SyscallResult {
         return Err(SyscallError::EBADF);
     }
 
-    // 标准流始终有效，其他 fd 需要检查 fd_table
-    if fd > 2 {
+    // 获取 stat 数据
+    let stat = if fd <= 2 {
+        // 标准流返回字符设备模式 (S_IFCHR | 0666)
+        VfsStat {
+            dev: 0,
+            ino: fd as u64,
+            mode: 0o020000 | 0o666, // S_IFCHR | rw-rw-rw-
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+        }
+    } else {
+        // R41-1 FIX: 查询 fd 对象获取真实元数据
         let pid = current_pid().ok_or(SyscallError::ESRCH)?;
         let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
         let proc = process.lock();
-        if proc.get_fd(fd).is_none() {
-            return Err(SyscallError::EBADF);
-        }
-    }
-
-    // 构造 stat 结构
-    // 标准流返回字符设备模式 (S_IFCHR | 0666)
-    // 其他文件返回普通文件模式 (S_IFREG | 0644)
-    let mode: u32 = if fd <= 2 {
-        0o020000 | 0o666 // S_IFCHR | rw-rw-rw-
-    } else {
-        0o100000 | 0o644 // S_IFREG | rw-r--r--
-    };
-
-    let stat = VfsStat {
-        dev: 0,
-        ino: fd as u64,
-        mode,
-        nlink: 1,
-        uid: 0,
-        gid: 0,
-        rdev: 0,
-        size: 0,
-        blksize: 4096,
-        blocks: 0,
-        atime_sec: 0,
-        atime_nsec: 0,
-        mtime_sec: 0,
-        mtime_nsec: 0,
-        ctime_sec: 0,
-        ctime_nsec: 0,
+        let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+        fd_obj.stat()?
     };
 
     // 将结果写入用户空间

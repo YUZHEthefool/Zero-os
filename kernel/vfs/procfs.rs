@@ -9,7 +9,7 @@
 //! - /proc/meminfo - System memory information
 //! - /proc/cpuinfo - CPU information
 
-use crate::traits::{FileSystem, Inode};
+use crate::traits::{FileHandle, FileSystem, Inode};
 use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeSpec};
 use alloc::boxed::Box;
 use alloc::format;
@@ -164,8 +164,14 @@ impl Inode for ProcRootInode {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Err(FsError::IsDir)
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+        // Directories can only be opened for read-only operations (getdents64)
+        if flags.is_writable() {
+            return Err(FsError::IsDir);
+        }
+        // Return directory handle with seekable=false
+        let inode: Arc<dyn Inode> = Arc::new(ProcRootInode { fs_id: self.fs_id });
+        Ok(Box::new(FileHandle::new(inode, flags, false)))
     }
 
     fn is_dir(&self) -> bool {
@@ -362,8 +368,17 @@ impl Inode for ProcPidDirInode {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Err(FsError::IsDir)
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+        // Directories can only be opened for read-only operations (getdents64)
+        if flags.is_writable() {
+            return Err(FsError::IsDir);
+        }
+        // Return directory handle with seekable=false
+        let inode: Arc<dyn Inode> = Arc::new(ProcPidDirInode {
+            fs_id: self.fs_id,
+            pid: self.pid,
+        });
+        Ok(Box::new(FileHandle::new(inode, flags, false)))
     }
 
     fn is_dir(&self) -> bool {
@@ -439,14 +454,19 @@ impl Inode for ProcPidStatusInode {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Ok(Box::new(ProcReadOnlyFile {
-            content: generate_status(self.pid),
-            offset: RwLock::new(0),
-        }))
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+        // Return FileHandle so fd_read_callback can use inode.read_at()
+        let inode: Arc<dyn Inode> = Arc::new(ProcPidStatusInode { fs_id: self.fs_id, pid: self.pid });
+        Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        // Security: Re-check access on each read to prevent PID reuse attacks
+        // If the original process exits and a new process takes its PID,
+        // we must not expose the new process's data to the original opener.
+        if !can_access_pid(self.pid) {
+            return Err(FsError::PermDenied);
+        }
         let content = generate_status(self.pid);
         read_from_content(&content, offset, buf)
     }
@@ -493,14 +513,17 @@ impl Inode for ProcPidCmdlineInode {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Ok(Box::new(ProcReadOnlyFile {
-            content: get_process_cmdline(self.pid),
-            offset: RwLock::new(0),
-        }))
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+        // Return FileHandle so fd_read_callback can use inode.read_at()
+        let inode: Arc<dyn Inode> = Arc::new(ProcPidCmdlineInode { fs_id: self.fs_id, pid: self.pid });
+        Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        // Security: Re-check access on each read to prevent PID reuse attacks
+        if !can_access_pid(self.pid) {
+            return Err(FsError::PermDenied);
+        }
         let content = get_process_cmdline(self.pid);
         read_from_content(&content, offset, buf)
     }
@@ -547,14 +570,17 @@ impl Inode for ProcPidStatInode {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Ok(Box::new(ProcReadOnlyFile {
-            content: generate_stat(self.pid),
-            offset: RwLock::new(0),
-        }))
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+        // Return FileHandle so fd_read_callback can use inode.read_at()
+        let inode: Arc<dyn Inode> = Arc::new(ProcPidStatInode { fs_id: self.fs_id, pid: self.pid });
+        Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        // Security: Re-check access on each read to prevent PID reuse attacks
+        if !can_access_pid(self.pid) {
+            return Err(FsError::PermDenied);
+        }
         let content = generate_stat(self.pid);
         read_from_content(&content, offset, buf)
     }
@@ -601,14 +627,17 @@ impl Inode for ProcPidMapsInode {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Ok(Box::new(ProcReadOnlyFile {
-            content: generate_maps(self.pid),
-            offset: RwLock::new(0),
-        }))
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+        // Return FileHandle so fd_read_callback can use inode.read_at()
+        let inode: Arc<dyn Inode> = Arc::new(ProcPidMapsInode { fs_id: self.fs_id, pid: self.pid });
+        Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        // Security: Re-check access on each read to prevent PID reuse attacks
+        if !can_access_pid(self.pid) {
+            return Err(FsError::PermDenied);
+        }
         let content = generate_maps(self.pid);
         read_from_content(&content, offset, buf)
     }
@@ -674,8 +703,17 @@ impl Inode for ProcPidFdDirInode {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Err(FsError::IsDir)
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+        // Directories can only be opened for read-only operations (getdents64)
+        if flags.is_writable() {
+            return Err(FsError::IsDir);
+        }
+        // Return directory handle with seekable=false
+        let inode: Arc<dyn Inode> = Arc::new(ProcPidFdDirInode {
+            fs_id: self.fs_id,
+            pid: self.pid,
+        });
+        Ok(Box::new(FileHandle::new(inode, flags, false)))
     }
 
     fn is_dir(&self) -> bool {
@@ -795,11 +833,10 @@ impl Inode for ProcMeminfoInode {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Ok(Box::new(ProcReadOnlyFile {
-            content: generate_meminfo(),
-            offset: RwLock::new(0),
-        }))
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+        // Return FileHandle so fd_read_callback can use inode.read_at()
+        let inode: Arc<dyn Inode> = Arc::new(ProcMeminfoInode { fs_id: self.fs_id });
+        Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
@@ -847,11 +884,10 @@ impl Inode for ProcCpuinfoInode {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Ok(Box::new(ProcReadOnlyFile {
-            content: generate_cpuinfo(),
-            offset: RwLock::new(0),
-        }))
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+        // Return FileHandle so fd_read_callback can use inode.read_at()
+        let inode: Arc<dyn Inode> = Arc::new(ProcCpuinfoInode { fs_id: self.fs_id });
+        Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
@@ -899,11 +935,10 @@ impl Inode for ProcUptimeInode {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Ok(Box::new(ProcReadOnlyFile {
-            content: generate_uptime(),
-            offset: RwLock::new(0),
-        }))
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+        // Return FileHandle so fd_read_callback can use inode.read_at()
+        let inode: Arc<dyn Inode> = Arc::new(ProcUptimeInode { fs_id: self.fs_id });
+        Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
@@ -951,11 +986,10 @@ impl Inode for ProcVersionInode {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Ok(Box::new(ProcReadOnlyFile {
-            content: String::from("Zero-OS version 0.1.0 (rustc)\n"),
-            offset: RwLock::new(0),
-        }))
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+        // Return FileHandle so fd_read_callback can use inode.read_at()
+        let inode: Arc<dyn Inode> = Arc::new(ProcVersionInode { fs_id: self.fs_id });
+        Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
@@ -965,32 +999,6 @@ impl Inode for ProcVersionInode {
 
     fn as_any(&self) -> &dyn Any {
         self
-    }
-}
-
-// ============================================================================
-// Read-only file handle
-// ============================================================================
-
-struct ProcReadOnlyFile {
-    content: String,
-    offset: RwLock<u64>,
-}
-
-impl FileOps for ProcReadOnlyFile {
-    fn clone_box(&self) -> Box<dyn FileOps> {
-        Box::new(ProcReadOnlyFile {
-            content: self.content.clone(),
-            offset: RwLock::new(*self.offset.read()),
-        })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn type_name(&self) -> &'static str {
-        "ProcFile"
     }
 }
 

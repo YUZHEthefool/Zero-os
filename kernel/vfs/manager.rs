@@ -194,7 +194,22 @@ impl Vfs {
         *self.root_fs.write() = Some(ramfs.clone());
 
         // Mount ramfs at / first
-        self.mount("/", ramfs).expect("Failed to mount ramfs at /");
+        self.mount("/", ramfs.clone()).expect("Failed to mount ramfs at /");
+
+        // Create mount point directories in root ramfs so they appear in ls
+        // These directories are needed so that readdir("/") shows /dev and /proc
+        let root_inode = ramfs.root_inode();
+        let dir_mode = crate::types::FileMode::new(crate::types::FileType::Directory, 0o755);
+
+        // Create /dev directory entry
+        if let Err(e) = ramfs.create(&root_inode, "dev", dir_mode) {
+            println!("Warning: failed to create /dev mountpoint: {:?}", e);
+        }
+
+        // Create /proc directory entry
+        if let Err(e) = ramfs.create(&root_inode, "proc", dir_mode) {
+            println!("Warning: failed to create /proc mountpoint: {:?}", e);
+        }
 
         // Create and mount devfs at /dev
         let devfs = DevFs::new();
@@ -313,11 +328,26 @@ impl Vfs {
         const MAX_SYMLINK_DEPTH: usize = 40;
 
         let mut symlink_count: usize = 0;
+        let is_absolute = path.starts_with('/');
         let mut path_to_resolve = normalize_path(path)?;
 
         // Capture the starting filesystem for RESOLVE_NO_XDEV
         let (anchor_mount, anchor_fs, _) = self.find_mount(&path_to_resolve)?;
         let anchor_fs_id = anchor_fs.fs_id();
+
+        // R41-2 FIX: Reject absolute paths when confinement flags are set
+        //
+        // SECURITY: RESOLVE_BENEATH and RESOLVE_IN_ROOT are designed to confine
+        // path resolution to a directory subtree. For this to work, paths must
+        // be relative to the anchor directory. Absolute paths bypass this
+        // confinement because anchor_mount for "/" makes all paths pass the
+        // starts_with check. This matches Linux's openat2 behavior.
+        if (resolve_flags.beneath() || resolve_flags.in_root())
+            && is_absolute
+            && path_to_resolve != anchor_mount
+        {
+            return Err(FsError::Invalid);
+        }
 
         'resolve: loop {
             // RESOLVE_BENEATH / RESOLVE_IN_ROOT: check path stays within anchor
@@ -1131,33 +1161,42 @@ fn vfs_readdir_callback(fd: i32) -> Result<alloc::vec::Vec<kernel_core::DirEntry
 
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
-    let proc = proc_arc.lock();
 
-    let handle = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+    // Get inode and current offset from the file handle
+    // FIX: Extract inode Arc and offset to release process lock before I/O
+    let (inode, start_offset) = {
+        let proc = proc_arc.lock();
+        let handle = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
 
-    // Downcast to FileHandle
-    let file_handle = handle
-        .as_any()
-        .downcast_ref::<FileHandle>()
-        .ok_or(SyscallError::ENOTDIR)?;
+        // Downcast to FileHandle
+        let file_handle = handle
+            .as_any()
+            .downcast_ref::<FileHandle>()
+            .ok_or(SyscallError::ENOTDIR)?;
 
-    if !file_handle.inode.is_dir() {
-        return Err(SyscallError::ENOTDIR);
-    }
+        if !file_handle.inode.is_dir() {
+            return Err(SyscallError::ENOTDIR);
+        }
+
+        // Read offset before creating tuple to avoid lifetime issues
+        let offset = *file_handle.offset.lock() as usize;
+        (Arc::clone(&file_handle.inode), offset)
+    };
+    // Process lock released here - safe for procfs operations
 
     // R37-4 FIX (Codex review): Add MAC check for sys_getdents64.
-    // The path-based readdir() has MAC check, but fd-based readdir must too.
-    let dir_stat = file_handle.inode.stat().map_err(fs_error_to_syscall)?;
+    let dir_stat = inode.stat().map_err(fs_error_to_syscall)?;
     if let Some(task) = LsmProcessCtx::from_current() {
         lsm::hook_file_permission(&task, dir_stat.ino, 0x05)
             .map_err(|_| SyscallError::EACCES)?;
     }
 
-    // Read all directory entries
+    // Read directory entries starting from current offset
     let mut entries = Vec::new();
-    let mut offset = 0usize;
+    let mut offset = start_offset;
+
     loop {
-        match file_handle.inode.readdir(offset) {
+        match inode.readdir(offset) {
             Ok(Some((next, entry))) => {
                 // Convert VFS DirEntry to kernel_core DirEntry
                 let file_type = match entry.file_type {
@@ -1178,6 +1217,17 @@ fn vfs_readdir_callback(fd: i32) -> Result<alloc::vec::Vec<kernel_core::DirEntry
             }
             Ok(None) => break,
             Err(e) => return Err(fs_error_to_syscall(e)),
+        }
+    }
+
+    // Re-acquire process lock to update the original file handle's offset
+    // FIX: Update the actual fd_table entry, not a clone
+    {
+        let proc = proc_arc.lock();
+        if let Some(handle) = proc.get_fd(fd) {
+            if let Some(file_handle) = handle.as_any().downcast_ref::<FileHandle>() {
+                *file_handle.offset.lock() = offset as u64;
+            }
         }
     }
 

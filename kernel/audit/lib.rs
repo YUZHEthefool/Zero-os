@@ -1623,6 +1623,31 @@ pub fn hash_bytes(data: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// R41-4 FIX: Compute SHA-256 hash of the first `max_len` bytes of a binary blob.
+///
+/// Used for in-memory exec where no stable on-disk path exists. The hash is
+/// computed from the actual ELF content, preventing argv[0] spoofing attacks.
+///
+/// The digest is truncated to 64 bits to match path_hash consumers.
+///
+/// # Arguments
+/// * `data` - The binary data to hash
+/// * `max_len` - Maximum number of bytes to include in hash (typically 4096)
+///
+/// # Security
+/// Using the actual binary content for policy checks prevents attackers from
+/// bypassing LSM hooks by setting argv[0] to an allowed program name while
+/// executing malicious code.
+pub fn hash_binary_prefix(data: &[u8], max_len: usize) -> u64 {
+    let len = core::cmp::min(data.len(), max_len);
+    let digest = Sha256::digest(&data[..len]);
+    // Truncate to 64 bits (first 8 bytes of SHA-256)
+    u64::from_be_bytes([
+        digest[0], digest[1], digest[2], digest[3],
+        digest[4], digest[5], digest[6], digest[7],
+    ])
+}
+
 // ============================================================================
 // Chain Verification
 // ============================================================================

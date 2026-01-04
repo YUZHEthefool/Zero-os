@@ -315,9 +315,14 @@ impl Inode for RamFsInode {
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        // Cannot open directories for read/write
+        // Directories can only be opened for read-only operations (getdents64)
         if matches!(self.kind, NodeKind::Dir { .. }) {
-            return Err(FsError::IsDir);
+            if flags.is_writable() {
+                return Err(FsError::IsDir);
+            }
+            // Return directory handle with seekable=false
+            let inode_arc = self.as_arc()?;
+            return Ok(Box::new(FileHandle::new(inode_arc, flags, false)));
         }
 
         let inode_arc = self.as_arc()?;

@@ -11,7 +11,7 @@ use crate::types::{DirEntry, FileMode, FileType, FsError, OpenFlags, Stat, TimeS
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use block::BlockDevice;
 use core::any::Any;
@@ -44,7 +44,10 @@ impl DevFs {
             fs_id,
             ino: 1,
             entries: RwLock::new(devices),
+            self_ref: RwLock::new(Weak::new()),
         });
+        // Set self-reference after Arc creation
+        *root.self_ref.write() = Arc::downgrade(&root);
 
         Arc::new(Self { fs_id, root })
     }
@@ -110,6 +113,18 @@ struct DevDirInode {
     fs_id: u64,
     ino: u64,
     entries: RwLock<BTreeMap<String, Arc<dyn Inode>>>,
+    /// Self-reference for creating Arc in open()
+    self_ref: RwLock<Weak<Self>>,
+}
+
+impl DevDirInode {
+    /// Get Arc<Self> from self_ref
+    fn as_arc(&self) -> Result<Arc<Self>, FsError> {
+        self.self_ref
+            .read()
+            .upgrade()
+            .ok_or(FsError::Invalid)
+    }
 }
 
 impl Inode for DevDirInode {
@@ -139,9 +154,14 @@ impl Inode for DevDirInode {
         })
     }
 
-    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        // Directories are opened for readdir, not read/write
-        Err(FsError::IsDir)
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
+        // Directories can only be opened for read-only operations (getdents64)
+        if flags.is_writable() {
+            return Err(FsError::IsDir);
+        }
+        // Return directory handle with seekable=false
+        let inode = self.as_arc()?;
+        Ok(Box::new(FileHandle::new(inode, flags, false)))
     }
 
     fn is_dir(&self) -> bool {

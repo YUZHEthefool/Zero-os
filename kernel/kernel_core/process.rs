@@ -1,5 +1,6 @@
 use crate::fork::PAGE_REF_COUNT;
 use crate::signal::PendingSignals;
+use crate::syscall::{SyscallError, VfsStat};
 use crate::time;
 use alloc::{boxed::Box, collections::{BTreeMap, BTreeSet}, string::String, sync::Arc, vec, vec::Vec};
 use cap::CapTable;
@@ -80,6 +81,15 @@ pub trait FileOps: Send + Sync {
 
     /// 获取类型名称（用于调试）
     fn type_name(&self) -> &'static str;
+
+    /// R41-1 FIX: 获取文件状态信息（用于 fstat）
+    ///
+    /// 默认返回 EBADF，子类型应覆盖此方法返回正确的元数据。
+    /// FileHandle、Ext2File 应返回 inode 元数据，
+    /// PipeHandle 应返回 S_IFIFO 模式。
+    fn stat(&self) -> Result<VfsStat, SyscallError> {
+        Err(SyscallError::EBADF)
+    }
 }
 
 impl core::fmt::Debug for dyn FileOps {

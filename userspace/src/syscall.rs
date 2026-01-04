@@ -32,6 +32,15 @@ pub const SYS_OPEN: u64 = 2;
 /// Close file descriptor
 pub const SYS_CLOSE: u64 = 3;
 
+/// Get file status by path
+pub const SYS_STAT: u64 = 4;
+
+/// Get file status by descriptor
+pub const SYS_FSTAT: u64 = 5;
+
+/// Reposition file offset
+pub const SYS_LSEEK: u64 = 8;
+
 /// Memory map
 pub const SYS_MMAP: u64 = 9;
 
@@ -46,6 +55,15 @@ pub const SYS_YIELD: u64 = 24;
 
 /// Get current process ID
 pub const SYS_GETPID: u64 = 39;
+
+/// Get system information
+pub const SYS_UNAME: u64 = 63;
+
+/// Get current working directory
+pub const SYS_GETCWD: u64 = 79;
+
+/// Change current working directory
+pub const SYS_CHDIR: u64 = 80;
 
 /// Create child process (copy-on-write)
 pub const SYS_FORK: u64 = 57;
@@ -67,6 +85,9 @@ pub const SYS_GETPPID: u64 = 110;
 
 /// Get thread ID
 pub const SYS_GETTID: u64 = 186;
+
+/// Read directory entries
+pub const SYS_GETDENTS64: u64 = 217;
 
 /// Set TID address for clear_child_tid
 pub const SYS_SET_TID_ADDRESS: u64 = 218;
@@ -273,6 +294,123 @@ pub unsafe fn sys_read(fd: u64, buf: *mut u8, count: u64) -> u64 {
     syscall3(SYS_READ, fd, buf as u64, count)
 }
 
+/// Open a file or directory
+///
+/// # Arguments
+/// - `path`: Path to open (null-terminated)
+/// - `flags`: Open flags (O_RDONLY, O_WRONLY, O_RDWR, etc.)
+/// - `mode`: Creation mode bits (used with O_CREAT)
+///
+/// # Returns
+/// File descriptor on success, or negative error code
+#[inline(always)]
+pub unsafe fn sys_open(path: *const u8, flags: i32, mode: u32) -> u64 {
+    syscall3(SYS_OPEN, path as u64, flags as u64, mode as u64)
+}
+
+/// Close a file descriptor
+///
+/// # Arguments
+/// - `fd`: File descriptor to close
+///
+/// # Returns
+/// 0 on success, or negative error code
+#[inline(always)]
+pub unsafe fn sys_close(fd: u64) -> u64 {
+    syscall1(SYS_CLOSE, fd)
+}
+
+/// Get file status by path
+///
+/// # Arguments
+/// - `path`: Path to the file (null-terminated)
+/// - `statbuf`: Pointer to Stat structure to fill
+///
+/// # Returns
+/// 0 on success, or negative error code
+#[inline(always)]
+pub unsafe fn sys_stat(path: *const u8, statbuf: *mut Stat) -> u64 {
+    syscall2(SYS_STAT, path as u64, statbuf as u64)
+}
+
+/// Get file status by file descriptor
+///
+/// # Arguments
+/// - `fd`: File descriptor
+/// - `statbuf`: Pointer to Stat structure to fill
+///
+/// # Returns
+/// 0 on success, or negative error code
+#[inline(always)]
+pub unsafe fn sys_fstat(fd: u64, statbuf: *mut Stat) -> u64 {
+    syscall2(SYS_FSTAT, fd, statbuf as u64)
+}
+
+/// Reposition file offset
+///
+/// # Arguments
+/// - `fd`: File descriptor
+/// - `offset`: Offset value
+/// - `whence`: Reference point (SEEK_SET=0, SEEK_CUR=1, SEEK_END=2)
+///
+/// # Returns
+/// New file offset, or negative error code
+#[inline(always)]
+pub unsafe fn sys_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
+    syscall3(SYS_LSEEK, fd, offset as u64, whence)
+}
+
+/// Read directory entries
+///
+/// # Arguments
+/// - `fd`: Directory file descriptor
+/// - `dirp`: Buffer to fill with directory entries
+/// - `count`: Buffer size in bytes
+///
+/// # Returns
+/// Number of bytes read, or negative error code
+#[inline(always)]
+pub unsafe fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> u64 {
+    syscall3(SYS_GETDENTS64, fd as u64, dirp as u64, count as u64)
+}
+
+/// Get current working directory
+///
+/// # Arguments
+/// - `buf`: Buffer to store the path
+/// - `size`: Buffer size
+///
+/// # Returns
+/// Length of path on success, or negative error code
+#[inline(always)]
+pub unsafe fn sys_getcwd(buf: *mut u8, size: usize) -> u64 {
+    syscall2(SYS_GETCWD, buf as u64, size as u64)
+}
+
+/// Change current working directory
+///
+/// # Arguments
+/// - `path`: Path to the new directory (null-terminated)
+///
+/// # Returns
+/// 0 on success, or negative error code
+#[inline(always)]
+pub unsafe fn sys_chdir(path: *const u8) -> u64 {
+    syscall1(SYS_CHDIR, path as u64)
+}
+
+/// Get system information
+///
+/// # Arguments
+/// - `buf`: Pointer to UtsName structure to fill
+///
+/// # Returns
+/// 0 on success, or negative error code
+#[inline(always)]
+pub unsafe fn sys_uname(buf: *mut UtsName) -> u64 {
+    syscall1(SYS_UNAME, buf as u64)
+}
+
 /// Terminate the current process
 ///
 /// # Arguments
@@ -416,6 +554,66 @@ pub unsafe fn sys_exit_group(code: u64) -> ! {
 #[inline(always)]
 pub unsafe fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> u64 {
     syscall3(SYS_GETRANDOM, buf as u64, len as u64, flags as u64)
+}
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+/// File status structure (matches kernel VfsStat)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Stat {
+    pub dev: u64,
+    pub ino: u64,
+    pub mode: u32,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u32,
+    pub size: u64,
+    pub blksize: u32,
+    pub blocks: u64,
+    pub atime_sec: i64,
+    pub atime_nsec: i64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
+    pub ctime_sec: i64,
+    pub ctime_nsec: i64,
+}
+
+/// Directory entry header returned by getdents64
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Dirent64 {
+    pub d_ino: u64,
+    pub d_off: i64,
+    pub d_reclen: u16,
+    pub d_type: u8,
+    // followed by name bytes + '\0'
+}
+
+/// System name structure (uname)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UtsName {
+    pub sysname: [u8; 65],
+    pub nodename: [u8; 65],
+    pub release: [u8; 65],
+    pub version: [u8; 65],
+    pub machine: [u8; 65],
+}
+
+impl Default for UtsName {
+    fn default() -> Self {
+        Self {
+            sysname: [0; 65],
+            nodename: [0; 65],
+            release: [0; 65],
+            version: [0; 65],
+            machine: [0; 65],
+        }
+    }
 }
 
 // ============================================================================

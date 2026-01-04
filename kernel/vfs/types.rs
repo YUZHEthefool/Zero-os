@@ -8,6 +8,7 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use kernel_core::{SyscallError, VfsStat};
 
 /// File type enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +249,57 @@ impl FsError {
             FsError::CrossDev => -18,     // EXDEV
             FsError::SymlinkLoop => -40,  // ELOOP
             FsError::Seek => -29,         // ESPIPE
+        }
+    }
+}
+
+// ============================================================================
+// R41-1 FIX: Type conversions for fstat support
+// ============================================================================
+
+/// Convert VFS Stat to kernel_core VfsStat for syscall interface.
+impl From<Stat> for VfsStat {
+    fn from(stat: Stat) -> Self {
+        VfsStat {
+            dev: stat.dev,
+            ino: stat.ino,
+            mode: stat.mode.to_raw(),
+            nlink: stat.nlink,
+            uid: stat.uid,
+            gid: stat.gid,
+            rdev: stat.rdev,
+            size: stat.size,
+            blksize: stat.blksize,
+            blocks: stat.blocks,
+            atime_sec: stat.atime.sec,
+            atime_nsec: stat.atime.nsec,
+            mtime_sec: stat.mtime.sec,
+            mtime_nsec: stat.mtime.nsec,
+            ctime_sec: stat.ctime.sec,
+            ctime_nsec: stat.ctime.nsec,
+        }
+    }
+}
+
+/// Convert FsError to SyscallError for unified error handling.
+impl From<FsError> for SyscallError {
+    fn from(err: FsError) -> Self {
+        match err {
+            FsError::NotFound => SyscallError::ENOENT,
+            FsError::PermDenied => SyscallError::EACCES,
+            FsError::Exists => SyscallError::EEXIST,
+            FsError::NotDir => SyscallError::ENOTDIR,
+            FsError::IsDir => SyscallError::EISDIR,
+            FsError::NotEmpty => SyscallError::EBUSY,
+            FsError::ReadOnly => SyscallError::EACCES,
+            FsError::NoSpace | FsError::NoMem => SyscallError::ENOMEM,
+            FsError::Io => SyscallError::EIO,
+            FsError::Invalid | FsError::NameTooLong | FsError::Seek => SyscallError::EINVAL,
+            FsError::CrossDev => SyscallError::EXDEV,
+            FsError::SymlinkLoop => SyscallError::ELOOP,
+            FsError::NotSupported => SyscallError::ENOSYS,
+            FsError::BadFd => SyscallError::EBADF,
+            FsError::Pipe => SyscallError::EPIPE,
         }
     }
 }
