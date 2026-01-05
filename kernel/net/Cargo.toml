@@ -1,12 +1,11 @@
 [package]
-name = "block"
+name = "net"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 spin = "0.9"
-lazy_static = { version = "1.4", features = ["spin_no_std"] }
-drivers = { path = "../drivers" }
 mm = { path = "../mm" }
 virtio = { path = "../virtio" }
+drivers = { path = "../drivers" }
 x86_64 = "0.15"

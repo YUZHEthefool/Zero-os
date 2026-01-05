@@ -89,13 +89,17 @@ pub struct PageCacheEntry {
 
 impl PageCacheEntry {
     /// Create a new page cache entry
+    ///
+    /// R42-4 FIX: Refcount now starts at 0 (no active pins).
+    /// The Arc wrapper provides the actual reference counting for the cache.
+    /// Callers who need to pin a page should use get()/put() explicitly.
     pub fn new(pfn: u64, inode_id: InodeId, index: PageIndex) -> Self {
         Self {
             pfn,
             inode_id,
             index,
             dirty: AtomicBool::new(false),
-            refcount: AtomicU32::new(1), // Start with refcount 1
+            refcount: AtomicU32::new(0), // R42-4 FIX: Start with 0 (no active pins)
             state: AtomicU32::new(PageState::Invalid as u32),
             io_lock: Mutex::new(()),
             lru_index: AtomicU64::new(u64::MAX),
@@ -180,11 +184,26 @@ impl PageCacheEntry {
         self.io_lock.lock()
     }
 
-    /// Check if the page can be reclaimed (refcount == 0, not dirty, not locked)
-    pub fn can_reclaim(&self) -> bool {
-        self.refcount.load(Ordering::Acquire) == 0
-            && !self.is_dirty()
-            && self.io_lock.try_lock().is_some()
+    /// Check if the page can be reclaimed
+    ///
+    /// R42-4 FIX: Use Arc::strong_count instead of internal refcount to determine
+    /// reclaimability. A page can be reclaimed when:
+    /// 1. Only the cache (bucket) and caller hold references (strong_count == 2)
+    ///    - After pop_tail from LRU, the page has: one ref in bucket, one ref in local var
+    /// 2. The page is not dirty (no pending writeback needed)
+    /// 3. The page is not locked for I/O
+    ///
+    /// This fixes the issue where the internal refcount was only incremented
+    /// but never decremented, preventing any page from ever being reclaimed.
+    ///
+    /// Note: Called from shrink() after the page has been removed from LRU.
+    /// At that point, only the bucket and the local variable hold Arc references.
+    pub fn can_reclaim(page: &alloc::sync::Arc<PageCacheEntry>) -> bool {
+        // After LRU pop: bucket(1) + local var(1) = 2
+        // Any external user would add more refs
+        alloc::sync::Arc::strong_count(page) == 2
+            && !page.is_dirty()
+            && page.io_lock.try_lock().is_some()
     }
 }
 
@@ -551,15 +570,16 @@ impl GlobalPageCache {
     }
 
     /// Find a page in the cache
+    ///
+    /// R42-4 FIX: Removed redundant page.get() call. The Arc clone already
+    /// increments the reference count. The internal refcount field is now
+    /// only used for explicit pinning by callers who need it.
     pub fn find_get_page(&self, inode_id: InodeId, index: PageIndex) -> Option<Arc<PageCacheEntry>> {
         let bucket_idx = hash_key(inode_id, index);
         let bucket = self.buckets[bucket_idx].read();
 
         if let Some(page) = bucket.get(&(inode_id, index)) {
-            // Increment refcount
-            page.get();
-
-            // Touch LRU
+            // Touch LRU (mark as recently used)
             let lru_idx = page.lru_index.load(Ordering::Acquire);
             if lru_idx != u64::MAX {
                 let mut lru = self.lru.lock();
@@ -575,6 +595,8 @@ impl GlobalPageCache {
     /// Add a page to the cache
     ///
     /// Returns the existing page if one already exists, or the new page if insertion succeeded.
+    ///
+    /// R42-4 FIX: Removed redundant existing.get() call on race condition path.
     pub fn add_to_cache(
         &self,
         inode_id: InodeId,
@@ -586,7 +608,7 @@ impl GlobalPageCache {
 
         // Check if page already exists
         if let Some(existing) = bucket.get(&(inode_id, index)) {
-            existing.get();
+            // R42-4 FIX: Just clone the Arc, don't increment internal refcount
             return Err(existing.clone());
         }
 
@@ -653,12 +675,17 @@ impl GlobalPageCache {
     ///
     /// Returns the number of pages reclaimed.
     ///
+    /// R42-5 FIX: Continue scanning LRU instead of stopping at first non-reclaimable page.
+    /// An attacker could keep pages dirty/pinned to block reclamation if we stopped early.
+    ///
     /// Lock ordering: bucket lock → LRU lock (same as find_get_page/add_to_cache)
     /// To avoid deadlock, we release LRU lock before acquiring bucket lock.
     pub fn shrink(&self, nr_to_reclaim: usize) -> usize {
         let mut reclaimed = 0;
+        let mut scanned = 0usize;
+        let max_scan = self.nr_pages.load(Ordering::Relaxed) as usize;
 
-        while reclaimed < nr_to_reclaim {
+        while reclaimed < nr_to_reclaim && scanned < max_scan {
             // Phase 1: Pop candidate from LRU (with LRU lock)
             let page = {
                 let mut lru = self.lru.lock();
@@ -668,13 +695,16 @@ impl GlobalPageCache {
                 }
             };
             // LRU lock released here
+            scanned += 1;
 
-            // Check if page can be reclaimed
-            if !page.can_reclaim() {
+            // R42-4 FIX: Use static method with Arc reference
+            // R42-5 FIX: Check if page can be reclaimed, continue if not
+            if !PageCacheEntry::can_reclaim(&page) {
                 // Put it back at the front (it's actively used or dirty)
                 let mut lru = self.lru.lock();
                 lru.push_front(page);
-                break;
+                // R42-5 FIX: Continue scanning instead of breaking
+                continue;
             }
 
             // Phase 2: Remove from hash bucket (with bucket lock only)

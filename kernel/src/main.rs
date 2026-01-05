@@ -12,6 +12,7 @@ extern crate drivers;
 extern crate arch;
 extern crate block;
 extern crate cap;
+extern crate net;
 extern crate ipc;
 extern crate kernel_core;
 extern crate mm;
@@ -396,6 +397,13 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("[7.52/8] Initializing Page Cache...");
     mm::init_page_cache();
     println!("      ✓ Global page cache initialized");
+
+    // Phase D: Network Layer
+    println!("[7.54/8] Initializing Network Layer...");
+    let net_devices = net::init();
+    if net_devices == 0 {
+        println!("      ! No network devices detected");
+    }
 
     // Phase C: Block Layer and Storage Foundation
     println!("[7.55/8] Initializing Block Layer...");

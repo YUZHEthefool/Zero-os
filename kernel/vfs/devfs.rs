@@ -35,10 +35,19 @@ impl DevFs {
 
         let mut devices: BTreeMap<String, Arc<dyn Inode>> = BTreeMap::new();
 
-        // Create device inodes
-        devices.insert("null".into(), Arc::new(NullDevInode::new(fs_id)));
-        devices.insert("zero".into(), Arc::new(ZeroDevInode::new(fs_id)));
-        devices.insert("console".into(), Arc::new(ConsoleDevInode::new(fs_id)));
+        // Create device inodes with self-references initialized
+        // This enables open() to return FileHandle wrapping the inode
+        let null_inode = Arc::new(NullDevInode::new(fs_id));
+        *null_inode.self_ref.write() = Arc::downgrade(&null_inode);
+        devices.insert("null".into(), null_inode);
+
+        let zero_inode = Arc::new(ZeroDevInode::new(fs_id));
+        *zero_inode.self_ref.write() = Arc::downgrade(&zero_inode);
+        devices.insert("zero".into(), zero_inode);
+
+        let console_inode = Arc::new(ConsoleDevInode::new(fs_id));
+        *console_inode.self_ref.write() = Arc::downgrade(&console_inode);
+        devices.insert("console".into(), console_inode);
 
         let root = Arc::new(DevDirInode {
             fs_id,
@@ -70,7 +79,10 @@ impl DevFs {
         static NEXT_BLOCK_INO: AtomicU64 = AtomicU64::new(100);
         let ino = NEXT_BLOCK_INO.fetch_add(1, Ordering::SeqCst);
 
+        // Create block device inode with self-reference initialized
+        // This enables open() to return FileHandle wrapping the inode
         let inode = Arc::new(BlockDevInode::new(self.fs_id, ino, device));
+        *inode.self_ref.write() = Arc::downgrade(&inode);
         entries.insert(String::from(name), inode);
 
         Ok(())
@@ -208,11 +220,22 @@ impl Inode for DevDirInode {
 struct NullDevInode {
     fs_id: u64,
     ino: u64,
+    /// Self-reference for creating Arc in open()
+    self_ref: RwLock<Weak<Self>>,
 }
 
 impl NullDevInode {
     fn new(fs_id: u64) -> Self {
-        Self { fs_id, ino: 2 }
+        Self {
+            fs_id,
+            ino: 2,
+            self_ref: RwLock::new(Weak::new()),
+        }
+    }
+
+    /// Get Arc<Self> from self_ref for FileHandle creation
+    fn as_arc(&self) -> Result<Arc<Self>, FsError> {
+        self.self_ref.read().upgrade().ok_or(FsError::Invalid)
     }
 }
 
@@ -244,7 +267,9 @@ impl Inode for NullDevInode {
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Ok(Box::new(NullDevFile { flags }))
+        // Return FileHandle wrapping this inode so fd_read/fd_write work correctly
+        let inode: Arc<dyn Inode> = self.as_arc()?;
+        Ok(Box::new(FileHandle::new(inode, flags, false)))
     }
 
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, FsError> {
@@ -262,25 +287,6 @@ impl Inode for NullDevInode {
     }
 }
 
-/// /dev/null file handle
-struct NullDevFile {
-    flags: OpenFlags,
-}
-
-impl FileOps for NullDevFile {
-    fn clone_box(&self) -> Box<dyn FileOps> {
-        Box::new(NullDevFile { flags: self.flags })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn type_name(&self) -> &'static str {
-        "NullDev"
-    }
-}
-
 // ============================================================================
 // /dev/zero implementation
 // ============================================================================
@@ -289,11 +295,22 @@ impl FileOps for NullDevFile {
 struct ZeroDevInode {
     fs_id: u64,
     ino: u64,
+    /// Self-reference for creating Arc in open()
+    self_ref: RwLock<Weak<Self>>,
 }
 
 impl ZeroDevInode {
     fn new(fs_id: u64) -> Self {
-        Self { fs_id, ino: 3 }
+        Self {
+            fs_id,
+            ino: 3,
+            self_ref: RwLock::new(Weak::new()),
+        }
+    }
+
+    /// Get Arc<Self> from self_ref for FileHandle creation
+    fn as_arc(&self) -> Result<Arc<Self>, FsError> {
+        self.self_ref.read().upgrade().ok_or(FsError::Invalid)
     }
 }
 
@@ -325,7 +342,9 @@ impl Inode for ZeroDevInode {
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Ok(Box::new(ZeroDevFile { flags }))
+        // Return FileHandle wrapping this inode so fd_read/fd_write work correctly
+        let inode: Arc<dyn Inode> = self.as_arc()?;
+        Ok(Box::new(FileHandle::new(inode, flags, false)))
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
@@ -344,25 +363,6 @@ impl Inode for ZeroDevInode {
     }
 }
 
-/// /dev/zero file handle
-struct ZeroDevFile {
-    flags: OpenFlags,
-}
-
-impl FileOps for ZeroDevFile {
-    fn clone_box(&self) -> Box<dyn FileOps> {
-        Box::new(ZeroDevFile { flags: self.flags })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn type_name(&self) -> &'static str {
-        "ZeroDev"
-    }
-}
-
 // ============================================================================
 // /dev/console implementation
 // ============================================================================
@@ -371,11 +371,22 @@ impl FileOps for ZeroDevFile {
 struct ConsoleDevInode {
     fs_id: u64,
     ino: u64,
+    /// Self-reference for creating Arc in open()
+    self_ref: RwLock<Weak<Self>>,
 }
 
 impl ConsoleDevInode {
     fn new(fs_id: u64) -> Self {
-        Self { fs_id, ino: 4 }
+        Self {
+            fs_id,
+            ino: 4,
+            self_ref: RwLock::new(Weak::new()),
+        }
+    }
+
+    /// Get Arc<Self> from self_ref for FileHandle creation
+    fn as_arc(&self) -> Result<Arc<Self>, FsError> {
+        self.self_ref.read().upgrade().ok_or(FsError::Invalid)
     }
 }
 
@@ -407,7 +418,9 @@ impl Inode for ConsoleDevInode {
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Ok(Box::new(ConsoleDevFile { flags }))
+        // Return FileHandle wrapping this inode so fd_read/fd_write work correctly
+        let inode: Arc<dyn Inode> = self.as_arc()?;
+        Ok(Box::new(FileHandle::new(inode, flags, false)))
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
@@ -433,24 +446,6 @@ impl Inode for ConsoleDevInode {
     }
 }
 
-/// /dev/console file handle
-struct ConsoleDevFile {
-    flags: OpenFlags,
-}
-
-impl FileOps for ConsoleDevFile {
-    fn clone_box(&self) -> Box<dyn FileOps> {
-        Box::new(ConsoleDevFile { flags: self.flags })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn type_name(&self) -> &'static str {
-        "ConsoleDev"
-    }
-}
 
 // ============================================================================
 // Helper functions
@@ -462,51 +457,6 @@ fn make_dev(major: u32, minor: u32) -> u32 {
     ((major & 0xFFF) << 8) | (minor & 0xFF) | ((minor & 0xFFF00) << 12)
 }
 
-/// Extended device file operations
-///
-/// This trait extends FileOps with device-specific operations
-pub trait DevFileOps: FileOps {
-    /// Read from device
-    fn dev_read(&self, buf: &mut [u8]) -> Result<usize, FsError>;
-
-    /// Write to device
-    fn dev_write(&self, data: &[u8]) -> Result<usize, FsError>;
-}
-
-impl DevFileOps for NullDevFile {
-    fn dev_read(&self, _buf: &mut [u8]) -> Result<usize, FsError> {
-        Ok(0) // EOF
-    }
-
-    fn dev_write(&self, data: &[u8]) -> Result<usize, FsError> {
-        Ok(data.len()) // Discard
-    }
-}
-
-impl DevFileOps for ZeroDevFile {
-    fn dev_read(&self, buf: &mut [u8]) -> Result<usize, FsError> {
-        buf.fill(0);
-        Ok(buf.len())
-    }
-
-    fn dev_write(&self, data: &[u8]) -> Result<usize, FsError> {
-        Ok(data.len()) // Discard
-    }
-}
-
-impl DevFileOps for ConsoleDevFile {
-    fn dev_read(&self, buf: &mut [u8]) -> Result<usize, FsError> {
-        // Console read: read from keyboard input buffer (non-blocking)
-        Ok(drivers::keyboard_read(buf))
-    }
-
-    fn dev_write(&self, data: &[u8]) -> Result<usize, FsError> {
-        if let Ok(s) = core::str::from_utf8(data) {
-            print!("{}", s);
-        }
-        Ok(data.len())
-    }
-}
 
 // ============================================================================
 // Block device implementation
@@ -519,6 +469,8 @@ struct BlockDevInode {
     device: Arc<dyn BlockDevice>,
     /// Lock for serializing read-modify-write operations
     rw_lock: Arc<Mutex<()>>,
+    /// Self-reference for creating Arc in open()
+    self_ref: RwLock<Weak<Self>>,
 }
 
 impl BlockDevInode {
@@ -528,7 +480,13 @@ impl BlockDevInode {
             ino,
             device,
             rw_lock: Arc::new(Mutex::new(())),
+            self_ref: RwLock::new(Weak::new()),
         }
+    }
+
+    /// Get Arc<Self> from self_ref for FileHandle creation
+    fn as_arc(&self) -> Result<Arc<Self>, FsError> {
+        self.self_ref.read().upgrade().ok_or(FsError::Invalid)
     }
 }
 
@@ -561,12 +519,10 @@ impl Inode for BlockDevInode {
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
-        Ok(Box::new(BlockDevFile {
-            device: Arc::clone(&self.device),
-            rw_lock: Arc::clone(&self.rw_lock),
-            offset: Mutex::new(0),
-            flags,
-        }))
+        // Return FileHandle wrapping this inode so fd_read/fd_write work correctly
+        // Block devices are seekable
+        let inode: Arc<dyn Inode> = self.as_arc()?;
+        Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
@@ -695,153 +651,4 @@ impl Inode for BlockDevInode {
     }
 }
 
-/// Block device file handle
-struct BlockDevFile {
-    device: Arc<dyn BlockDevice>,
-    /// Lock for serializing read-modify-write operations
-    rw_lock: Arc<Mutex<()>>,
-    offset: Mutex<u64>,
-    flags: OpenFlags,
-}
 
-impl FileOps for BlockDevFile {
-    fn clone_box(&self) -> Box<dyn FileOps> {
-        Box::new(BlockDevFile {
-            device: Arc::clone(&self.device),
-            rw_lock: Arc::clone(&self.rw_lock),
-            offset: Mutex::new(*self.offset.lock()),
-            flags: self.flags,
-        })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn type_name(&self) -> &'static str {
-        "BlockDev"
-    }
-}
-
-impl DevFileOps for BlockDevFile {
-    fn dev_read(&self, buf: &mut [u8]) -> Result<usize, FsError> {
-        let mut offset = self.offset.lock();
-        let sector_size = self.device.sector_size() as u64;
-        let capacity_bytes = self.device.capacity_sectors() * sector_size;
-
-        // Check bounds and empty buffer
-        if *offset >= capacity_bytes || buf.is_empty() {
-            return Ok(0); // EOF
-        }
-
-        let mut buf_pos = 0usize;
-        let mut sector_buf = alloc::vec![0u8; sector_size as usize];
-        let limit = (capacity_bytes - *offset) as usize;
-        let to_read = buf.len().min(limit);
-
-        while buf_pos < to_read && *offset < capacity_bytes {
-            let sector_idx = *offset / sector_size;
-            let sector_off = (*offset % sector_size) as usize;
-            let bytes_until_eof = (capacity_bytes - *offset) as usize;
-            let available = (sector_size as usize - sector_off)
-                .min(to_read - buf_pos)
-                .min(bytes_until_eof);
-
-            // If sector-aligned and have at least one whole sector, batch the read
-            if sector_off == 0
-                && available == sector_size as usize
-                && (to_read - buf_pos) >= sector_size as usize
-            {
-                let max_full = (to_read - buf_pos).min(bytes_until_eof);
-                let full_len = max_full - (max_full % sector_size as usize);
-                if full_len > 0 {
-                    let aligned_buf = &mut buf[buf_pos..buf_pos + full_len];
-                    self.device
-                        .read_sync(sector_idx, aligned_buf)
-                        .map_err(|_| FsError::Io)?;
-                    buf_pos += full_len;
-                    *offset += full_len as u64;
-                    continue;
-                }
-            }
-
-            // Handle partial sector read
-            self.device
-                .read_sync(sector_idx, &mut sector_buf)
-                .map_err(|_| FsError::Io)?;
-
-            buf[buf_pos..buf_pos + available]
-                .copy_from_slice(&sector_buf[sector_off..sector_off + available]);
-
-            buf_pos += available;
-            *offset += available as u64;
-        }
-
-        Ok(buf_pos)
-    }
-
-    fn dev_write(&self, data: &[u8]) -> Result<usize, FsError> {
-        let mut offset = self.offset.lock();
-        let sector_size = self.device.sector_size() as u64;
-        let capacity_bytes = self.device.capacity_sectors() * sector_size;
-
-        if *offset >= capacity_bytes {
-            return Err(FsError::NoSpace);
-        }
-
-        let max_write = (capacity_bytes - *offset) as usize;
-        let to_write = data.len().min(max_write);
-        if to_write == 0 {
-            return Ok(0);
-        }
-
-        // Serialize RMW operations to prevent data corruption
-        let _guard = self.rw_lock.lock();
-        let mut data_pos = 0usize;
-        let mut sector_buf = alloc::vec![0u8; sector_size as usize];
-
-        while data_pos < to_write && *offset < capacity_bytes {
-            let sector_idx = *offset / sector_size;
-            let sector_off = (*offset % sector_size) as usize;
-            let bytes_until_eof = (capacity_bytes - *offset) as usize;
-            let available = (sector_size as usize - sector_off)
-                .min(to_write - data_pos)
-                .min(bytes_until_eof);
-
-            // If sector-aligned and have at least one whole sector, batch the write
-            if sector_off == 0
-                && available == sector_size as usize
-                && (to_write - data_pos) >= sector_size as usize
-            {
-                let max_full = (to_write - data_pos).min(bytes_until_eof);
-                let full_len = max_full - (max_full % sector_size as usize);
-                if full_len > 0 {
-                    let aligned_data = &data[data_pos..data_pos + full_len];
-                    self.device
-                        .write_sync(sector_idx, aligned_data)
-                        .map_err(|_| FsError::Io)?;
-                    data_pos += full_len;
-                    *offset += full_len as u64;
-                    continue;
-                }
-            }
-
-            // Handle partial sector with read-modify-write
-            self.device
-                .read_sync(sector_idx, &mut sector_buf)
-                .map_err(|_| FsError::Io)?;
-
-            sector_buf[sector_off..sector_off + available]
-                .copy_from_slice(&data[data_pos..data_pos + available]);
-
-            self.device
-                .write_sync(sector_idx, &sector_buf)
-                .map_err(|_| FsError::Io)?;
-
-            data_pos += available;
-            *offset += available as u64;
-        }
-
-        Ok(data_pos)
-    }
-}

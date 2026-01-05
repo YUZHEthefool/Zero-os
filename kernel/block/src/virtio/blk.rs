@@ -18,10 +18,10 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU16, Ordering};
 use spin::Mutex;
 
-use super::transport::{MmioTransport, VirtioPciAddrs, VirtioPciTransport, VirtioTransport};
 use super::{
-    blk_features, blk_status, blk_types, mb, rmb, wmb, VirtioBlkConfig, VirtioBlkReqHeader,
-    VringAvail, VringDesc, VringUsed, VringUsedElem, VIRTIO_DEVICE_BLK, VIRTIO_F_VERSION_1,
+    blk_features, blk_status, blk_types, mb, rmb, wmb, MmioTransport, VirtioPciAddrs,
+    VirtioPciTransport, VirtioBlkConfig, VirtioBlkReqHeader, VirtioTransport, VringAvail,
+    VringDesc, VringUsed, VringUsedElem, VIRTIO_DEVICE_BLK, VIRTIO_F_VERSION_1,
     VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
     VIRTIO_STATUS_FEATURES_OK, VIRTIO_VERSION_LEGACY, VIRTIO_VERSION_MODERN, VRING_DESC_F_NEXT,
     VRING_DESC_F_WRITE,
@@ -479,8 +479,8 @@ impl VirtioBlkDevice {
             return Err(BlockError::NotSupported);
         }
 
-        // Read device config
-        let config = transport.read_blk_config();
+        // Read device config using the generic read_config_struct method
+        let config: VirtioBlkConfig = transport.read_config_struct();
         let capacity = config.capacity;
         let sector_size = if config.blk_size != 0 {
             config.blk_size

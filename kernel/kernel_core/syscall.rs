@@ -4911,9 +4911,25 @@ fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
 
     for entry in entries {
         let name_bytes = entry.name.as_bytes();
-        let reclen = ((header_size + name_bytes.len() + 1 + 7) / 8) * 8; // 8字节对齐
 
-        if written + reclen > count {
+        // R42-2 FIX: Use checked arithmetic to prevent integer overflow.
+        // An extremely long filename could cause the addition to wrap around,
+        // resulting in an undersized buffer and subsequent memory corruption.
+        let reclen = header_size
+            .checked_add(name_bytes.len())
+            .and_then(|v| v.checked_add(1))  // +1 for NUL terminator
+            .and_then(|v| v.checked_add(7))  // +7 for alignment
+            .map(|v| v & !7)                 // 8-byte alignment (round down)
+            .ok_or(SyscallError::EINVAL)?;
+
+        // R42-2 FIX: Validate reclen fits in u16 (d_reclen field type)
+        if reclen > u16::MAX as usize {
+            return Err(SyscallError::EINVAL);
+        }
+
+        // R42-2 FIX: Use checked arithmetic for buffer position
+        let next_written = written.checked_add(reclen).ok_or(SyscallError::EINVAL)?;
+        if next_written > count {
             break;
         }
 
@@ -4951,7 +4967,7 @@ fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
 
         // 复制到用户空间
         copy_to_user(unsafe { dirp.add(written) }, &buf)?;
-        written += reclen;
+        written = next_written;  // R42-2 FIX: Use pre-computed checked value
     }
 
     Ok(written)
@@ -4988,10 +5004,18 @@ fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> SyscallResult {
         .saturating_mul(1000)
         .saturating_add((ts.tv_nsec / 1_000_000) as u64);
 
-    // 忙等待实现
+    // R42-3 FIX: Yield CPU during sleep to prevent busy-wait DoS.
+    // Instead of spinning in kernel context monopolizing the CPU,
+    // we allow the scheduler to run other processes and use HLT
+    // to reduce power consumption while waiting for the timer.
     let start = crate::time::get_ticks();
     while crate::time::get_ticks().saturating_sub(start) < total_ms {
-        core::hint::spin_loop();
+        // Allow other processes to run
+        crate::reschedule_if_needed();
+        // Halt until next timer interrupt (reduces CPU usage)
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
     }
 
     // 如果提供了rem，设置为0

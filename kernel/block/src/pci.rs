@@ -7,7 +7,7 @@
 
 use core::arch::asm;
 
-use crate::virtio::transport::VirtioPciAddrs;
+use crate::virtio::VirtioPciAddrs;
 
 const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
 const PCI_CONFIG_DATA: u16 = 0xCFC;

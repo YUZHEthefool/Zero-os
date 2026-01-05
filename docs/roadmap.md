@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-03
+**Last Updated:** 2026-01-04
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -10,17 +10,18 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ## Executive Summary
 
-### Current Status: Phase C In Progress (Storage Foundation)
+### Current Status: Phase D.1 In Progress (Network Foundation)
 
-Zero-OS has completed security framework integration and is building storage infrastructure:
-- **41 security audits** with 178+ issues found, ~145 fixed (81%) - R41 issues fixed
+Zero-OS has completed storage foundation and is building network infrastructure:
+- **42 security audits** with 183+ issues found, ~150 fixed (82%) - R42 issues fixed
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
 - **Security hardening**: W^X, SMEP/SMAP/UMIP, SHA-256 hash-chained audit, CSPRNG
 - **Phase A**: ~90% complete (Usercopy ✅, Spectre ✅, SMP-stubs ✅, Audit gate ✅, KASLR partial)
 - **Phase B**: ✅ **COMPLETE** (Cap/LSM/Seccomp integrated into syscall paths)
-- **Phase C**: ~70% complete (virtio-blk ✅, page cache ✅, ext2 ✅, procfs ✅, OOM killer ✅, openat2 ✅)
+- **Phase C**: ✅ **COMPLETE** (virtio-blk, page cache, ext2, procfs, OOM killer, openat2, devfs read/write)
+- **Phase D.1**: Driver infrastructure complete (virtio crate, NetDevice trait, virtio-net driver MVP)
 
 ### Gap Analysis vs Linux Kernel
 
@@ -336,13 +337,13 @@ trait LsmPolicy: Send + Sync {  // ✅ Trait defined
 
 ---
 
-### Phase C: Storage Foundation [IN PROGRESS ~70%]
+### Phase C: Storage Foundation [COMPLETE ✅]
 
 **Goal**: Usable persistent storage with full permission chain.
 
 **Priority**: High
 **Dependencies**: Phase B (LSM/Capability hooks) ✅
-**Status**: Core infrastructure complete, permission chain integration remaining
+**Status**: ✅ **COMPLETE** (2026-01-04) - All storage infrastructure ready, devfs read/write fixed
 
 #### C.1 Block Layer ✅
 
@@ -359,14 +360,14 @@ trait LsmPolicy: Send + Sync {  // ✅ Trait defined
 - [x] Writeback policy (dirty page tracking)
 - [x] Cache invalidation (reclaim_pages)
 
-#### C.3 File Systems (Partial)
+#### C.3 File Systems ✅
 
 - [x] ext2 read/write (kernel/vfs/ext2.rs)
 - [x] tmpfs/ramfs (kernel/vfs/ramfs.rs)
 - [x] procfs (/proc/self, /proc/[pid], /proc/meminfo) (kernel/vfs/procfs.rs)
 - [x] Mount table and superblock cache
 - [x] initramfs (CPIO archive) support
-- [ ] devfs character device read/write (partial)
+- [x] devfs character device read/write (FileHandle pattern)
 
 #### C.4 Permission Chain Integration ✅
 
@@ -403,13 +404,13 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 
 ---
 
-### Phase D: Network Foundation [PLANNING COMPLETE]
+### Phase D: Network Foundation [IN PROGRESS]
 
 **Goal**: Minimal usable network stack with kernel protection.
 
 **Priority**: High
 **Dependencies**: Phase B (Cap/LSM), Phase A (usercopy)
-**Status**: Planning complete (2026-01-02). See [phase-d-network-plan.md](phase-d-network-plan.md) for detailed implementation plan.
+**Status**: D.1 Driver infrastructure complete. See [phase-d-network-plan.md](phase-d-network-plan.md) for detailed implementation plan.
 
 **MVP Scope** (Phase D.1):
 - virtio-net driver + IPv4 + ICMP (ping working)
@@ -417,11 +418,14 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - Security primitives (ISN randomization, rate limiting)
 - TCP deferred to Phase D.2
 
-#### D.1 Drivers
+#### D.1 Drivers [IN PROGRESS]
 
-- [ ] virtio-net (primary)
+- [x] Shared VirtIO transport crate (kernel/virtio/)
+- [x] NetBuf/BufPool packet buffer system (kernel/net/buffer.rs)
+- [x] NetDevice trait abstraction (kernel/net/device.rs)
+- [x] virtio-net driver MVP (kernel/net/virtio_net.rs)
 - [ ] e1000 (fallback)
-- [ ] Minimal RX/TX path
+- [ ] Network device registration and discovery
 - [ ] Interrupt coalescing
 
 #### D.2 Protocol Stack
@@ -646,20 +650,22 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2025-12-17-18 | 20-22 | 29 | 19 | Ring 3, SYSCALL/SYSRET |
 | 2025-12-20 | 23-24 | 12 | 12 | Thread/Clone, TLS, usercopy |
 | 2025-12-23 to 2026-01-02 | 25-40 | 36 | 32 | Cap/LSM/Seccomp integration, VirtIO |
-| 2026-01-03 | 41 | 4 | 4 | sys_fstat, sys_execve LSM, openat2 - **ALL FIXED** |
-| **Total** | **41** | **178** | **145 (81%)** | **33 open (R41 fixed)** |
+| 2026-01-03 | 41 | 4 | 4 | sys_fstat, sys_execve LSM, openat2 |
+| 2026-01-04 | 42 | 5 | 5 | procfs PID-reuse, getdents64, page cache - **ALL FIXED** |
+| **Total** | **42** | **183** | **150 (82%)** | **33 open (R42 fixed)** |
 
 ### Current Status
 
-- **Fixed**: 145 issues (81%)
-- **Open**: 33 issues (19%)
-  - ~~R41-1: sys_fstat fabricated metadata (HIGH)~~ ✅ Fixed
-  - ~~R41-4: sys_execve LSM bypass (HIGH)~~ ✅ Fixed
-  - ~~R41-2: openat2 RESOLVE_BENEATH ineffective (MEDIUM)~~ ✅ Fixed
-  - ~~R41-3: fd I/O under process lock (MEDIUM)~~ ✅ Fixed
+- **Fixed**: 150 issues (82%)
+- **Open**: 33 issues (18%)
+  - ~~R42-1: procfs FD symlink PID-reuse leak (HIGH)~~ ✅ Fixed
+  - ~~R42-2: getdents64 integer overflow (HIGH)~~ ✅ Fixed
+  - ~~R42-4: page cache refcount leak (HIGH)~~ ✅ Fixed
+  - ~~R42-3: nanosleep CPU DoS (MEDIUM)~~ ✅ Fixed
+  - ~~R42-5: LRU shrink early termination (MEDIUM)~~ ✅ Fixed
   - SMP-related issues deferred to Phase E
 
-See [qa-2026-01-03.md](review/qa-2026-01-03.md) for latest audit report.
+See [qa-2026-01-04.md](review/qa-2026-01-04.md) for latest audit report.
 
 ---
 

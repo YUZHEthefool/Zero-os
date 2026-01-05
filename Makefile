@@ -210,6 +210,12 @@ else
 QEMU_BLK = $(QEMU_BLK_PCI)
 endif
 
+# virtio-net 网络设备配置 (Phase D: Network Foundation)
+# 使用user-mode网络和virtio-net-pci设备
+# romfile= 禁用UEFI网络驱动，让内核处理设备初始化
+QEMU_NET = -netdev user,id=net0 \
+	-device virtio-net-pci,netdev=net0,romfile=
+
 # 创建64MB ext2虚拟磁盘镜像
 # 使用dd确保跨平台兼容性，debugfs可选创建测试文件
 disk-ext2.img:
@@ -232,13 +238,13 @@ disk-ext2.img:
 run: build
 	@echo "=== 启动内核（图形窗口模式）==="
 	@echo "提示：使用Ctrl+Alt+G释放鼠标，Ctrl+Alt+2切换到QEMU监视器"
-	$(QEMU) $(QEMU_COMMON)
+	$(QEMU) $(QEMU_COMMON) $(QEMU_NET)
 
 # 串口输出模式 - 通过串口查看内核输出
 run-serial: build
 	@echo "=== 启动内核（串口输出模式）==="
 	@echo "提示：按Ctrl+A然后按X退出QEMU"
-	$(QEMU) $(QEMU_COMMON) \
+	$(QEMU) $(QEMU_COMMON) $(QEMU_NET) \
 		-nographic
 
 # virtio-blk 图形模式 - 附加ext2磁盘镜像
@@ -246,14 +252,14 @@ run-blk: build disk-ext2.img
 	@echo "=== 启动内核（virtio-blk 图形模式）==="
 	@echo "磁盘: disk-ext2.img (64MB ext2)"
 	@echo "提示：使用Ctrl+Alt+G释放鼠标，Ctrl+Alt+2切换到QEMU监视器"
-	$(QEMU) $(QEMU_COMMON) $(QEMU_BLK)
+	$(QEMU) $(QEMU_COMMON) $(QEMU_BLK) $(QEMU_NET)
 
 # virtio-blk 串口模式 - 便于查看挂载日志
 run-blk-serial: build disk-ext2.img
 	@echo "=== 启动内核（virtio-blk 串口模式）==="
 	@echo "磁盘: disk-ext2.img (64MB ext2)"
 	@echo "提示：按Ctrl+A然后按X退出QEMU"
-	$(QEMU) $(QEMU_COMMON) $(QEMU_BLK) \
+	$(QEMU) $(QEMU_COMMON) $(QEMU_BLK) $(QEMU_NET) \
 		-nographic
 
 # Shell模式 - 运行交互式Shell（串口输出）

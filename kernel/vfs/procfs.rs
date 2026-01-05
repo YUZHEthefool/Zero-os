@@ -765,6 +765,12 @@ impl Inode for ProcPidFdSymlink {
     }
 
     fn stat(&self) -> Result<Stat, FsError> {
+        // R42-1 FIX: Re-check access permission on each stat call to prevent
+        // PID-reuse information leaks. If the original process exits and a new
+        // process reuses the PID, we must not expose the new process's FD info.
+        if !can_access_pid(self.pid) {
+            return Err(FsError::PermDenied);
+        }
         let (uid, gid) = get_process_owner(self.pid);
         let target = get_fd_target(self.pid, self.fd);
         Ok(Stat {
@@ -789,6 +795,11 @@ impl Inode for ProcPidFdSymlink {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        // R42-1 FIX: Defense-in-depth access check for each read operation.
+        // Handles race conditions where PID is reused between open and read.
+        if !can_access_pid(self.pid) {
+            return Err(FsError::PermDenied);
+        }
         let target = get_fd_target(self.pid, self.fd);
         read_from_content(&target, offset, buf)
     }
