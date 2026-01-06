@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-04
+**Last Updated:** 2026-01-05
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -10,10 +10,10 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ## Executive Summary
 
-### Current Status: Phase D.1 In Progress (Network Foundation)
+### Current Status: Phase D.2 In Progress (IPv4/ICMP Stack)
 
 Zero-OS has completed storage foundation and is building network infrastructure:
-- **42 security audits** with 183+ issues found, ~150 fixed (82%) - R42 issues fixed
+- **43 security audits** with 188+ issues found, ~155 fixed (82%) - R43 VirtIO security fixes
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -21,7 +21,8 @@ Zero-OS has completed storage foundation and is building network infrastructure:
 - **Phase A**: ~90% complete (Usercopy ✅, Spectre ✅, SMP-stubs ✅, Audit gate ✅, KASLR partial)
 - **Phase B**: ✅ **COMPLETE** (Cap/LSM/Seccomp integrated into syscall paths)
 - **Phase C**: ✅ **COMPLETE** (virtio-blk, page cache, ext2, procfs, OOM killer, openat2, devfs read/write)
-- **Phase D.1**: Driver infrastructure complete (virtio crate, NetDevice trait, virtio-net driver MVP)
+- **Phase D.1**: ✅ **COMPLETE** (virtio crate, NetDevice trait, virtio-net driver MVP)
+- **Phase D.2**: IPv4/ICMP protocol stack with security-first design (Ethernet, IPv4, ICMP echo)
 
 ### Gap Analysis vs Linux Kernel
 
@@ -418,31 +419,38 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - Security primitives (ISN randomization, rate limiting)
 - TCP deferred to Phase D.2
 
-#### D.1 Drivers [IN PROGRESS]
+#### D.1 Drivers ✅ COMPLETE
 
 - [x] Shared VirtIO transport crate (kernel/virtio/)
 - [x] NetBuf/BufPool packet buffer system (kernel/net/buffer.rs)
 - [x] NetDevice trait abstraction (kernel/net/device.rs)
 - [x] virtio-net driver MVP (kernel/net/virtio_net.rs)
+- [x] VirtIO security hardening (R43: used.id validation, chain traversal limits, double-free detection)
 - [ ] e1000 (fallback)
 - [ ] Network device registration and discovery
 - [ ] Interrupt coalescing
 
-#### D.2 Protocol Stack
+#### D.2 Protocol Stack [IN PROGRESS]
 
-- [ ] IPv4 header validation
-- [ ] ICMP (ping)
+- [x] Ethernet frame parsing (kernel/net/ethernet.rs)
+- [x] IPv4 header validation with security checks (kernel/net/ipv4.rs)
+- [x] ICMP echo (ping) with rate limiting (kernel/net/icmp.rs)
+- [x] Protocol stack integration (kernel/net/stack.rs)
+- [x] Checksum verification (RFC 791 one's complement)
+- [x] Source routing rejection (LSRR/SSRR per RFC 1122)
+- [x] Broadcast echo suppression (Smurf attack prevention)
 - [ ] UDP
 - [ ] TCP (3-way handshake, timeout, retransmit, sliding window)
-- [ ] Checksum verification
 - [ ] Fragment reassembly with limits
-- [ ] Source routing disabled
+- [ ] ARP protocol
 
 #### D.3 Protection Mechanisms
 
+- [x] Rate limiting (token bucket, 10pps burst 20)
+- [x] Broadcast/multicast response suppression
+- [x] MAC filtering (process only frames addressed to us)
 - [ ] Conntrack state machine
 - [ ] SYN cookies
-- [ ] Rate limiting (token bucket)
 - [ ] Basic firewall (match + action table)
 - [ ] ISN randomization (RFC 6528)
 - [ ] Ephemeral port randomization
@@ -652,20 +660,18 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2025-12-23 to 2026-01-02 | 25-40 | 36 | 32 | Cap/LSM/Seccomp integration, VirtIO |
 | 2026-01-03 | 41 | 4 | 4 | sys_fstat, sys_execve LSM, openat2 |
 | 2026-01-04 | 42 | 5 | 5 | procfs PID-reuse, getdents64, page cache - **ALL FIXED** |
-| **Total** | **42** | **183** | **150 (82%)** | **33 open (R42 fixed)** |
+| 2026-01-05 | 43 | 5 | 5 | VirtIO used.id OOB, descriptor chain loop, double-free - **ALL FIXED** |
+| **Total** | **43** | **188** | **155 (82%)** | **33 open (R43 fixed)** |
 
 ### Current Status
 
-- **Fixed**: 150 issues (82%)
+- **Fixed**: 155 issues (82%)
 - **Open**: 33 issues (18%)
-  - ~~R42-1: procfs FD symlink PID-reuse leak (HIGH)~~ ✅ Fixed
-  - ~~R42-2: getdents64 integer overflow (HIGH)~~ ✅ Fixed
-  - ~~R42-4: page cache refcount leak (HIGH)~~ ✅ Fixed
-  - ~~R42-3: nanosleep CPU DoS (MEDIUM)~~ ✅ Fixed
-  - ~~R42-5: LRU shrink early termination (MEDIUM)~~ ✅ Fixed
+  - R42 issues: All fixed (procfs, getdents64, page cache, nanosleep, LRU)
+  - R43 issues: All fixed (VirtIO used.id, descriptor chain, double-free, buffer bounds, reset zeroing)
   - SMP-related issues deferred to Phase E
 
-See [qa-2026-01-04.md](review/qa-2026-01-04.md) for latest audit report.
+See [qa-2026-01-05.md](review/qa-2026-01-05.md) for latest audit report.
 
 ---
 

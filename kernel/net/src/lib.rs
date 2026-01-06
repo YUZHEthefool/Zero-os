@@ -41,13 +41,30 @@ use x86_64::{PhysAddr, VirtAddr};
 
 pub mod buffer;
 pub mod device;
+pub mod ethernet;
+pub mod icmp;
+pub mod ipv4;
 mod pci;
+pub mod stack;
 pub mod virtio_net;
 
 pub use buffer::{BufPool, NetBuf};
 pub use device::{
     DeviceCaps, LinkStatus, MacAddress, NetDevice, NetError, OperatingMode, RxError, TxError,
 };
+pub use icmp::{
+    build_echo_reply, parse_icmp, IcmpError, IcmpHeader, TokenBucket, ICMP_RATE_LIMITER,
+    ICMP_TYPE_DEST_UNREACHABLE, ICMP_TYPE_ECHO_REPLY, ICMP_TYPE_ECHO_REQUEST,
+    ICMP_TYPE_TIME_EXCEEDED,
+};
+pub use ipv4::{
+    build_ipv4_header, compute_checksum, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
+};
+pub use ethernet::{
+    parse_ethernet, build_ethernet_frame, EthAddr, EthHeader, EthError,
+    ETHERTYPE_IPV4, ETHERTYPE_ARP,
+};
+pub use stack::{process_frame, NetStats, ProcessResult, DropReason};
 pub use virtio_net::VirtioNetDevice;
 
 // ============================================================================

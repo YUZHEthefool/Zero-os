@@ -290,28 +290,66 @@ impl VirtioNetDevice {
     }
 
     /// Free a descriptor chain starting from head.
+    ///
+    /// # R43-2 FIX: Added bounds checking and loop protection
+    /// - Validates head index is within queue bounds
+    /// - Limits chain traversal to queue size (prevents infinite loop from malicious device)
+    /// - Detects self-referential descriptors
     fn free_chain(queue: &VirtQueue, head: u16) {
+        let qsize = queue.size();
+
+        // R43-2 FIX: Validate head index
+        if head >= qsize {
+            return;
+        }
+
         let mut idx = head;
+        let mut depth: u16 = 0;
+
         loop {
+            // R43-2 FIX: Limit chain depth to prevent infinite loops
+            if depth >= qsize {
+                break;
+            }
+
             let desc = unsafe { queue.desc(idx) };
             let has_next = (desc.flags & VRING_DESC_F_NEXT) != 0;
             let next = desc.next;
             queue.free_desc(idx);
-            if !has_next {
+
+            // R43-2 FIX: Stop on end, invalid next, or self-reference
+            if !has_next || next >= qsize || next == idx {
                 break;
             }
+
+            depth = depth.saturating_add(1);
             idx = next;
         }
     }
 
     /// Process one used RX entry.
+    ///
+    /// # R43-1 FIX: Validates used.id from device before use as array index
     fn pop_rx_used(&mut self) -> Result<Option<NetBuf>, RxError> {
         let used = match self.rx_queue.pop_used() {
             Some(u) => u,
             None => return Ok(None),
         };
 
-        let head = used.id as u16;
+        // R43-1 FIX: Validate used.id from device to prevent OOB access
+        // A malicious/buggy device could return an arbitrary id value
+        let qsize = self.rx_queue.size() as u32;
+        let head_raw = used.id;
+        if head_raw >= qsize {
+            self.stats.rx_errors += 1;
+            // Log the invalid descriptor for debugging
+            drivers::println!(
+                "[net] WARNING: device returned invalid used.id {} >= {}",
+                head_raw, qsize
+            );
+            return Err(RxError::BufferError);
+        }
+        let head = head_raw as u16;
 
         // Free the descriptor chain
         Self::free_chain(&self.rx_queue, head);
@@ -443,9 +481,20 @@ impl NetDevice for VirtioNetDevice {
 
     fn reclaim_tx(&mut self) -> usize {
         let mut reclaimed = 0;
+        let qsize = self.tx_queue.size() as u32;
 
         while let Some(used) = self.tx_queue.pop_used() {
-            let head = used.id as u16;
+            // R43-1 FIX: Validate used.id from device to prevent OOB access
+            let head_raw = used.id;
+            if head_raw >= qsize {
+                self.stats.tx_errors += 1;
+                drivers::println!(
+                    "[net] WARNING: TX device returned invalid used.id {} >= {}",
+                    head_raw, qsize
+                );
+                continue;
+            }
+            let head = head_raw as u16;
 
             // Free descriptor chain
             Self::free_chain(&self.tx_queue, head);

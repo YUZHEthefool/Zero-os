@@ -270,8 +270,21 @@ impl NetBuf {
     /// Reset the buffer for reuse.
     ///
     /// This restores the initial headroom/tailroom configuration and
-    /// clears the data length. The memory contents are not zeroed.
+    /// clears the data length.
+    ///
+    /// # R43-5 FIX (v2): Zero the entire usable region to prevent information leakage
+    /// When buffers are returned to the pool and reused for RX, stale data in
+    /// headroom and payload area could be exposed to DMA devices. Zeroing only
+    /// data_len is insufficient because data_len is often 0 when returned.
     pub fn reset(&mut self) {
+        // R43-5 FIX (v2): Zero the entire usable buffer region
+        // This includes headroom (virtio header) and payload area
+        // to prevent any stale data from being visible to devices
+        let usable_region = self.total_len - self.reserved_tailroom;
+        unsafe {
+            core::ptr::write_bytes(self.virt_base, 0, usable_region);
+        }
+
         self.data_offset = self.headroom;
         self.data_len = 0;
     }
@@ -294,17 +307,35 @@ impl NetBuf {
         true
     }
 
+    /// Get an immutable slice of the buffer.
+    ///
+    /// # R43-4 FIX: Use assert! instead of debug_assert! for bounds checking
+    /// The original debug_assert! would not run in release builds, allowing
+    /// potential OOB access if the caller passes invalid offset/len.
     #[inline]
     fn buffer_slice(&self, offset: usize, len: usize) -> &[u8] {
-        debug_assert!(offset + len <= self.total_len);
-        // SAFETY: Bounds checked by debug_assert and caller
+        // R43-4 FIX: Use checked arithmetic and assert! for release safety
+        assert!(
+            offset.checked_add(len).map_or(false, |end| end <= self.total_len),
+            "NetBuf::buffer_slice OOB: offset={}, len={}, total={}",
+            offset, len, self.total_len
+        );
+        // SAFETY: Bounds checked by assert above
         unsafe { slice::from_raw_parts(self.virt_base.add(offset), len) }
     }
 
+    /// Get a mutable slice of the buffer.
+    ///
+    /// # R43-4 FIX: Use assert! instead of debug_assert! for bounds checking
     #[inline]
     fn buffer_slice_mut(&mut self, offset: usize, len: usize) -> &mut [u8] {
-        debug_assert!(offset + len <= self.total_len);
-        // SAFETY: Bounds checked by debug_assert and caller
+        // R43-4 FIX: Use checked arithmetic and assert! for release safety
+        assert!(
+            offset.checked_add(len).map_or(false, |end| end <= self.total_len),
+            "NetBuf::buffer_slice_mut OOB: offset={}, len={}, total={}",
+            offset, len, self.total_len
+        );
+        // SAFETY: Bounds checked by assert above
         unsafe { slice::from_raw_parts_mut(self.virt_base.add(offset), len) }
     }
 }
