@@ -99,8 +99,12 @@ pub struct VirtioNetDevice {
     operating_mode: OperatingMode,
     /// Inflight TX buffers (indexed by descriptor head)
     tx_inflight: Vec<Option<NetBuf>>,
+    /// R44-1 FIX: Driver-tracked TX chain links (device can't tamper)
+    tx_chain_next: Vec<Option<u16>>,
     /// Inflight RX buffers (indexed by descriptor head)
     rx_inflight: Vec<Option<NetBuf>>,
+    /// R44-1 FIX: Driver-tracked RX chain links (device can't tamper)
+    rx_chain_next: Vec<Option<u16>>,
     /// Received packets ready for delivery
     rx_ready: Vec<NetBuf>,
     /// Statistics
@@ -220,9 +224,15 @@ impl VirtioNetDevice {
         // Initialize inflight buffer tracking
         let mut tx_inflight = Vec::with_capacity(tx_size);
         tx_inflight.resize_with(tx_size, || None);
+        // R44-1 FIX: Initialize driver-owned chain metadata
+        let mut tx_chain_next = Vec::with_capacity(tx_size);
+        tx_chain_next.resize_with(tx_size, || None);
 
         let mut rx_inflight = Vec::with_capacity(rx_size);
         rx_inflight.resize_with(rx_size, || None);
+        // R44-1 FIX: Initialize driver-owned chain metadata
+        let mut rx_chain_next = Vec::with_capacity(rx_size);
+        rx_chain_next.resize_with(rx_size, || None);
 
         drivers::println!(
             "[net] {} ({}) MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -245,7 +255,9 @@ impl VirtioNetDevice {
             link: LinkStatus::UP_UNKNOWN,
             operating_mode: OperatingMode::Polling,
             tx_inflight,
+            tx_chain_next,
             rx_inflight,
+            rx_chain_next,
             rx_ready: Vec::new(),
             stats: NetStats::default(),
         })
@@ -289,48 +301,43 @@ impl VirtioNetDevice {
         Ok(queue)
     }
 
-    /// Free a descriptor chain starting from head.
+    /// Free a TX descriptor chain using driver-owned metadata.
     ///
-    /// # R43-2 FIX: Added bounds checking and loop protection
-    /// - Validates head index is within queue bounds
-    /// - Limits chain traversal to queue size (prevents infinite loop from malicious device)
-    /// - Detects self-referential descriptors
-    fn free_chain(queue: &VirtQueue, head: u16) {
-        let qsize = queue.size();
-
-        // R43-2 FIX: Validate head index
-        if head >= qsize {
+    /// # R44-1 FIX: Uses tx_chain_next instead of device-controlled desc.next
+    /// This prevents a malicious device from manipulating the descriptor chain
+    /// to free descriptors belonging to other in-flight operations.
+    fn free_tx_chain(&mut self, head: u16) {
+        if head >= self.tx_queue.size() {
             return;
         }
 
-        let mut idx = head;
-        let mut depth: u16 = 0;
-
-        loop {
-            // R43-2 FIX: Limit chain depth to prevent infinite loops
-            if depth >= qsize {
-                break;
-            }
-
-            let desc = unsafe { queue.desc(idx) };
-            let has_next = (desc.flags & VRING_DESC_F_NEXT) != 0;
-            let next = desc.next;
-            queue.free_desc(idx);
-
-            // R43-2 FIX: Stop on end, invalid next, or self-reference
-            if !has_next || next >= qsize || next == idx {
-                break;
-            }
-
-            depth = depth.saturating_add(1);
-            idx = next;
+        // Use driver-tracked chain link, not device-controlled descriptor
+        if let Some(next) = self.tx_chain_next.get_mut(head as usize).and_then(Option::take) {
+            self.tx_queue.free_desc(next);
         }
+        self.tx_queue.free_desc(head);
+    }
+
+    /// Free an RX descriptor chain using driver-owned metadata.
+    ///
+    /// # R44-1 FIX: Uses rx_chain_next instead of device-controlled desc.next
+    fn free_rx_chain(&mut self, head: u16) {
+        if head >= self.rx_queue.size() {
+            return;
+        }
+
+        // Use driver-tracked chain link, not device-controlled descriptor
+        if let Some(next) = self.rx_chain_next.get_mut(head as usize).and_then(Option::take) {
+            self.rx_queue.free_desc(next);
+        }
+        self.rx_queue.free_desc(head);
     }
 
     /// Process one used RX entry.
     ///
     /// # R43-1 FIX: Validates used.id from device before use as array index
-    fn pop_rx_used(&mut self) -> Result<Option<NetBuf>, RxError> {
+    /// # R44-2 FIX: Validates length and re-arms buffer on error instead of leaking
+    fn pop_rx_used(&mut self, pool: Option<&BufPool>) -> Result<Option<NetBuf>, RxError> {
         let used = match self.rx_queue.pop_used() {
             Some(u) => u,
             None => return Ok(None),
@@ -351,8 +358,11 @@ impl VirtioNetDevice {
         }
         let head = head_raw as u16;
 
-        // Free the descriptor chain
-        Self::free_chain(&self.rx_queue, head);
+        // R44-1 FIX: Get driver-owned chain metadata before freeing
+        let data_idx = self
+            .rx_chain_next
+            .get_mut(head as usize)
+            .and_then(Option::take);
 
         // Retrieve the buffer
         let buf = self
@@ -363,13 +373,48 @@ impl VirtioNetDevice {
 
         // Calculate payload length (total - header)
         let total_len = used.len as usize;
-        let payload_len = total_len.saturating_sub(VIRTIO_NET_HDR_SIZE);
+
+        // R44-2 FIX: Validate length before consuming the buffer
+        // If length is invalid, return buffer to pool instead of leaking it
+        if total_len < VIRTIO_NET_HDR_SIZE {
+            self.stats.rx_errors += 1;
+            // Return buffer to pool if provided, otherwise it's lost
+            if let Some(pool) = pool {
+                let mut buf = buf;
+                buf.reset();
+                pool.free(buf);
+            }
+            // Free descriptors using driver-owned metadata
+            if let Some(next) = data_idx {
+                self.rx_queue.free_desc(next);
+            }
+            self.rx_queue.free_desc(head);
+            return Err(RxError::InvalidPacket);
+        }
+
+        let payload_len = total_len - VIRTIO_NET_HDR_SIZE;
 
         let mut buf = buf;
         if !buf.set_len(payload_len) {
             self.stats.rx_errors += 1;
+            // R44-2 FIX: Return buffer to pool on error
+            if let Some(pool) = pool {
+                buf.reset();
+                pool.free(buf);
+            }
+            // Free descriptors using driver-owned metadata
+            if let Some(next) = data_idx {
+                self.rx_queue.free_desc(next);
+            }
+            self.rx_queue.free_desc(head);
             return Err(RxError::InvalidPacket);
         }
+
+        // Free descriptors using driver-owned metadata (R44-1 FIX)
+        if let Some(next) = data_idx {
+            self.rx_queue.free_desc(next);
+        }
+        self.rx_queue.free_desc(head);
 
         self.stats.rx_packets += 1;
         self.stats.rx_bytes += payload_len as u64;
@@ -467,6 +512,8 @@ impl NetDevice for VirtioNetDevice {
             desc1.next = 0;
 
             // Track inflight buffer BEFORE notifying device (avoid race with completion)
+            // R44-1 FIX: Track driver-owned chain link
+            self.tx_chain_next[header_idx as usize] = Some(data_idx);
             self.tx_inflight[header_idx as usize] = Some(buf);
 
             // Add to available ring
@@ -496,8 +543,8 @@ impl NetDevice for VirtioNetDevice {
             }
             let head = head_raw as u16;
 
-            // Free descriptor chain
-            Self::free_chain(&self.tx_queue, head);
+            // R44-1 FIX: Free descriptor chain using driver-owned metadata
+            self.free_tx_chain(head);
 
             // Release buffer
             if let Some(buf) = self.tx_inflight.get_mut(head as usize).and_then(Option::take) {
@@ -522,8 +569,8 @@ impl NetDevice for VirtioNetDevice {
             return Ok(Some(buf));
         }
 
-        // Poll for new packets
-        self.pop_rx_used()
+        // Poll for new packets (no pool for returning buffers in simple receive path)
+        self.pop_rx_used(None)
     }
 
     fn replenish_rx(&mut self, pool: &BufPool, count: usize) -> usize {
@@ -584,6 +631,8 @@ impl NetDevice for VirtioNetDevice {
             }
 
             // Track inflight buffer
+            // R44-1 FIX: Track driver-owned chain link
+            self.rx_chain_next[header_idx as usize] = Some(data_idx);
             self.rx_inflight[header_idx as usize] = Some(buf);
             posted += 1;
         }
@@ -607,8 +656,9 @@ impl NetDevice for VirtioNetDevice {
         let mut rx_done = 0;
 
         // Process all available RX completions
+        // Note: In poll context, we don't have the pool to return buffers on error
         loop {
-            match self.pop_rx_used() {
+            match self.pop_rx_used(None) {
                 Ok(Some(buf)) => {
                     self.rx_ready.push(buf);
                     rx_done += 1;

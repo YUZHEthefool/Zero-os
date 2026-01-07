@@ -3,6 +3,7 @@
 //! This module provides a generic virtqueue implementation that can be shared
 //! across different VirtIO device drivers (block, network, etc.).
 
+use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU16, Ordering};
@@ -29,6 +30,9 @@ pub struct VirtQueue {
     used: *mut VringUsed,
     /// Free descriptor stack.
     free_list: Mutex<Vec<u16>>,
+    /// R44-8 FIX: Allocation bitmap to track which descriptors are in use.
+    /// Prevents freeing descriptors that were never allocated (forged next pointers).
+    alloc_bitmap: Mutex<Vec<bool>>,
     /// Last seen used index.
     last_used_idx: AtomicU16,
     /// Physical address of descriptor table.
@@ -102,10 +106,19 @@ impl VirtQueue {
             free_list.push(i);
         }
 
-        // Zero out the rings
+        // R44-8 FIX: Initialize allocation bitmap (all descriptors start as free)
+        let alloc_bitmap = vec![false; queue_size as usize];
+
+        // R44-4 FIX: Zero out ALL ring memory, not just the header structs
+        // This prevents info leaks from stale memory and ensures consistent state.
+        // Descriptor table: queue_size * sizeof(VringDesc)
         core::ptr::write_bytes(desc, 0, queue_size as usize);
-        core::ptr::write_bytes(avail, 0, 1);
-        core::ptr::write_bytes(used, 0, 1);
+        // Available ring: flags(2) + idx(2) + ring(2 * queue_size) + used_event(2)
+        let avail_bytes = 4 + 2 * queue_size as usize + 2;
+        core::ptr::write_bytes(avail as *mut u8, 0, avail_bytes);
+        // Used ring: flags(2) + idx(2) + ring(8 * queue_size) + avail_event(2)
+        let used_bytes = 4 + 8 * queue_size as usize + 2;
+        core::ptr::write_bytes(used as *mut u8, 0, used_bytes);
 
         Self {
             size: queue_size,
@@ -114,6 +127,7 @@ impl VirtQueue {
             avail,
             used,
             free_list: Mutex::new(free_list),
+            alloc_bitmap: Mutex::new(alloc_bitmap),
             last_used_idx: AtomicU16::new(0),
             desc_phys,
             avail_phys,
@@ -155,38 +169,47 @@ impl VirtQueue {
     ///
     /// Returns `None` if no descriptors are available.
     pub fn alloc_desc(&self) -> Option<u16> {
-        self.free_list.lock().pop()
+        // R44-8 LOCK ORDER FIX: Lock alloc_bitmap first, then free_list
+        // This matches the order in free_desc to prevent deadlock
+        let mut alloc = self.alloc_bitmap.lock();
+        let mut free = self.free_list.lock();
+
+        let idx = free.pop()?;
+        // R44-8 FIX: Mark descriptor as allocated
+        alloc[idx as usize] = true;
+        Some(idx)
     }
 
     /// Free a descriptor back to the free list.
     ///
-    /// # R43-3 FIX: Added bounds check and double-free detection
+    /// # R43-3 + R44-8 FIX: Added bounds check, allocation tracking, and double-free detection
     /// - Validates index is within queue bounds
+    /// - Checks descriptor was actually allocated before freeing
     /// - Ignores duplicate free attempts to prevent descriptor aliasing
-    /// - Logs double-free attempts for debugging
     pub fn free_desc(&self, idx: u16) {
         // R43-3 FIX: Bounds check
         if idx >= self.size {
             return;
         }
 
+        // R44-8 LOCK ORDER FIX: Lock alloc_bitmap first, then free_list
+        let mut alloc = self.alloc_bitmap.lock();
         let mut free = self.free_list.lock();
 
-        // R43-3 FIX: Detect double-free
-        // Linear search is acceptable for security-critical path
-        // Consider using a bitmap for high-throughput scenarios
-        if free.iter().any(|&v| v == idx) {
-            // Already freed - this indicates a bug or malicious device
-            // Log the issue but don't corrupt free_list
-            // Note: Using inline debug print to avoid dependency on drivers crate
-            #[cfg(debug_assertions)]
-            {
-                // In debug mode, log the double-free attempt
-                // Production builds silently ignore to avoid log flooding
-            }
+        // R44-8 FIX: Check if descriptor was allocated
+        // This prevents freeing forged descriptors from malicious device
+        if !alloc.get(idx as usize).copied().unwrap_or(false) {
+            // Was not allocated - reject (forged free or double-free)
             return;
         }
 
+        // R43-3 FIX: Detect double-free (redundant with above, but extra safety)
+        if free.iter().any(|&v| v == idx) {
+            return;
+        }
+
+        // Mark as deallocated and add to free list
+        alloc[idx as usize] = false;
         free.push(idx);
     }
 
@@ -228,13 +251,29 @@ impl VirtQueue {
     /// Pop a used entry from the used ring.
     ///
     /// Returns `None` if no used entries are available.
+    ///
+    /// # R44-5 FIX: Validates used.idx jump to prevent reading stale ring slots
+    /// If device jumps used.idx beyond queue size, we resync to prevent permanent stall.
     pub fn pop_used(&self) -> Option<VringUsedElem> {
         unsafe {
             let used = &*self.used;
             let used_idx = read_volatile(&used.idx);
             let last = self.last_used_idx.load(Ordering::Relaxed);
 
-            if used_idx == last {
+            // Calculate how many entries are available
+            let available = used_idx.wrapping_sub(last);
+            if available == 0 {
+                return None;
+            }
+
+            // R44-5 FIX: Reject implausible jumps in used.idx
+            // A malicious device could jump used.idx far ahead to make us read
+            // stale ring slots and free unrelated descriptor chains.
+            // Rather than stalling forever, we resync to current device idx.
+            if available > self.size {
+                // Log the issue (would require drivers crate, skip for now)
+                // Resync: trust the device idx but don't process any entries
+                self.last_used_idx.store(used_idx, Ordering::Relaxed);
                 return None;
             }
 

@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-05
+**Last Updated:** 2026-01-06
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -13,7 +13,7 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 ### Current Status: Phase D.2 In Progress (IPv4/ICMP Stack)
 
 Zero-OS has completed storage foundation and is building network infrastructure:
-- **43 security audits** with 188+ issues found, ~155 fixed (82%) - R43 VirtIO security fixes
+- **44 security audits** with 196+ issues found, ~163 fixed (83%) - R44 VirtIO driver hardening
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -439,16 +439,18 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] Checksum verification (RFC 791 one's complement)
 - [x] Source routing rejection (LSRR/SSRR per RFC 1122)
 - [x] Broadcast echo suppression (Smurf attack prevention)
-- [ ] UDP
+- [x] ARP protocol (kernel/net/arp.rs) - RFC 826 with anti-spoofing
+- [x] UDP protocol (kernel/net/udp.rs) - RFC 768 with strict checksums
+- [x] Socket API (kernel/net/socket.rs) - Capability-based UDP sockets with LSM hooks
 - [ ] TCP (3-way handshake, timeout, retransmit, sliding window)
 - [ ] Fragment reassembly with limits
-- [ ] ARP protocol
 
 #### D.3 Protection Mechanisms
 
 - [x] Rate limiting (token bucket, 10pps burst 20)
 - [x] Broadcast/multicast response suppression
 - [x] MAC filtering (process only frames addressed to us)
+- [x] ARP rate limiting (RX 50pps, TX 20pps) and cache anti-spoofing
 - [ ] Conntrack state machine
 - [ ] SYN cookies
 - [ ] Basic firewall (match + action table)
@@ -661,17 +663,18 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-03 | 41 | 4 | 4 | sys_fstat, sys_execve LSM, openat2 |
 | 2026-01-04 | 42 | 5 | 5 | procfs PID-reuse, getdents64, page cache - **ALL FIXED** |
 | 2026-01-05 | 43 | 5 | 5 | VirtIO used.id OOB, descriptor chain loop, double-free - **ALL FIXED** |
-| **Total** | **43** | **188** | **155 (82%)** | **33 open (R43 fixed)** |
+| 2026-01-06 | 44 | 8 | 7 | VirtIO driver-owned chains, ring zeroing, alloc bitmap - **ALL FIXED** |
+| **Total** | **44** | **196** | **163 (83%)** | **33 open (R44 fixed)** |
 
 ### Current Status
 
-- **Fixed**: 155 issues (82%)
-- **Open**: 33 issues (18%)
-  - R42 issues: All fixed (procfs, getdents64, page cache, nanosleep, LRU)
-  - R43 issues: All fixed (VirtIO used.id, descriptor chain, double-free, buffer bounds, reset zeroing)
+- **Fixed**: 163 issues (83%)
+- **Open**: 33 issues (17%)
+  - R43 issues: All fixed (enhanced with driver-owned chain metadata)
+  - R44 issues: All fixed (VirtIO hardening, IPv4 source validation, TokenBucket)
   - SMP-related issues deferred to Phase E
 
-See [qa-2026-01-05.md](review/qa-2026-01-05.md) for latest audit report.
+See [qa-2026-01-06.md](review/qa-2026-01-06.md) for latest audit report.
 
 ---
 

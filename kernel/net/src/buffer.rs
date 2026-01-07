@@ -272,17 +272,16 @@ impl NetBuf {
     /// This restores the initial headroom/tailroom configuration and
     /// clears the data length.
     ///
-    /// # R43-5 FIX (v2): Zero the entire usable region to prevent information leakage
-    /// When buffers are returned to the pool and reused for RX, stale data in
-    /// headroom and payload area could be exposed to DMA devices. Zeroing only
-    /// data_len is insufficient because data_len is often 0 when returned.
+    /// # R43-5 FIX (v3): Zero the ENTIRE buffer to prevent information leakage
+    /// When buffers are returned to the pool and reused for RX, stale data
+    /// could be exposed to DMA devices. We must zero the complete buffer
+    /// including tailroom in case future offload features expose it.
     pub fn reset(&mut self) {
-        // R43-5 FIX (v2): Zero the entire usable buffer region
-        // This includes headroom (virtio header) and payload area
-        // to prevent any stale data from being visible to devices
-        let usable_region = self.total_len - self.reserved_tailroom;
+        // R43-5 FIX (v3): Zero the entire buffer including tailroom
+        // This ensures no stale data is visible even if tailroom becomes
+        // device-accessible in future (e.g., offloads, trailers)
         unsafe {
-            core::ptr::write_bytes(self.virt_base, 0, usable_region);
+            core::ptr::write_bytes(self.virt_base, 0, self.total_len);
         }
 
         self.data_offset = self.headroom;

@@ -99,10 +99,42 @@ impl Ipv4Addr {
     }
 
     /// Check if this address is valid as a source address
-    /// Invalid sources: broadcast, multicast, unspecified
+    ///
+    /// # R44-3 FIX: Strengthened source validation
+    /// Invalid sources now include:
+    /// - Broadcast (255.255.255.255 and directed broadcast patterns)
+    /// - Multicast (224.0.0.0/4)
+    /// - Unspecified (0.0.0.0)
+    /// - Loopback (127.0.0.0/8) - can be spoofed from external networks
+    /// - Reserved 0/8 network (except 0.0.0.0 which is handled above)
+    /// - Addresses ending in .255 (potential directed broadcast)
     #[inline]
     pub fn is_valid_source(&self) -> bool {
-        !self.is_broadcast() && !self.is_multicast() && !self.is_unspecified()
+        // Basic checks
+        if self.is_broadcast() || self.is_multicast() || self.is_unspecified() {
+            return false;
+        }
+
+        // R44-3 FIX: Reject loopback from external sources
+        // Loopback addresses should never appear on the wire
+        if self.is_loopback() {
+            return false;
+        }
+
+        // R44-3 FIX: Reject 0/8 network (reserved)
+        if self.0[0] == 0 {
+            return false;
+        }
+
+        // R44-3 FIX: Heuristic - reject sources ending in .255
+        // These are likely directed broadcast addresses. While some legitimate
+        // hosts may use .255, the risk of reflection attacks outweighs this.
+        // TODO: Make this subnet-aware when we have netmask configuration
+        if self.0[3] == 255 {
+            return false;
+        }
+
+        true
     }
 
     /// Get the raw bytes

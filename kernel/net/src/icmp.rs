@@ -459,6 +459,9 @@ pub struct TokenBucket {
     last_refill_ms: AtomicU64,
 }
 
+/// Maximum refill window to prevent extreme time jumps (60 seconds)
+const MAX_REFILL_WINDOW_MS: u64 = 60_000;
+
 impl TokenBucket {
     /// Default steady-state rate: 10 packets per second
     pub const DEFAULT_RATE_PER_SEC: u64 = 10;
@@ -490,20 +493,31 @@ impl TokenBucket {
     /// This should be called before sending an ICMP response.
     ///
     /// # Arguments
-    /// * `now_ms` - Current time in milliseconds
+    /// * `now_ms` - Current time in milliseconds (MUST be from trusted monotonic source)
     ///
     /// # Returns
     /// `true` if a token was consumed and the packet can be sent,
-    /// `false` if rate limited.
+    /// `false` if rate limited (or if time went backwards).
+    ///
+    /// # R44-6 FIX: Added monotonic time enforcement and refill window capping
     pub fn allow(&self, now_ms: u64) -> bool {
         // Refill tokens based on elapsed time
         let last = self.last_refill_ms.load(Ordering::Relaxed);
+
+        // R44-6 FIX: Enforce monotonic time - reject if time went backwards
+        // This prevents manipulation via non-monotonic timestamps
+        if last != 0 && now_ms < last {
+            return false;
+        }
+
         let elapsed = if last == 0 {
             // First call - initialize timestamp
             self.last_refill_ms.store(now_ms, Ordering::Relaxed);
             0
         } else {
-            now_ms.saturating_sub(last)
+            // R44-6 FIX: Cap the refill window to prevent extreme time jumps
+            // from instantly refilling the bucket
+            cmp::min(now_ms.saturating_sub(last), MAX_REFILL_WINDOW_MS)
         };
 
         if elapsed > 0 {

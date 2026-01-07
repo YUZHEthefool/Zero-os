@@ -39,13 +39,16 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, Once, RwLock};
 use x86_64::{PhysAddr, VirtAddr};
 
+pub mod arp;
 pub mod buffer;
 pub mod device;
 pub mod ethernet;
 pub mod icmp;
 pub mod ipv4;
 mod pci;
+pub mod socket;
 pub mod stack;
+pub mod udp;
 pub mod virtio_net;
 
 pub use buffer::{BufPool, NetBuf};
@@ -66,6 +69,19 @@ pub use ethernet::{
 };
 pub use stack::{process_frame, NetStats, ProcessResult, DropReason};
 pub use virtio_net::VirtioNetDevice;
+pub use arp::{
+    parse_arp, serialize_arp, build_arp_reply, build_arp_request, build_gratuitous_arp,
+    process_arp, ArpCache, ArpEntry, ArpEntryKind, ArpError, ArpOp, ArpPacket, ArpResult,
+    ArpStats, ARP_RX_RATE_LIMITER, ARP_TX_RATE_LIMITER,
+};
+pub use udp::{
+    parse_udp, parse_udp_header, build_udp_datagram, compute_udp_checksum, verify_udp_checksum,
+    UdpError, UdpHeader, UdpResult, UdpStats, UDP_HEADER_LEN, UDP_PROTO,
+};
+pub use socket::{
+    socket_table, PendingDatagram, SocketDomain, SocketError, SocketLabel, SocketProtocol,
+    SocketState, SocketStats, SocketTable, SocketType, TableStats,
+};
 
 // ============================================================================
 // Network Constants

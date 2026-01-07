@@ -20,7 +20,7 @@
 //!              |                               |
 //!     +--------v---------+           +---------v--------+
 //!     |     IPv4         |           |      ARP         |
-//!     | (validate/route) |           |   (future)       |
+//!     | (validate/route) |           |  (cache/reply)   |
 //!     +--------+---------+           +------------------+
 //!              |
 //!     +--------v---------+
@@ -39,10 +39,13 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::arp::{process_arp, ArpCache, ArpError, ArpResult, ArpStats};
 use crate::buffer::NetBuf;
-use crate::ethernet::{parse_ethernet, build_ethernet_frame, EthAddr, EthHeader, ETHERTYPE_IPV4};
+use crate::ethernet::{parse_ethernet, build_ethernet_frame, EthAddr, EthHeader, ETHERTYPE_IPV4, ETHERTYPE_ARP};
 use crate::icmp::{build_echo_reply, parse_icmp, IcmpError, ICMP_RATE_LIMITER, ICMP_TYPE_ECHO_REQUEST};
 use crate::ipv4::{build_ipv4_header, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto};
+use crate::socket::socket_table;
+use crate::udp::{parse_udp, UdpError, UdpResult, UdpStats};
 
 // ============================================================================
 // Statistics
@@ -67,6 +70,10 @@ pub struct NetStats {
     pub rate_limited: AtomicU64,
     /// Packets dropped due to unsupported protocol
     pub unsupported_proto: AtomicU64,
+    /// ARP statistics
+    pub arp_stats: ArpStats,
+    /// UDP statistics
+    pub udp_stats: UdpStats,
 }
 
 impl NetStats {
@@ -81,6 +88,8 @@ impl NetStats {
             icmp_echo_tx: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
             unsupported_proto: AtomicU64::new(0),
+            arp_stats: ArpStats::new(),
+            udp_stats: UdpStats::new(),
         }
     }
 
@@ -149,6 +158,10 @@ pub enum DropReason {
     Ipv4Error(Ipv4Error),
     /// ICMP parsing failed
     IcmpError(IcmpError),
+    /// ARP processing error
+    ArpError(ArpError),
+    /// UDP processing error
+    UdpError(UdpError),
     /// Unsupported EtherType
     UnsupportedEtherType,
     /// Unsupported IP protocol
@@ -178,6 +191,7 @@ pub enum DropReason {
 /// * `frame` - Raw Ethernet frame bytes
 /// * `our_mac` - Our MAC address (for filtering and responses)
 /// * `our_ip` - Our IP address (for filtering and responses)
+/// * `arp_cache` - ARP cache for address resolution
 /// * `stats` - Statistics counters
 /// * `now_ms` - Current time in milliseconds (for rate limiting)
 ///
@@ -187,6 +201,7 @@ pub fn process_frame(
     frame: &[u8],
     our_mac: EthAddr,
     our_ip: Ipv4Addr,
+    arp_cache: &mut ArpCache,
     stats: &NetStats,
     now_ms: u64,
 ) -> ProcessResult {
@@ -213,7 +228,14 @@ pub fn process_frame(
         ETHERTYPE_IPV4 => {
             process_ipv4(eth_payload, &eth_hdr, our_mac, our_ip, stats, now_ms)
         }
-        // TODO: Add ARP handling
+        ETHERTYPE_ARP => {
+            // Process ARP packet
+            match process_arp(eth_payload, our_mac, our_ip, arp_cache, &stats.arp_stats, now_ms) {
+                ArpResult::Handled => ProcessResult::Handled,
+                ArpResult::Reply(frame) => ProcessResult::Reply(frame),
+                ArpResult::Dropped(e) => ProcessResult::Dropped(DropReason::ArpError(e)),
+            }
+        }
         _ => {
             stats.inc_unsupported_proto();
             ProcessResult::Dropped(DropReason::UnsupportedEtherType)
@@ -261,8 +283,12 @@ fn process_ipv4(
             // Pass broadcast flag to ICMP handler for response suppression
             process_icmp(payload, &ip_hdr, eth_hdr, our_mac, our_ip, stats, now_ms, is_broadcast_dst)
         }
-        Some(Ipv4Proto::Tcp) | Some(Ipv4Proto::Udp) => {
-            // TODO: TCP/UDP handling
+        Some(Ipv4Proto::Udp) => {
+            // Process UDP packet
+            process_udp(payload, &ip_hdr, stats, is_broadcast_dst, now_ms)
+        }
+        Some(Ipv4Proto::Tcp) => {
+            // TODO: TCP handling
             stats.inc_unsupported_proto();
             ProcessResult::Dropped(DropReason::UnsupportedProtocol)
         }
@@ -271,6 +297,64 @@ fn process_ipv4(
             ProcessResult::Dropped(DropReason::UnsupportedProtocol)
         }
     }
+}
+
+/// Process a UDP datagram.
+///
+/// # Security
+///
+/// - Does NOT process datagrams sent to broadcast/multicast addresses
+///   (prevents amplification attacks)
+/// - Validates checksum strictly (zero checksums rejected)
+/// - Validates length fields
+/// - Delivers to bound sockets via socket_table()
+fn process_udp(
+    payload: &[u8],
+    ip_hdr: &Ipv4Header,
+    stats: &NetStats,
+    is_broadcast_dst: bool,
+    now_ms: u64,
+) -> ProcessResult {
+    stats.udp_stats.inc_rx_packets();
+
+    // Security: Reject UDP to broadcast/multicast destinations
+    // This prevents amplification attacks
+    if is_broadcast_dst || ip_hdr.dst.is_multicast() {
+        stats.udp_stats.inc_rx_errors();
+        return ProcessResult::Dropped(DropReason::UdpError(UdpError::BroadcastDest));
+    }
+
+    // Parse and validate UDP datagram
+    let (header, data) = match parse_udp(payload, ip_hdr.src, ip_hdr.dst) {
+        Ok(result) => result,
+        Err(e) => {
+            match e {
+                UdpError::ChecksumInvalid | UdpError::ZeroChecksum => {
+                    stats.udp_stats.inc_checksum_errors();
+                }
+                _ => {
+                    stats.udp_stats.inc_rx_errors();
+                }
+            }
+            return ProcessResult::Dropped(DropReason::UdpError(e));
+        }
+    };
+
+    // Record bytes received
+    stats.udp_stats.add_rx_bytes(data.len() as u64);
+
+    // Deliver to socket layer
+    if socket_table().deliver_udp(header.dst_port, ip_hdr.src, header.src_port, data, now_ms) {
+        return ProcessResult::Handled;
+    }
+
+    // No listener - silently drop to avoid port scanning feedback
+    // Note: We could send ICMP Port Unreachable, but that requires:
+    // 1. Rate limiting (to prevent reflection attacks)
+    // 2. Building the ICMP response
+    // For now, silent drop is the safer default
+    stats.udp_stats.inc_no_listener();
+    ProcessResult::Handled
 }
 
 /// Process an ICMP packet.
