@@ -269,10 +269,25 @@ impl VirtQueue {
             // R44-5 FIX: Reject implausible jumps in used.idx
             // A malicious device could jump used.idx far ahead to make us read
             // stale ring slots and free unrelated descriptor chains.
-            // Rather than stalling forever, we resync to current device idx.
+            //
+            // R48-1/R48-4 FIX: Also reject backward movement (rewind) to prevent
+            // stale-slot replay attacks. When used_idx moves backward without a
+            // proper wrap, a malicious device could cause us to re-read old slots
+            // and double-free descriptors we already processed.
+            //
+            // Detection logic:
+            // - `available > self.size` indicates an abnormal jump
+            // - If `used_idx < last` (backward move without wrap), drop silently
+            //   and keep last_used_idx unchanged to prevent replay
+            // - If forward jump (wrapped or too far ahead), resync to prevent stall
             if available > self.size {
-                // Log the issue (would require drivers crate, skip for now)
-                // Resync: trust the device idx but don't process any entries
+                if used_idx < last {
+                    // Backward move: drop entry, do NOT update last_used_idx
+                    // This prevents replaying already-processed slots
+                    return None;
+                }
+                // Forward jump: resync to device index to avoid permanent stall
+                // but don't process any entries from this abnormal transition
                 self.last_used_idx.store(used_idx, Ordering::Relaxed);
                 return None;
             }

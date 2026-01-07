@@ -441,17 +441,28 @@ impl CapEntry {
 // Placeholder Object Handles
 // ============================================================================
 
-/// Placeholder socket handle until the network stack exposes a concrete type.
+/// Socket capability handle referencing a socket_table() entry by ID.
+///
+/// This struct links the capability system to the network socket table.
+/// The socket_id corresponds to the `SocketState.id` field in `socket_table()`.
 #[derive(Debug, Clone)]
 pub struct Socket {
-    // Will contain: protocol, local_addr, remote_addr, state, etc.
-    _placeholder: (),
+    /// Global socket identifier managed by socket_table()
+    pub socket_id: u64,
 }
 
 impl Socket {
-    /// Create a placeholder socket.
+    /// Create a socket capability handle for a specific socket ID.
+    #[inline]
+    pub fn new(socket_id: u64) -> Self {
+        Self { socket_id }
+    }
+
+    /// Create a placeholder socket (socket_id = 0, invalid).
+    /// Used for legacy compatibility; new code should use `new()`.
+    #[inline]
     pub fn placeholder() -> Self {
-        Self { _placeholder: () }
+        Self { socket_id: 0 }
     }
 }
 

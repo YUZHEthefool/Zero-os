@@ -43,7 +43,10 @@ use crate::arp::{process_arp, ArpCache, ArpError, ArpResult, ArpStats};
 use crate::buffer::NetBuf;
 use crate::ethernet::{parse_ethernet, build_ethernet_frame, EthAddr, EthHeader, ETHERTYPE_IPV4, ETHERTYPE_ARP};
 use crate::icmp::{build_echo_reply, parse_icmp, IcmpError, ICMP_RATE_LIMITER, ICMP_TYPE_ECHO_REQUEST};
-use crate::ipv4::{build_ipv4_header, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto};
+use crate::ipv4::{
+    build_ipv4_header, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
+    IPV4_HEADER_MIN_LEN,
+};
 use crate::socket::socket_table;
 use crate::udp::{parse_udp, UdpError, UdpResult, UdpStats};
 
@@ -254,7 +257,28 @@ fn process_ipv4(
 ) -> ProcessResult {
     stats.inc_ipv4_rx();
 
-    // Parse and validate IPv4 header
+    // R48-6 FIX: Early fragment filter BEFORE expensive checksum/options parsing.
+    //
+    // Without this filter, an attacker can send floods of minimal-size fragmented
+    // packets that trigger full parse_ipv4() processing (checksum verification,
+    // options walk) only to be discarded later when we detect the fragment.
+    // This wastes CPU and enables a low-effort DoS attack.
+    //
+    // IPv4 header bytes 6-7 contain:
+    // - Bits 0-2: Flags (bit 1 = DF, bit 2 = MF = More Fragments)
+    // - Bits 3-15: Fragment Offset (in 8-byte units)
+    //
+    // If MF flag is set OR fragment offset is non-zero, it's a fragment.
+    // Mask 0x3FFF covers MF flag + fragment offset.
+    if packet.len() >= IPV4_HEADER_MIN_LEN {
+        let flags_fragment = u16::from_be_bytes([packet[6], packet[7]]);
+        if flags_fragment & 0x3FFF != 0 {
+            // Fragment detected - drop early without full parsing
+            return ProcessResult::Handled;
+        }
+    }
+
+    // Parse and validate IPv4 header (now guaranteed to be non-fragment)
     let (ip_hdr, _options, payload) = match parse_ipv4(packet) {
         Ok(result) => result,
         Err(e) => {

@@ -51,11 +51,110 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use spin::{Mutex, Once, RwLock};
 
 use cap::CapId;
-use ipc::{WaitOutcome, WaitQueue};
 use lsm::{
     hook_net_bind, hook_net_recv, hook_net_send, hook_net_socket,
     LsmError, NetCtx, ProcessCtx,
 };
+
+// ============================================================================
+// Simple Wait Primitives (local to net crate to avoid ipc dependency)
+// ============================================================================
+
+/// Wait operation outcome.
+///
+/// Simplified version that avoids kernel_core dependency.
+/// For now, we only support polling (non-blocking) mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// Resource became available
+    Woken,
+    /// Operation timed out (or poll returned nothing)
+    TimedOut,
+    /// Resource closed
+    Closed,
+    /// No process context available
+    NoProcess,
+}
+
+/// Simple wait queue (polling-based, non-blocking).
+///
+/// This is a simplified implementation that doesn't actually block.
+/// When `wait_with_timeout(Some(0))` is called, it returns immediately
+/// with TimedOut if no data is available.
+///
+/// True blocking support will require integration with the scheduler,
+/// which can be added later through kernel hooks.
+pub struct WaitQueue {
+    /// Flag indicating if the queue is closed
+    closed: AtomicBool,
+    /// Wakeup counter (incremented on wake, read on wait to detect wakeup)
+    wakeup_count: AtomicU64,
+}
+
+impl WaitQueue {
+    /// Create a new wait queue.
+    pub fn new() -> Self {
+        WaitQueue {
+            closed: AtomicBool::new(false),
+            wakeup_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Wait with optional timeout.
+    ///
+    /// # Arguments
+    /// * `timeout_ns` - Timeout in nanoseconds. `Some(0)` means non-blocking poll.
+    ///   `None` means block indefinitely (not currently supported - returns TimedOut).
+    ///
+    /// # Returns
+    /// - `WaitOutcome::Woken` if wakeup was signaled before the call
+    /// - `WaitOutcome::TimedOut` if polling and no data available
+    /// - `WaitOutcome::Closed` if the queue is closed
+    pub fn wait_with_timeout(&self, timeout_ns: Option<u64>) -> WaitOutcome {
+        // Check if closed
+        if self.closed.load(Ordering::Acquire) {
+            return WaitOutcome::Closed;
+        }
+
+        // For now, we only support non-blocking polling
+        // True blocking would require kernel scheduler integration
+        match timeout_ns {
+            Some(0) => WaitOutcome::TimedOut, // Non-blocking poll: return immediately
+            Some(_) | None => {
+                // For blocking waits, we just return TimedOut for now
+                // This makes recv_from always behave as non-blocking
+                // TODO: Implement proper blocking with kernel scheduler hooks
+                WaitOutcome::TimedOut
+            }
+        }
+    }
+
+    /// Signal one waiter.
+    pub fn wake_one(&self) {
+        self.wakeup_count.fetch_add(1, Ordering::Release);
+    }
+
+    /// Signal all waiters.
+    pub fn wake_all(&self) {
+        self.wakeup_count.fetch_add(1, Ordering::Release);
+    }
+
+    /// Close the queue and prevent further waits.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Check if closed.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
+impl Default for WaitQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 use crate::ipv4::Ipv4Addr;
 use crate::udp::{
@@ -310,6 +409,13 @@ impl SocketState {
     /// Get the local port if bound.
     pub fn local_port(&self) -> Option<u16> {
         self.meta.lock().local_port
+    }
+
+    /// Get the local IP address if bound.
+    ///
+    /// R48-REVIEW FIX: Expose bound local IP for correct source address in sendto.
+    pub fn local_ip(&self) -> Option<[u8; 4]> {
+        self.meta.lock().local_ip
     }
 
     /// Get a snapshot of socket metadata.
@@ -749,6 +855,26 @@ impl SocketTable {
             return false;
         };
 
+        // R48-3 FIX: Invoke LSM policy check BEFORE allocating/copying
+        // attacker-controlled payload. This prevents unauthorized peers from
+        // filling MAX_RX_QUEUE of MAC-protected sockets, causing legitimate
+        // traffic to be dropped despite policy denial at recv_from_udp time.
+        //
+        // We use the socket creator's context for the policy decision, since
+        // this is packet delivery (not a specific syscall caller context).
+        {
+            let mut ctx = self.ctx_from_socket(&sock);
+            ctx.remote = ipv4_to_u64(src_ip.0);
+            ctx.remote_port = src_port;
+            // Note: No CapId available in delivery path (not a syscall)
+
+            if hook_net_recv(&sock.label.creator, &ctx, data.len()).is_err() {
+                // LSM policy denied - drop packet without consuming queue space
+                sock.rx_dropped.fetch_add(1, Ordering::Relaxed);
+                return true; // Socket exists but policy denied
+            }
+        }
+
         // R47-4 FIX: Check queue capacity BEFORE copying
         // This prevents memory exhaustion from large datagrams
         {
@@ -759,7 +885,7 @@ impl SocketTable {
             }
         }
 
-        // Now safe to allocate memory for the datagram
+        // Now safe to allocate memory for the datagram (LSM approved, queue has space)
         let pkt = PendingDatagram {
             src_ip,
             src_port,

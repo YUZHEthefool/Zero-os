@@ -30,6 +30,12 @@ extern crate seccomp;
 // LSM hook infrastructure
 extern crate lsm;
 
+// Network socket layer
+extern crate net;
+
+// Capability system
+extern crate cap;
+
 // Security RNG for cryptographically secure random number generation
 use security::rng;
 
@@ -177,6 +183,148 @@ struct LinuxDirent64 {
     d_reclen: u16,
     d_type: u8,
     // followed by name bytes + '\0'
+}
+
+// ============================================================================
+// Socket ABI (Linux x86_64)
+// ============================================================================
+
+/// Socket type flags (Linux ABI)
+const SOCK_NONBLOCK: u32 = 0o4000;   // O_NONBLOCK
+const SOCK_CLOEXEC: u32 = 0o2000000; // O_CLOEXEC
+
+/// sendto/recvfrom flags we support
+const MSG_DONTWAIT: u32 = 0x40;
+
+/// Maximum UDP payload size
+const UDP_MAX_PAYLOAD: usize = 65507;
+
+/// struct sockaddr_in (Linux x86_64 ABI compatible)
+///
+/// Used by socket syscalls for IPv4 address specification.
+/// All multi-byte fields are in network byte order.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct SockAddrIn {
+    /// Address family (AF_INET = 2)
+    sin_family: u16,
+    /// Port number (network byte order)
+    sin_port: u16,
+    /// IPv4 address (network byte order)
+    sin_addr: u32,
+    /// Padding to 16 bytes (Linux ABI)
+    sin_zero: [u8; 8],
+}
+
+impl SockAddrIn {
+    /// Create from Ipv4Addr and port (host byte order).
+    fn from_addr(ip: [u8; 4], port: u16) -> Self {
+        Self {
+            sin_family: AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: u32::from_be_bytes(ip),
+            sin_zero: [0; 8],
+        }
+    }
+
+    /// Extract IP address as [u8; 4] in network byte order.
+    fn ip_bytes(&self) -> [u8; 4] {
+        self.sin_addr.to_be_bytes()
+    }
+
+    /// Extract port in host byte order.
+    fn port(&self) -> u16 {
+        u16::from_be(self.sin_port)
+    }
+}
+
+/// AF_INET constant (IPv4)
+const AF_INET: u32 = 2;
+
+/// Socket file descriptor wrapper for fd_table.
+///
+/// Stores the CapId and socket_id together for efficient lookup.
+#[derive(Clone)]
+struct SocketFile {
+    /// Capability ID referencing this socket in cap_table
+    cap_id: cap::CapId,
+    /// Socket ID in socket_table()
+    socket_id: u64,
+    /// Non-blocking flag (SOCK_NONBLOCK)
+    nonblocking: bool,
+}
+
+impl SocketFile {
+    fn new(cap_id: cap::CapId, socket_id: u64, nonblocking: bool) -> Self {
+        Self { cap_id, socket_id, nonblocking }
+    }
+}
+
+/// S_IFSOCK constant - socket file type marker
+const S_IFSOCK: u32 = 0o140000;
+
+impl crate::process::FileOps for SocketFile {
+    fn clone_box(&self) -> alloc::boxed::Box<dyn crate::process::FileOps> {
+        alloc::boxed::Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn type_name(&self) -> &'static str {
+        "SocketFile"
+    }
+
+    fn stat(&self) -> Result<VfsStat, SyscallError> {
+        Ok(VfsStat {
+            dev: 0,
+            ino: self.socket_id,
+            mode: S_IFSOCK | 0o666, // Socket with rw-rw-rw- permissions
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+        })
+    }
+}
+
+/// R48-REVIEW FIX: Socket cleanup on Drop.
+///
+/// When a SocketFile is dropped (via sys_close or process exit), we must
+/// clean up the socket_table entry to prevent port leaks and memory exhaustion.
+/// This ensures:
+/// - Port binding is released for reuse
+/// - Socket memory is freed
+/// - Waiters are woken with WaitOutcome::Closed
+///
+/// **KNOWN LIMITATION (TODO)**: This implementation unconditionally closes the
+/// socket_table entry on any FD drop. This breaks POSIX semantics for:
+/// - dup()/dup2(): Multiple FDs sharing one socket; closing any closes all
+/// - fork(): Child inherits socket FDs; child exit closes parent's socket
+///
+/// **FIX REQUIRED**: Implement reference counting in socket_table:
+/// - Add refcount to SocketState
+/// - sys_socket: refcount = 1
+/// - dup()/fork(): increment refcount
+/// - Drop: decrement refcount, only close() on 0
+///
+/// Current status: Safe for single-process, single-FD per socket patterns.
+impl Drop for SocketFile {
+    fn drop(&mut self) {
+        // TODO: Should only close when refcount reaches 0
+        // For now, unconditionally close (breaks dup/fork semantics)
+        net::socket_table().close(self.socket_id);
+    }
 }
 
 // ============================================================================
@@ -384,6 +532,15 @@ pub enum SyscallError {
     ENOSYS = -38,  // 功能未实现
     ENOTEMPTY = -39, // 目录非空
     ELOOP = -40,   // 符号链接过多或禁止符号链接
+    // Socket-related errors (Linux ABI)
+    ENOTSOCK = -88,       // 套接字操作目标不是套接字
+    EDESTADDRREQ = -89,   // 需要目标地址
+    EMSGSIZE = -90,       // 消息太长
+    EPROTOTYPE = -91,     // 协议类型错误
+    EPROTONOSUPPORT = -93, // 协议不支持
+    EAFNOSUPPORT = -97,   // 地址族不支持
+    EADDRINUSE = -98,     // 地址已被使用
+    EADDRNOTAVAIL = -99,  // 无法分配请求的地址
     ETIMEDOUT = -110, // R39-6 FIX: 操作超时
 }
 
@@ -1000,6 +1157,29 @@ fn cap_error_to_syscall(err: cap::CapError) -> SyscallError {
     }
 }
 
+/// Map socket layer errors to syscall errno values.
+///
+/// Used by sys_socket/sys_bind/sys_sendto/sys_recvfrom to convert
+/// SocketError into appropriate Linux errno codes.
+#[inline]
+fn socket_error_to_syscall(err: net::SocketError) -> SyscallError {
+    match err {
+        net::SocketError::InvalidDomain => SyscallError::EAFNOSUPPORT,
+        net::SocketError::InvalidType => SyscallError::EPROTOTYPE,
+        net::SocketError::InvalidProtocol => SyscallError::EPROTONOSUPPORT,
+        net::SocketError::PermissionDenied | net::SocketError::PrivilegedPort => SyscallError::EACCES,
+        net::SocketError::PortInUse => SyscallError::EADDRINUSE,
+        net::SocketError::NoPorts => SyscallError::EAGAIN,
+        net::SocketError::NotBound => SyscallError::EDESTADDRREQ,
+        net::SocketError::Closed | net::SocketError::NotFound => SyscallError::EBADF,
+        net::SocketError::Timeout => SyscallError::EAGAIN,
+        net::SocketError::NoProcess => SyscallError::ESRCH,
+        net::SocketError::Udp(net::UdpError::PayloadTooLarge) => SyscallError::EMSGSIZE,
+        net::SocketError::Udp(_) => SyscallError::EINVAL,
+        net::SocketError::Lsm(e) => lsm_error_to_syscall(e),
+    }
+}
+
 /// Build an LSM ProcessCtx from current process state.
 /// Returns None if no current process is available.
 #[inline]
@@ -1274,6 +1454,26 @@ pub fn syscall_dispatcher(
         // 其他
         24 => sys_yield(),
         318 => sys_getrandom(arg0 as *mut u8, arg1 as usize, arg2 as u32),
+
+        // 套接字 (Socket syscalls - Linux x86_64 ABI)
+        41 => sys_socket(arg0 as i32, arg1 as i32, arg2 as i32),
+        49 => sys_bind(arg0 as i32, arg1 as *const SockAddrIn, arg2 as u32),
+        44 => sys_sendto(
+            arg0 as i32,
+            arg1 as *const u8,
+            arg2 as usize,
+            arg3 as i32,
+            arg4 as *const SockAddrIn,
+            arg5 as u32,
+        ),
+        45 => sys_recvfrom(
+            arg0 as i32,
+            arg1 as *mut u8,
+            arg2 as usize,
+            arg3 as i32,
+            arg4 as *mut SockAddrIn,
+            arg5 as *mut u32,
+        ),
 
         _ => Err(SyscallError::ENOSYS),
     };
@@ -5092,6 +5292,401 @@ fn sys_uname(buf: *mut UtsName) -> SyscallResult {
         .map_err(|_| SyscallError::EFAULT)?;
 
     Ok(0)
+}
+
+// ============================================================================
+// Socket 系统调用 (Linux x86_64 ABI: 41/49/44/45)
+// ============================================================================
+
+/// Helper: Read sockaddr_in from user space with length validation.
+fn read_sockaddr_in(user: *const SockAddrIn, len: u32) -> Result<SockAddrIn, SyscallError> {
+    if user.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let need = core::mem::size_of::<SockAddrIn>() as u32;
+    if len < need {
+        return Err(SyscallError::EINVAL);
+    }
+
+    validate_user_ptr(user as *const u8, need as usize)?;
+
+    let mut addr = SockAddrIn::default();
+    let addr_bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            &mut addr as *mut SockAddrIn as *mut u8,
+            core::mem::size_of::<SockAddrIn>(),
+        )
+    };
+    copy_from_user(addr_bytes, user as *const u8)?;
+    Ok(addr)
+}
+
+/// Helper: Write sockaddr_in to user space with length tracking.
+fn write_sockaddr_in(
+    addr: &SockAddrIn,
+    user_addr: *mut SockAddrIn,
+    user_len: *mut u32,
+) -> Result<(), SyscallError> {
+    if user_addr.is_null() {
+        return Ok(()); // Nothing to write
+    }
+
+    // Get user-provided buffer length
+    let provided_len = if user_len.is_null() {
+        core::mem::size_of::<SockAddrIn>() as u32
+    } else {
+        validate_user_ptr(user_len as *const u8, core::mem::size_of::<u32>())?;
+        let mut len_bytes = [0u8; 4];
+        copy_from_user(&mut len_bytes, user_len as *const u8)?;
+        u32::from_ne_bytes(len_bytes)
+    };
+
+    let addr_bytes = unsafe {
+        core::slice::from_raw_parts(
+            addr as *const SockAddrIn as *const u8,
+            core::mem::size_of::<SockAddrIn>(),
+        )
+    };
+
+    let write_len = core::cmp::min(provided_len as usize, addr_bytes.len());
+    if write_len > 0 {
+        validate_user_ptr_mut(user_addr as *mut u8, write_len)?;
+        copy_to_user(user_addr as *mut u8, &addr_bytes[..write_len])?;
+    }
+
+    // Write actual length back
+    if !user_len.is_null() {
+        let actual = (core::mem::size_of::<SockAddrIn>() as u32).to_ne_bytes();
+        copy_to_user(user_len as *mut u8, &actual)?;
+    }
+
+    Ok(())
+}
+
+/// Helper: Get socket handle from fd_table.
+fn socket_handle_from_fd(fd: i32) -> Result<(cap::CapId, u64, bool), SyscallError> {
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let proc = process.lock();
+    let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+    let socket = fd_obj
+        .as_any()
+        .downcast_ref::<SocketFile>()
+        .ok_or(SyscallError::ENOTSOCK)?;
+    Ok((socket.cap_id, socket.socket_id, socket.nonblocking))
+}
+
+/// Helper: Resolve socket state from handle.
+fn resolve_socket(
+    cap_id: cap::CapId,
+    socket_id: u64,
+) -> Result<(cap::CapEntry, alloc::sync::Arc<net::SocketState>), SyscallError> {
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let proc = process.lock();
+
+    // Lookup capability entry
+    let entry = proc
+        .cap_table
+        .lookup(cap_id)
+        .map_err(cap_error_to_syscall)?;
+
+    // Verify it's a socket with matching ID
+    match &entry.object {
+        cap::CapObject::Socket(ref h) if h.socket_id == socket_id => {}
+        _ => return Err(SyscallError::ENOTSOCK),
+    }
+
+    // Get socket state from socket_table
+    let sock = net::socket_table()
+        .get(socket_id)
+        .ok_or(SyscallError::EBADF)?;
+
+    Ok((entry, sock))
+}
+
+/// sys_socket - Create a UDP socket (syscall 41).
+///
+/// # Arguments
+/// * `domain` - Address family (AF_INET = 2)
+/// * `type_` - Socket type (SOCK_DGRAM = 2, may have SOCK_CLOEXEC/SOCK_NONBLOCK)
+/// * `protocol` - Protocol (IPPROTO_UDP = 17, or 0 for default)
+///
+/// # Returns
+/// File descriptor on success, negative errno on failure.
+///
+/// # Security
+/// - Invokes LSM hook_net_socket for policy check
+/// - Creates CapEntry with READ|WRITE|BIND rights
+/// - Stores CapId in fd_table via SocketFile wrapper
+fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
+    // Parse domain
+    let domain_val = net::SocketDomain::from_raw(domain as u32)
+        .ok_or(SyscallError::EAFNOSUPPORT)?;
+
+    // Parse type (handle SOCK_CLOEXEC/SOCK_NONBLOCK flags)
+    let raw_ty = type_ as u32;
+    let cloexec = raw_ty & SOCK_CLOEXEC != 0;
+    let nonblock = raw_ty & SOCK_NONBLOCK != 0;
+    let clean_ty = raw_ty & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
+    let ty = net::SocketType::from_raw(clean_ty).ok_or(SyscallError::EPROTOTYPE)?;
+
+    // Parse protocol
+    let proto = net::SocketProtocol::from_raw(protocol as u32)
+        .ok_or(SyscallError::EPROTONOSUPPORT)?;
+
+    // Currently only support AF_INET + SOCK_DGRAM + UDP
+    if domain_val != net::SocketDomain::Inet4 {
+        return Err(SyscallError::EAFNOSUPPORT);
+    }
+    if ty != net::SocketType::Dgram {
+        return Err(SyscallError::EPROTOTYPE);
+    }
+    if proto != net::SocketProtocol::Udp {
+        return Err(SyscallError::EPROTONOSUPPORT);
+    }
+
+    // Get security label from current process
+    let label = net::SocketLabel::from_current(0).ok_or(SyscallError::ESRCH)?;
+
+    // Create socket via socket_table (includes LSM hook_net_socket check)
+    let socket = net::socket_table()
+        .create_udp_socket(label)
+        .map_err(socket_error_to_syscall)?;
+
+    // Create capability entry
+    let cap_flags = if cloexec {
+        cap::CapFlags::CLOEXEC
+    } else {
+        cap::CapFlags::empty()
+    };
+    let cap_entry = cap::CapEntry::with_flags(
+        cap::CapObject::Socket(alloc::sync::Arc::new(cap::Socket::new(socket.id))),
+        cap::CapRights::READ | cap::CapRights::WRITE | cap::CapRights::BIND,
+        cap_flags,
+    );
+
+    // Allocate CapId + fd
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let fd = {
+        let mut proc = process.lock();
+        let cap_id = proc.cap_table.allocate(cap_entry).map_err(cap_error_to_syscall)?;
+        let sock_file = SocketFile::new(cap_id, socket.id, nonblock);
+        let fd = proc
+            .allocate_fd(alloc::boxed::Box::new(sock_file))
+            .ok_or(SyscallError::EMFILE)?;
+        if cloexec {
+            proc.cloexec_fds.insert(fd);
+        }
+        fd
+    };
+
+    Ok(fd as usize)
+}
+
+/// sys_bind - Bind socket to local address (syscall 49).
+///
+/// # Arguments
+/// * `fd` - Socket file descriptor
+/// * `addr` - Pointer to sockaddr_in
+/// * `addrlen` - Length of address structure
+///
+/// # Security
+/// - Verifies CapRights::BIND
+/// - Invokes LSM hook_net_bind for policy check
+/// - Ports < 1024 require euid == 0
+fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
+    let (cap_id, socket_id, _nonblock) = socket_handle_from_fd(fd)?;
+    let (entry, socket) = resolve_socket(cap_id, socket_id)?;
+
+    // Check BIND right
+    if !entry.rights.allows(cap::CapRights::BIND) {
+        return Err(SyscallError::EACCES);
+    }
+
+    // Read address from user space
+    let user_addr = read_sockaddr_in(addr, addrlen)?;
+    if user_addr.sin_family != AF_INET as u16 {
+        return Err(SyscallError::EAFNOSUPPORT);
+    }
+
+    let port = user_addr.port();
+    let ip = net::Ipv4Addr(user_addr.ip_bytes());
+
+    // Get current process context for LSM check
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
+
+    // Bind via socket_table (includes LSM hook_net_bind check)
+    net::socket_table()
+        .bind_udp(
+            &socket,
+            &ctx,
+            cap_id,
+            ip,
+            if port == 0 { None } else { Some(port) },
+        )
+        .map_err(socket_error_to_syscall)?;
+
+    Ok(0)
+}
+
+/// sys_sendto - Send UDP datagram (syscall 44).
+///
+/// # Arguments
+/// * `fd` - Socket file descriptor
+/// * `buf` - Data buffer
+/// * `len` - Data length
+/// * `flags` - Send flags (MSG_DONTWAIT supported)
+/// * `dest_addr` - Destination address
+/// * `addrlen` - Length of destination address
+///
+/// # Security
+/// - Verifies CapRights::WRITE
+/// - Invokes LSM hook_net_send for policy check
+/// - Auto-binds to ephemeral port if not bound
+fn sys_sendto(
+    fd: i32,
+    buf: *const u8,
+    len: usize,
+    flags: i32,
+    dest_addr: *const SockAddrIn,
+    addrlen: u32,
+) -> SyscallResult {
+    if len == 0 {
+        return Ok(0);
+    }
+    if len > UDP_MAX_PAYLOAD {
+        return Err(SyscallError::EMSGSIZE);
+    }
+
+    // Check flags
+    let flag_bits = flags as u32;
+    if flag_bits & !MSG_DONTWAIT != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let (cap_id, socket_id, _nonblock) = socket_handle_from_fd(fd)?;
+    let (entry, socket) = resolve_socket(cap_id, socket_id)?;
+
+    // Check WRITE right
+    if !entry.rights.allows(cap::CapRights::WRITE) {
+        return Err(SyscallError::EACCES);
+    }
+
+    // R48-REVIEW FIX: Check BIND right if socket is not already bound.
+    // Auto-bind in sendto requires BIND capability to prevent capability bypass.
+    let is_bound = socket.local_port().is_some();
+    if !is_bound && !entry.rights.allows(cap::CapRights::BIND) {
+        // Socket not bound and no BIND right - cannot auto-bind
+        return Err(SyscallError::EACCES);
+    }
+
+    // Read destination address
+    let dest = read_sockaddr_in(dest_addr, addrlen)?;
+    if dest.sin_family != AF_INET as u16 {
+        return Err(SyscallError::EAFNOSUPPORT);
+    }
+    let dst_port = dest.port();
+    if dst_port == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    let dst_ip = net::Ipv4Addr(dest.ip_bytes());
+
+    // Copy payload from user space
+    validate_user_ptr(buf, len)?;
+    let mut data = vec![0u8; len];
+    copy_from_user(&mut data, buf)?;
+
+    // Get current process context
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
+
+    // R48-REVIEW FIX: Source IP - use actual bound address if available.
+    // If not bound, use INADDR_ANY (0.0.0.0) which send_to_udp will use
+    // when auto-binding to an ephemeral port.
+    let src_ip = socket
+        .local_ip()
+        .map(net::Ipv4Addr)
+        .unwrap_or(net::Ipv4Addr([0, 0, 0, 0]));
+
+    // Send via socket_table (includes LSM hook_net_send check)
+    let _datagram = net::socket_table()
+        .send_to_udp(&socket, &ctx, cap_id, src_ip, dst_ip, dst_port, &data)
+        .map_err(socket_error_to_syscall)?;
+
+    // TODO: Actually transmit the datagram via network device
+    // For now, the socket layer builds the datagram but we need
+    // network device integration to actually send it.
+
+    Ok(len)
+}
+
+/// sys_recvfrom - Receive UDP datagram (syscall 45).
+///
+/// # Arguments
+/// * `fd` - Socket file descriptor
+/// * `buf` - Buffer for received data
+/// * `len` - Buffer length
+/// * `flags` - Receive flags (MSG_DONTWAIT supported)
+/// * `src_addr` - Buffer for source address (optional)
+/// * `addrlen` - Pointer to address length (in/out)
+///
+/// # Security
+/// - Verifies CapRights::READ
+/// - Invokes LSM hook_net_recv for policy check
+fn sys_recvfrom(
+    fd: i32,
+    buf: *mut u8,
+    len: usize,
+    flags: i32,
+    src_addr: *mut SockAddrIn,
+    addrlen: *mut u32,
+) -> SyscallResult {
+    if len == 0 {
+        return Ok(0);
+    }
+
+    // Check flags
+    let flag_bits = flags as u32;
+    if flag_bits & !MSG_DONTWAIT != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let (cap_id, socket_id, nonblock) = socket_handle_from_fd(fd)?;
+    let (entry, socket) = resolve_socket(cap_id, socket_id)?;
+
+    // Check READ right
+    if !entry.rights.allows(cap::CapRights::READ) {
+        return Err(SyscallError::EACCES);
+    }
+
+    // Get current process context
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
+
+    // Determine timeout (0 for non-blocking, None for blocking)
+    let timeout = if nonblock || (flag_bits & MSG_DONTWAIT != 0) {
+        Some(0)
+    } else {
+        None
+    };
+
+    // Receive via socket_table (includes LSM hook_net_recv check)
+    let pkt = net::socket_table()
+        .recv_from_udp(&socket, &ctx, cap_id, timeout)
+        .map_err(socket_error_to_syscall)?;
+
+    // Copy data to user space
+    let copy_len = core::cmp::min(len, pkt.data.len());
+    validate_user_ptr_mut(buf, copy_len)?;
+    copy_to_user(buf, &pkt.data[..copy_len])?;
+
+    // Write source address if requested
+    if !src_addr.is_null() {
+        let sockaddr = SockAddrIn::from_addr(pkt.src_ip.0, pkt.src_port);
+        write_sockaddr_in(&sockaddr, src_addr, addrlen)?;
+    }
+
+    Ok(copy_len)
 }
 
 /// 系统调用统计

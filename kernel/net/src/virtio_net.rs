@@ -376,13 +376,21 @@ impl VirtioNetDevice {
 
         // R44-2 FIX: Validate length before consuming the buffer
         // If length is invalid, return buffer to pool instead of leaking it
+        //
+        // R48-5 FIX: When pool is None, recycle buffer locally to rx_ready
+        // instead of dropping it. Although NetBuf now has Drop that frees
+        // the page, recycling avoids the allocation overhead of getting a
+        // new page from the buddy allocator on the next replenish.
         if total_len < VIRTIO_NET_HDR_SIZE {
             self.stats.rx_errors += 1;
-            // Return buffer to pool if provided, otherwise it's lost
+            // Recycle buffer: prefer pool if available, else local rx_ready
+            let mut buf = buf;
+            buf.reset();
             if let Some(pool) = pool {
-                let mut buf = buf;
-                buf.reset();
                 pool.free(buf);
+            } else {
+                // R48-5: Recycle locally when no pool provided
+                self.rx_ready.push(buf);
             }
             // Free descriptors using driver-owned metadata
             if let Some(next) = data_idx {
@@ -397,10 +405,13 @@ impl VirtioNetDevice {
         let mut buf = buf;
         if !buf.set_len(payload_len) {
             self.stats.rx_errors += 1;
-            // R44-2 FIX: Return buffer to pool on error
+            // R44-2 + R48-5 FIX: Recycle buffer on error
+            buf.reset();
             if let Some(pool) = pool {
-                buf.reset();
                 pool.free(buf);
+            } else {
+                // R48-5: Recycle locally when no pool provided
+                self.rx_ready.push(buf);
             }
             // Free descriptors using driver-owned metadata
             if let Some(next) = data_idx {

@@ -10,5 +10,4 @@ virtio = { path = "../virtio" }
 drivers = { path = "../drivers" }
 x86_64 = "0.15"
 cap = { path = "../cap" }
-ipc = { path = "../ipc" }
 lsm = { path = "../lsm" }

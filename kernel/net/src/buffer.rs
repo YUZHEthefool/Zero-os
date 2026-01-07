@@ -61,6 +61,26 @@ pub struct NetBuf {
 unsafe impl Send for NetBuf {}
 unsafe impl Sync for NetBuf {}
 
+/// R48-5 FIX: Implement Drop to prevent physical page leaks.
+///
+/// When a NetBuf is dropped without being returned to a BufPool (e.g., in error
+/// paths where pool == None), the backing physical page must be freed back to
+/// the buddy allocator. Without this Drop impl, a malicious device could
+/// repeatedly trigger error paths to exhaust physical memory.
+///
+/// # Safety
+///
+/// This impl assumes that `phys_base` always refers to a valid, owned physical
+/// frame that was allocated from the buddy allocator. This invariant is
+/// maintained by the constructor which only accepts valid PhysFrame values.
+impl Drop for NetBuf {
+    fn drop(&mut self) {
+        // Return the physical page to the buddy allocator
+        let frame = PhysFrame::containing_address(self.phys_base);
+        mm::buddy_allocator::free_physical_pages(frame, 1);
+    }
+}
+
 impl NetBuf {
     /// Create a new buffer backed by a physical frame.
     ///

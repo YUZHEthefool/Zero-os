@@ -724,6 +724,24 @@ pub fn process_arp(
     let is_gratuitous = pkt.sender_ip == pkt.target_ip;
     let for_us = pkt.target_ip == our_ip;
 
+    // R48-2 FIX: Restrict gratuitous ARP learning to prevent cache poisoning.
+    //
+    // Previously, we accepted ANY gratuitous ARP (sender_ip == target_ip),
+    // which allowed an attacker to inject first-use mappings for arbitrary IPs
+    // (e.g., gateway IP → attacker MAC) and hijack outbound traffic.
+    //
+    // Now we only accept gratuitous ARP when:
+    // 1. It's for our own IP (legitimate self-announcement), OR
+    // 2. It's a same-MAC refresh of an existing cache entry
+    //
+    // This prevents injection of new malicious mappings while still allowing
+    // legitimate refreshes from known hosts.
+    let existing_mac = cache.lookup(pkt.sender_ip, now_ms);
+    let allow_gratuitous = is_gratuitous && (
+        pkt.sender_ip == our_ip ||                        // Our own announcement
+        existing_mac == Some(pkt.sender_hw)               // Same-MAC refresh only
+    );
+
     // Security: Detect reflection attack attempt
     // If sender claims our IP but has different MAC, ignore completely
     if pkt.sender_ip == our_ip && pkt.sender_hw != our_mac {
@@ -734,22 +752,23 @@ pub fn process_arp(
     // R45 FIX: Drop ARP replies not directed at us to reduce poisoning surface
     // Only accept replies that are:
     // 1. Targeted at our IP and MAC, or
-    // 2. Gratuitous announcements (sender_ip == target_ip)
+    // 2. Gratuitous announcements that pass the R48-2 check
     if pkt.op == ArpOp::Reply {
         // Reject replies with invalid target MAC (broadcast/multicast/zero)
         if pkt.target_hw.is_broadcast() || pkt.target_hw.is_multicast() || pkt.target_hw == EthAddr::ZERO {
             stats.inc_rx_errors();
             return ArpResult::Dropped(ArpError::InvalidSender);
         }
-        // Drop replies not for us (unless gratuitous)
-        if !is_gratuitous && (!for_us || pkt.target_hw != our_mac) {
+        // Drop replies not for us (check allow_gratuitous instead of is_gratuitous)
+        if !allow_gratuitous && (!for_us || pkt.target_hw != our_mac) {
             return ArpResult::Handled;
         }
     }
 
-    // R45 FIX: Only learn mappings that involve us or are gratuitous announcements
-    // This reduces the attack surface for cache poisoning
-    if for_us || is_gratuitous {
+    // R45 FIX + R48-2 FIX: Only learn mappings that involve us or pass
+    // the restricted gratuitous check. This reduces the attack surface
+    // for cache poisoning while still allowing legitimate ARP operations.
+    if for_us || allow_gratuitous {
         if let Err(e) = cache.insert(pkt.sender_ip, pkt.sender_hw, ArpEntryKind::Dynamic, now_ms) {
             stats.inc_cache_conflicts();
             return ArpResult::Dropped(e);

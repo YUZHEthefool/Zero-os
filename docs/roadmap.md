@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-06
+**Last Updated:** 2026-01-07
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -10,10 +10,10 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ## Executive Summary
 
-### Current Status: Phase D.2 In Progress (IPv4/ICMP Stack)
+### Current Status: Phase D.2 In Progress (IPv4/ICMP/ARP/UDP Stack)
 
 Zero-OS has completed storage foundation and is building network infrastructure:
-- **44 security audits** with 196+ issues found, ~163 fixed (83%) - R44 VirtIO driver hardening
+- **48 security audits** with 210+ issues found, ~177 fixed (84%) - R48 Network stack security audit
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -442,6 +442,11 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] ARP protocol (kernel/net/arp.rs) - RFC 826 with anti-spoofing
 - [x] UDP protocol (kernel/net/udp.rs) - RFC 768 with strict checksums
 - [x] Socket API (kernel/net/socket.rs) - Capability-based UDP sockets with LSM hooks
+- [x] **R48 FIXED**: VirtIO used.idx rewind attack prevention
+- [x] **R48 FIXED**: NetBuf Drop impl (memory leak prevention)
+- [x] **R48 FIXED**: ARP gratuitous learning restriction (poisoning prevention)
+- [x] **R48 FIXED**: LSM check before UDP datagram copy (resource exhaustion)
+- [x] **R48 FIXED**: Early IPv4 fragment filter (CPU DoS prevention)
 - [ ] TCP (3-way handshake, timeout, retransmit, sliding window)
 - [ ] Fragment reassembly with limits
 
@@ -663,18 +668,23 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-03 | 41 | 4 | 4 | sys_fstat, sys_execve LSM, openat2 |
 | 2026-01-04 | 42 | 5 | 5 | procfs PID-reuse, getdents64, page cache - **ALL FIXED** |
 | 2026-01-05 | 43 | 5 | 5 | VirtIO used.id OOB, descriptor chain loop, double-free - **ALL FIXED** |
-| 2026-01-06 | 44 | 8 | 7 | VirtIO driver-owned chains, ring zeroing, alloc bitmap - **ALL FIXED** |
-| **Total** | **44** | **196** | **163 (83%)** | **33 open (R44 fixed)** |
+| 2026-01-06 | 44-47 | 16 | 16 | ARP/UDP/Socket API, VirtIO hardening - **ALL FIXED** |
+| 2026-01-07 | 48 | 6 | 6 | Network stack security audit - **ALL R48 FIXED** |
+| **Total** | **48** | **210+** | **183 (87%)** | **27 open (SMP deferred)** |
 
 ### Current Status
 
-- **Fixed**: 163 issues (83%)
-- **Open**: 33 issues (17%)
-  - R43 issues: All fixed (enhanced with driver-owned chain metadata)
-  - R44 issues: All fixed (VirtIO hardening, IPv4 source validation, TokenBucket)
+- **Fixed**: 183 issues (87%)
+- **Open**: 27 issues (13%)
+  - R48 issues: 6 found, **ALL FIXED**
+    - R48-1/R48-4: VirtIO used.idx rewind prevention ✅
+    - R48-5: NetBuf Drop implementation ✅
+    - R48-2: ARP gratuitous learning restriction ✅
+    - R48-3: UDP LSM check before copy ✅
+    - R48-6: Early IPv4 fragment filter ✅
   - SMP-related issues deferred to Phase E
 
-See [qa-2026-01-06.md](review/qa-2026-01-06.md) for latest audit report.
+See [qa-2026-01-07.md](review/qa-2026-01-07.md) for latest audit report.
 
 ---
 
