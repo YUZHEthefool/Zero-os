@@ -62,28 +62,106 @@ use lsm::{
 
 /// Wait operation outcome.
 ///
-/// Simplified version that avoids kernel_core dependency.
-/// For now, we only support polling (non-blocking) mode.
+/// Represents the result of a blocking wait operation.
+/// Used by both socket waits and futex operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
-    /// Resource became available
+    /// Resource became available (waiter was explicitly woken)
     Woken,
-    /// Operation timed out (or poll returned nothing)
+    /// Operation timed out
     TimedOut,
-    /// Resource closed
+    /// Resource closed (socket/queue closed while waiting)
     Closed,
-    /// No process context available
+    /// No process context available (called from kernel context)
     NoProcess,
 }
 
-/// Simple wait queue (polling-based, non-blocking).
+// ============================================================================
+// Socket Wait Hooks (Scheduler Integration)
+// ============================================================================
+
+/// Scheduler integration hooks for socket blocking waits.
 ///
-/// This is a simplified implementation that doesn't actually block.
-/// When `wait_with_timeout(Some(0))` is called, it returns immediately
-/// with TimedOut if no data is available.
+/// This trait allows the net crate to perform true blocking waits without
+/// depending on kernel_core's process/scheduler implementation directly.
+/// kernel_core registers an implementation at initialization time.
 ///
-/// True blocking support will require integration with the scheduler,
-/// which can be added later through kernel hooks.
+/// # Design
+///
+/// The trait design follows the same pattern as stdin blocking in syscall.rs:
+/// 1. Mark process as Blocked
+/// 2. Add to waiter queue
+/// 3. Call force_reschedule to yield CPU
+/// 4. On wakeup, check condition and return outcome
+///
+/// # Safety
+///
+/// Implementations must:
+/// - Properly handle interrupt disabling during state transitions
+/// - Not hold locks across reschedule calls to avoid deadlock
+/// - Clean up waiter entries on timeout or close
+pub trait SocketWaitHooks: Send + Sync {
+    /// Block the current task until woken, timed out, or the queue is closed.
+    ///
+    /// # Arguments
+    /// * `queue` - The wait queue to block on
+    /// * `timeout_ns` - Optional timeout in nanoseconds:
+    ///   - `None`: Block indefinitely
+    ///   - `Some(0)`: Non-blocking poll (return immediately)
+    ///   - `Some(n)`: Block for up to n nanoseconds
+    ///
+    /// # Returns
+    /// * `Woken` - Explicitly woken by wake_one/wake_all
+    /// * `TimedOut` - Timeout expired before wakeup
+    /// * `Closed` - Queue was closed while waiting
+    /// * `NoProcess` - No current process context (kernel thread)
+    fn wait(&self, queue: &WaitQueue, timeout_ns: Option<u64>) -> WaitOutcome;
+
+    /// Wake one waiter blocked on this queue.
+    ///
+    /// If multiple waiters are blocked, wakes the one that blocked first (FIFO).
+    fn wake_one(&self, queue: &WaitQueue);
+
+    /// Wake all waiters blocked on this queue.
+    fn wake_all(&self, queue: &WaitQueue);
+}
+
+/// Static storage for the registered wait hooks.
+///
+/// Uses spin::Once to ensure thread-safe one-time initialization.
+/// After initialization, the reference is valid for the lifetime of the kernel.
+static SOCKET_WAIT_HOOKS: spin::Once<&'static dyn SocketWaitHooks> = spin::Once::new();
+
+/// Register kernel scheduler hooks for socket waits.
+///
+/// This should be called once during kernel initialization from kernel_core::init().
+/// Multiple calls are safe - only the first registration takes effect.
+///
+/// # Arguments
+/// * `hooks` - Static reference to a SocketWaitHooks implementation
+pub fn register_socket_wait_hooks(hooks: &'static dyn SocketWaitHooks) {
+    SOCKET_WAIT_HOOKS.call_once(|| hooks);
+}
+
+/// Get the registered wait hooks, if any.
+#[inline]
+fn socket_wait_hooks() -> Option<&'static dyn SocketWaitHooks> {
+    SOCKET_WAIT_HOOKS.get().copied()
+}
+
+/// Simple wait queue with optional scheduler integration.
+///
+/// When SocketWaitHooks are registered, this queue supports true blocking
+/// with timeout. Without hooks, only non-blocking polling is supported.
+///
+/// # Architecture
+///
+/// The queue maintains:
+/// - A closed flag to signal permanent closure
+/// - A wakeup counter for detecting spurious wakeups
+///
+/// Actual waiter tracking is delegated to the SocketWaitHooks implementation
+/// in kernel_core, which has access to the process table and scheduler.
 pub struct WaitQueue {
     /// Flag indicating if the queue is closed
     closed: AtomicBool,
@@ -103,40 +181,69 @@ impl WaitQueue {
     /// Wait with optional timeout.
     ///
     /// # Arguments
-    /// * `timeout_ns` - Timeout in nanoseconds. `Some(0)` means non-blocking poll.
-    ///   `None` means block indefinitely (not currently supported - returns TimedOut).
+    /// * `timeout_ns` - Timeout in nanoseconds.
+    ///   - `Some(0)`: Non-blocking poll (return immediately)
+    ///   - `Some(n)`: Block for up to n nanoseconds
+    ///   - `None`: Block indefinitely
     ///
     /// # Returns
-    /// - `WaitOutcome::Woken` if wakeup was signaled before the call
-    /// - `WaitOutcome::TimedOut` if polling and no data available
+    /// - `WaitOutcome::Woken` if wakeup was signaled
+    /// - `WaitOutcome::TimedOut` if timeout expired or non-blocking poll
     /// - `WaitOutcome::Closed` if the queue is closed
+    /// - `WaitOutcome::NoProcess` if no process context (kernel thread)
     pub fn wait_with_timeout(&self, timeout_ns: Option<u64>) -> WaitOutcome {
         // Check if closed
         if self.closed.load(Ordering::Acquire) {
             return WaitOutcome::Closed;
         }
 
-        // For now, we only support non-blocking polling
-        // True blocking would require kernel scheduler integration
-        match timeout_ns {
-            Some(0) => WaitOutcome::TimedOut, // Non-blocking poll: return immediately
-            Some(_) | None => {
-                // For blocking waits, we just return TimedOut for now
-                // This makes recv_from always behave as non-blocking
-                // TODO: Implement proper blocking with kernel scheduler hooks
-                WaitOutcome::TimedOut
-            }
+        // Non-blocking poll returns immediately
+        if timeout_ns == Some(0) {
+            return WaitOutcome::TimedOut;
+        }
+
+        // Consume any pending wake signal that arrived before we registered
+        // to avoid sleeping despite a ready datagram.
+        if self
+            .wakeup_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current > 0).then(|| current - 1)
+            })
+            .is_ok()
+        {
+            return WaitOutcome::Woken;
+        }
+
+        // Delegate to scheduler hooks for true blocking
+        if let Some(hooks) = socket_wait_hooks() {
+            hooks.wait(self, timeout_ns)
+        } else {
+            // No scheduler hooks registered - fall back to non-blocking
+            // This happens early in boot or in kernel threads
+            WaitOutcome::TimedOut
         }
     }
 
     /// Signal one waiter.
+    ///
+    /// Wakes the first blocked waiter (FIFO order). If no waiters are blocked,
+    /// increments the wakeup counter so the next wait() sees it.
     pub fn wake_one(&self) {
         self.wakeup_count.fetch_add(1, Ordering::Release);
+        if let Some(hooks) = socket_wait_hooks() {
+            hooks.wake_one(self);
+        }
     }
 
     /// Signal all waiters.
+    ///
+    /// Wakes all blocked waiters. If no waiters are blocked, increments the
+    /// wakeup counter.
     pub fn wake_all(&self) {
         self.wakeup_count.fetch_add(1, Ordering::Release);
+        if let Some(hooks) = socket_wait_hooks() {
+            hooks.wake_all(self);
+        }
     }
 
     /// Close the queue and prevent further waits.
@@ -326,6 +433,11 @@ pub struct SocketState {
     pub proto: SocketProtocol,
     /// Security label from creation
     pub label: SocketLabel,
+    /// Reference count for file descriptors referencing this socket.
+    ///
+    /// Initialized to 1 at creation. Incremented on dup()/fork(), decremented
+    /// on close(). Socket is only fully closed when refcount reaches 0.
+    refcount: AtomicU64,
     /// Binding/connection metadata
     meta: Mutex<SocketMeta>,
     /// Received datagram queue
@@ -373,6 +485,7 @@ impl SocketState {
             ty,
             proto,
             label,
+            refcount: AtomicU64::new(1),
             meta: Mutex::new(SocketMeta::new()),
             rx_queue: Mutex::new(VecDeque::new()),
             waiters: WaitQueue::new(),
@@ -389,6 +502,46 @@ impl SocketState {
     #[inline]
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// Increment the socket reference count.
+    ///
+    /// Called when a file descriptor is duplicated (dup/dup2/dup3) or when
+    /// forking a process that has socket file descriptors.
+    ///
+    /// Uses AcqRel ordering for symmetry with decrement_refcount() and to
+    /// ensure visibility of all modifications before the increment.
+    #[inline]
+    pub fn increment_refcount(&self) {
+        self.refcount.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Decrement the socket reference count and return the new count.
+    ///
+    /// Called when a file descriptor is closed. The socket should only be
+    /// fully closed (port released, waiters woken) when this returns 0.
+    ///
+    /// Uses `fetch_update` to prevent underflow: if the refcount is already 0
+    /// (which indicates a double-drop bug), we return 0 without modifying the
+    /// counter, avoiding wrap to `u64::MAX` which would leak the socket.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, panics if called with refcount == 0 (double-drop).
+    #[inline]
+    pub fn decrement_refcount(&self) -> u64 {
+        match self.refcount.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            if current == 0 {
+                // Debug: catch double-drop bugs early
+                debug_assert!(false, "socket refcount underflow: double-drop detected");
+                None // Don't modify - already at 0
+            } else {
+                Some(current - 1)
+            }
+        }) {
+            Ok(old) => old - 1, // Return new value (old - 1)
+            Err(_) => 0,        // Was already 0, return 0
+        }
     }
 
     /// Mark the socket as closed and wake all waiters.

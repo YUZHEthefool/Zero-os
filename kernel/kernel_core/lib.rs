@@ -128,6 +128,13 @@ pub fn init() {
     // This bridges the seccomp module to the process module for filter evaluation
     seccomp::register_current_hooks(evaluate_seccomp, has_seccomp_enabled);
 
+    // Register socket wait hooks for blocking recv support
+    // Must be after process::init since it needs process management
+    syscall::register_socket_hooks();
+
+    // Register socket timeout checker as timer callback
+    scheduler_hook::register_timer_callback(syscall::check_socket_timeouts);
+
     // R26-4 FIX: Register audit snapshot authorizer
     // Allow root (euid == 0) or processes with CAP_AUDIT_READ capability
     audit::register_snapshot_authorizer(|| {

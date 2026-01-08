@@ -265,6 +265,21 @@ const S_IFSOCK: u32 = 0o140000;
 
 impl crate::process::FileOps for SocketFile {
     fn clone_box(&self) -> alloc::boxed::Box<dyn crate::process::FileOps> {
+        // Increment refcount on clone (for dup/fork POSIX semantics).
+        //
+        // NOTE: If the socket was already closed/removed from the table,
+        // get() returns None and we create a SocketFile pointing to a dead
+        // socket. This is acceptable because:
+        // 1. Any operation on the dead socket will fail gracefully (EBADF)
+        // 2. Drop will do nothing (get() returns None again)
+        // 3. The FileOps trait doesn't allow returning errors from clone_box
+        //
+        // This edge case can occur if the socket is closed between dup/fork
+        // initiation and completion - a valid race condition in concurrent
+        // environments.
+        if let Some(sock) = net::socket_table().get(self.socket_id) {
+            sock.increment_refcount();
+        }
         alloc::boxed::Box::new(self.clone())
     }
 
@@ -298,32 +313,28 @@ impl crate::process::FileOps for SocketFile {
     }
 }
 
-/// R48-REVIEW FIX: Socket cleanup on Drop.
+/// Socket cleanup on Drop with reference counting.
 ///
-/// When a SocketFile is dropped (via sys_close or process exit), we must
-/// clean up the socket_table entry to prevent port leaks and memory exhaustion.
-/// This ensures:
-/// - Port binding is released for reuse
-/// - Socket memory is freed
-/// - Waiters are woken with WaitOutcome::Closed
+/// When a SocketFile is dropped (via sys_close or process exit), we decrement
+/// the socket's reference count. Only when the refcount reaches 0 do we fully
+/// close the socket, releasing the port binding and waking any waiters.
 ///
-/// **KNOWN LIMITATION (TODO)**: This implementation unconditionally closes the
-/// socket_table entry on any FD drop. This breaks POSIX semantics for:
-/// - dup()/dup2(): Multiple FDs sharing one socket; closing any closes all
-/// - fork(): Child inherits socket FDs; child exit closes parent's socket
+/// This preserves POSIX semantics for:
+/// - dup()/dup2()/dup3(): Multiple FDs can share one socket
+/// - fork(): Child inherits socket FDs with proper refcounting
 ///
-/// **FIX REQUIRED**: Implement reference counting in socket_table:
-/// - Add refcount to SocketState
-/// - sys_socket: refcount = 1
-/// - dup()/fork(): increment refcount
-/// - Drop: decrement refcount, only close() on 0
-///
-/// Current status: Safe for single-process, single-FD per socket patterns.
+/// The reference count is:
+/// - Initialized to 1 at socket creation
+/// - Incremented in clone_box() (called by dup/fork)
+/// - Decremented here on drop
 impl Drop for SocketFile {
     fn drop(&mut self) {
-        // TODO: Should only close when refcount reaches 0
-        // For now, unconditionally close (breaks dup/fork semantics)
-        net::socket_table().close(self.socket_id);
+        // Decrement refcount; only close when reaching 0
+        if let Some(sock) = net::socket_table().get(self.socket_id) {
+            if sock.decrement_refcount() == 0 {
+                net::socket_table().close(self.socket_id);
+            }
+        }
     }
 }
 
@@ -430,6 +441,344 @@ pub fn wake_stdin_waiters() {
             // 进程不存在或不在阻塞状态，继续检查下一个
         }
     });
+}
+
+// ============================================================================
+// Socket Wait Hooks Implementation (scheduler integration for net crate)
+// ============================================================================
+
+use alloc::collections::{BTreeMap, BTreeSet};
+
+/// Per-queue waiter tracking for socket blocking operations.
+///
+/// Uses the WaitQueue address as a unique identifier. Each queue maintains
+/// a FIFO list of waiting process IDs with optional timeout deadlines.
+struct SocketWaiters {
+    /// Map from queue address to list of (ProcessId, deadline_ticks)
+    /// Deadline is None for indefinite wait, Some(ticks) for timeout
+    waiters: BTreeMap<usize, VecDeque<(ProcessId, Option<u64>)>>,
+    /// Track timed-out waiters to report correct WaitOutcome.
+    ///
+    /// When a waiter times out (via check_timeouts or inline check), we add
+    /// their PID here. When wait() returns, it consumes this marker to
+    /// distinguish TimedOut from Woken (fixes race between timer and wake).
+    timed_out: BTreeSet<ProcessId>,
+}
+
+impl SocketWaiters {
+    const fn new() -> Self {
+        SocketWaiters {
+            waiters: BTreeMap::new(),
+            timed_out: BTreeSet::new(),
+        }
+    }
+
+    /// Add current process to wait queue.
+    fn add_waiter(&mut self, queue_addr: usize, pid: ProcessId, deadline: Option<u64>) {
+        self.waiters
+            .entry(queue_addr)
+            .or_insert_with(VecDeque::new)
+            .push_back((pid, deadline));
+    }
+
+    /// Remove a specific process from a queue (on wakeup or timeout).
+    fn remove_waiter(&mut self, queue_addr: usize, pid: ProcessId) -> bool {
+        if let Some(queue) = self.waiters.get_mut(&queue_addr) {
+            if let Some(pos) = queue.iter().position(|(p, _)| *p == pid) {
+                queue.remove(pos);
+                // Clean up empty queue entries
+                if queue.is_empty() {
+                    self.waiters.remove(&queue_addr);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Mark a process as timed out (for correct WaitOutcome reporting).
+    fn mark_timed_out(&mut self, pid: ProcessId) {
+        self.timed_out.insert(pid);
+    }
+
+    /// Consume the timeout marker for a process.
+    ///
+    /// Returns true if the process was marked as timed out (and removes the mark).
+    fn consume_timeout(&mut self, pid: ProcessId) -> bool {
+        self.timed_out.remove(&pid)
+    }
+
+    /// Wake one waiter from a queue (FIFO order).
+    fn wake_one(&mut self, queue_addr: usize) -> Option<ProcessId> {
+        if let Some(queue) = self.waiters.get_mut(&queue_addr) {
+            while let Some((pid, _)) = queue.pop_front() {
+                // Verify process still exists and is blocked
+                if let Some(proc_arc) = get_process(pid) {
+                    let mut proc = proc_arc.lock();
+                    if proc.state == ProcessState::Blocked {
+                        proc.state = ProcessState::Ready;
+                        // Clean up empty queue
+                        if queue.is_empty() {
+                            self.waiters.remove(&queue_addr);
+                        }
+                        return Some(pid);
+                    }
+                }
+                // Process gone or not blocked, try next
+            }
+            // All waiters invalid, clean up
+            self.waiters.remove(&queue_addr);
+        }
+        None
+    }
+
+    /// Wake all waiters from a queue.
+    fn wake_all(&mut self, queue_addr: usize) -> usize {
+        let mut woken = 0;
+        if let Some(mut queue) = self.waiters.remove(&queue_addr) {
+            while let Some((pid, _)) = queue.pop_front() {
+                if let Some(proc_arc) = get_process(pid) {
+                    let mut proc = proc_arc.lock();
+                    if proc.state == ProcessState::Blocked {
+                        proc.state = ProcessState::Ready;
+                        woken += 1;
+                    }
+                }
+            }
+        }
+        woken
+    }
+
+    /// Check and wake timed-out waiters. Called from timer interrupt.
+    ///
+    /// Also cleans up waiters for processes that have exited, preventing
+    /// memory leaks and stale entries in the waiter queues.
+    ///
+    /// Uses fixed-size stack buffer to avoid heap allocation in IRQ context.
+    fn check_timeouts(&mut self, current_ticks: u64) {
+        // Maximum timeouts processed per tick to avoid spending too long in IRQ
+        const MAX_TIMEOUTS_PER_TICK: usize = 16;
+
+        // Use stack array instead of Vec to avoid IRQ-context allocation
+        // Each entry: (queue_addr, pid, is_timeout vs is_exited)
+        let mut expired: [Option<(usize, ProcessId, bool)>; MAX_TIMEOUTS_PER_TICK] =
+            [None; MAX_TIMEOUTS_PER_TICK];
+        let mut count = 0;
+
+        // Collect expired or exited waiters
+        for (&queue_addr, queue) in self.waiters.iter() {
+            for &(pid, deadline) in queue.iter() {
+                if count >= MAX_TIMEOUTS_PER_TICK {
+                    break; // Will catch remaining on next tick
+                }
+                let is_timeout = deadline.map(|dl| current_ticks >= dl).unwrap_or(false);
+                let is_exited = get_process(pid).is_none();
+                if is_timeout || is_exited {
+                    expired[count] = Some((queue_addr, pid, is_timeout));
+                    count += 1;
+                }
+            }
+        }
+
+        // Wake expired waiters and drop entries for dead processes
+        let mut queues_to_clean: [Option<usize>; MAX_TIMEOUTS_PER_TICK] =
+            [None; MAX_TIMEOUTS_PER_TICK];
+        let mut clean_count = 0;
+
+        for entry in expired.iter().take(count).flatten() {
+            let (queue_addr, pid, is_timeout) = *entry;
+
+            if let Some(queue) = self.waiters.get_mut(&queue_addr) {
+                if let Some(pos) = queue.iter().position(|(p, _)| *p == pid) {
+                    queue.remove(pos);
+
+                    // Mark as timed out for correct WaitOutcome (only if timeout, not exit)
+                    if is_timeout {
+                        self.timed_out.insert(pid);
+                    }
+
+                    // Wake the process if it still exists
+                    if let Some(proc_arc) = get_process(pid) {
+                        let mut proc = proc_arc.lock();
+                        if proc.state == ProcessState::Blocked {
+                            proc.state = ProcessState::Ready;
+                        }
+                    }
+
+                    // Track queues that may need cleanup
+                    if queue.is_empty() && clean_count < MAX_TIMEOUTS_PER_TICK {
+                        queues_to_clean[clean_count] = Some(queue_addr);
+                        clean_count += 1;
+                    }
+                }
+            }
+        }
+
+        // Clean up empty queues (separate pass to avoid borrow issues)
+        for addr in queues_to_clean.iter().take(clean_count).flatten() {
+            if let Some(queue) = self.waiters.get(addr) {
+                if queue.is_empty() {
+                    self.waiters.remove(addr);
+                }
+            }
+        }
+
+        // Clean up stale timeout markers for exited processes (prevents PID reuse issues)
+        // Only do this periodically to avoid overhead on every tick
+        if current_ticks % 100 == 0 {
+            self.timed_out.retain(|pid| get_process(*pid).is_some());
+        }
+    }
+}
+
+/// Global socket waiter tracking.
+static SOCKET_WAITERS: spin::Mutex<SocketWaiters> = spin::Mutex::new(SocketWaiters::new());
+
+/// Kernel implementation of SocketWaitHooks trait.
+///
+/// Provides true blocking waits with scheduler integration and timeout support.
+pub struct KernelSocketWaitHooks;
+
+impl net::SocketWaitHooks for KernelSocketWaitHooks {
+    fn wait(&self, queue: &net::WaitQueue, timeout_ns: Option<u64>) -> net::WaitOutcome {
+        // Get current process
+        let pid = match current_pid() {
+            Some(p) => p,
+            None => return net::WaitOutcome::NoProcess,
+        };
+
+        // Calculate deadline in ticks (if timeout specified)
+        // Timer tick is 1ms (time::on_timer_tick increments every millisecond)
+        const NS_PER_TICK: u64 = 1_000_000;
+        let deadline = timeout_ns.map(|ns| {
+            let current = crate::get_ticks();
+            let ticks = (ns + NS_PER_TICK - 1) / NS_PER_TICK; // Round up
+            current.saturating_add(ticks)
+        });
+
+        // Queue address as unique identifier
+        let queue_addr = queue as *const _ as usize;
+
+        // Phase 1: Add to wait queue and mark blocked (with interrupts disabled)
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut waiters = SOCKET_WAITERS.lock();
+
+            // Avoid duplicate entries
+            if let Some(q) = waiters.waiters.get(&queue_addr) {
+                if q.iter().any(|(p, _)| *p == pid) {
+                    return; // Already waiting
+                }
+            }
+
+            waiters.add_waiter(queue_addr, pid, deadline);
+
+            // Mark process as blocked
+            if let Some(proc_arc) = get_process(pid) {
+                let mut proc = proc_arc.lock();
+                proc.state = ProcessState::Blocked;
+            }
+        });
+
+        // Phase 2: Yield CPU and wait for wakeup
+        crate::force_reschedule();
+
+        // Phase 3: HLT loop waiting for interrupt (if no other process to run)
+        loop {
+            let should_continue = x86_64::instructions::interrupts::without_interrupts(|| {
+                if let Some(proc_arc) = get_process(pid) {
+                    let proc = proc_arc.lock();
+                    if proc.state != ProcessState::Blocked {
+                        return false; // Woken up
+                    }
+                } else {
+                    return false; // Process gone
+                }
+
+                // Check if closed
+                if queue.is_closed() {
+                    // Remove from wait queue
+                    SOCKET_WAITERS.lock().remove_waiter(queue_addr, pid);
+                    // Mark ready so we can return
+                    if let Some(proc_arc) = get_process(pid) {
+                        proc_arc.lock().state = ProcessState::Ready;
+                    }
+                    return false;
+                }
+
+                // Check timeout
+                if let Some(dl) = deadline {
+                    if crate::get_ticks() >= dl {
+                        // Timeout expired - mark and remove
+                        let mut waiters = SOCKET_WAITERS.lock();
+                        waiters.remove_waiter(queue_addr, pid);
+                        waiters.mark_timed_out(pid);
+                        if let Some(proc_arc) = get_process(pid) {
+                            proc_arc.lock().state = ProcessState::Ready;
+                        }
+                        return false;
+                    }
+                }
+
+                true // Continue waiting
+            });
+
+            if !should_continue {
+                break;
+            }
+
+            // Wait for interrupt (timer or network)
+            x86_64::instructions::interrupts::enable_and_hlt();
+        }
+
+        // Determine outcome using timeout marker (fixes race between timer and wake)
+        if queue.is_closed() {
+            // Consume any stale timeout marker
+            SOCKET_WAITERS.lock().consume_timeout(pid);
+            return net::WaitOutcome::Closed;
+        }
+
+        // Check if we were marked as timed out (by timer callback or inline check)
+        if SOCKET_WAITERS.lock().consume_timeout(pid) {
+            return net::WaitOutcome::TimedOut;
+        }
+
+        net::WaitOutcome::Woken
+    }
+
+    fn wake_one(&self, queue: &net::WaitQueue) {
+        let queue_addr = queue as *const _ as usize;
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            SOCKET_WAITERS.lock().wake_one(queue_addr);
+        });
+    }
+
+    fn wake_all(&self, queue: &net::WaitQueue) {
+        let queue_addr = queue as *const _ as usize;
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            SOCKET_WAITERS.lock().wake_all(queue_addr);
+        });
+    }
+}
+
+/// Static instance of KernelSocketWaitHooks for registration.
+static KERNEL_SOCKET_WAIT_HOOKS: KernelSocketWaitHooks = KernelSocketWaitHooks;
+
+/// Register socket wait hooks with the net crate.
+///
+/// Called during kernel initialization after process module is ready.
+pub fn register_socket_hooks() {
+    net::register_socket_wait_hooks(&KERNEL_SOCKET_WAIT_HOOKS);
+}
+
+/// Timer callback to check socket wait timeouts.
+///
+/// Called from scheduler tick to wake processes whose timeouts have expired.
+pub fn check_socket_timeouts() {
+    let current_ticks = crate::get_ticks();
+    // Use try_lock to avoid blocking in IRQ context
+    if let Some(mut waiters) = SOCKET_WAITERS.try_lock() {
+        waiters.check_timeouts(current_ticks);
+    }
 }
 
 /// 最大参数总字节数（argv + envp 字符串总大小上限）

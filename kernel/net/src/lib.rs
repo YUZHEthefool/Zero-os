@@ -79,8 +79,9 @@ pub use udp::{
     UdpError, UdpHeader, UdpResult, UdpStats, UDP_HEADER_LEN, UDP_PROTO,
 };
 pub use socket::{
-    socket_table, PendingDatagram, SocketDomain, SocketError, SocketLabel, SocketProtocol,
-    SocketState, SocketStats, SocketTable, SocketType, TableStats,
+    socket_table, register_socket_wait_hooks, PendingDatagram, SocketDomain, SocketError,
+    SocketLabel, SocketProtocol, SocketState, SocketStats, SocketTable, SocketType,
+    SocketWaitHooks, TableStats, WaitOutcome, WaitQueue,
 };
 
 // ============================================================================
