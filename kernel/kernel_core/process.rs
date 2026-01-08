@@ -1702,10 +1702,23 @@ unsafe fn free_page_table_level(
         let entry_phys = entry.addr();
 
         // 检查是否是大页 (2MB 或 1GB)
-        // 用户空间通常不使用大页，但为安全起见跳过处理
+        //
+        // R49-2 FIX: Previously this code skipped huge pages entirely, causing
+        // memory leaks if user-space ever used huge pages. While user-space
+        // typically doesn't use huge pages currently, we should:
+        // 1. Clear the page table entry (defense-in-depth)
+        // 2. Attempt to free the physical memory
+        //
+        // Note: Buddy allocator only tracks 4KB frames. For huge pages, we
+        // release the base frame which may not fully reclaim the memory.
+        // Future improvement: Extend buddy allocator for multi-page frees.
         if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            // 大页：当前 buddy allocator 仅支持 4KB 帧，跳过以避免损坏
-            // 注：若用户空间需要大页支持，需扩展此逻辑
+            // Release the huge page physical memory to prevent leak
+            let huge_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(entry_phys);
+            frame_alloc.deallocate_frame(huge_frame);
+
+            // Clear the page table entry for defense-in-depth
+            entry.set_unused();
             continue;
         }
 

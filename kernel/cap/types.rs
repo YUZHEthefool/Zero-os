@@ -225,11 +225,14 @@ bitflags::bitflags! {
         const MAP         = 1 << 5;
         const MAP_EXEC    = 1 << 6;
 
-        // Network rights (bits 7-10)
+        // Network rights (bits 7-10, 14)
         const BIND        = 1 << 7;
         const CONNECT     = 1 << 8;
         const LISTEN      = 1 << 9;
         const ACCEPT      = 1 << 10;
+        /// Bind to privileged ports (< 1024). Equivalent to Linux CAP_NET_BIND_SERVICE.
+        /// This is an ambient authority checked via has_rights(), not per-socket.
+        const NET_BIND_SERVICE = 1 << 14;
 
         // Process rights (bits 11-13)
         const SIGNAL      = 1 << 11;

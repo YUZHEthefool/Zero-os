@@ -9,8 +9,8 @@
 
 use crate::fork::PAGE_REF_COUNT;
 use crate::process::{
-    cleanup_zombie, create_process, current_pid, get_process, terminate_process, ProcessId,
-    ProcessState,
+    cleanup_zombie, create_process, current_pid, get_process, terminate_process,
+    with_current_cap_table, ProcessId, ProcessState,
 };
 use crate::usercopy::UserAccessGuard;
 use alloc::string::{String, ToString};
@@ -5844,7 +5844,7 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
 /// # Security
 /// - Verifies CapRights::BIND
 /// - Invokes LSM hook_net_bind for policy check
-/// - Ports < 1024 require euid == 0
+/// - Ports < 1024 require euid == 0 or NET_BIND_SERVICE capability
 fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
     let (cap_id, socket_id, _nonblock) = socket_handle_from_fd(fd)?;
     let (entry, socket) = resolve_socket(cap_id, socket_id)?;
@@ -5866,6 +5866,20 @@ fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
     // Get current process context for LSM check
     let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
 
+    // R49-3 FIX: Compute privileged port binding permission
+    // Can bind to privileged ports if: root (euid == 0) OR has NET_BIND_SERVICE capability
+    let has_net_bind_cap = with_current_cap_table(|table| {
+        table.has_rights(cap::CapRights::NET_BIND_SERVICE)
+    })
+    .unwrap_or(false);
+    let can_bind_privileged = ctx.euid == 0 || has_net_bind_cap;
+
+    // Early check for privileged port access
+    const PRIVILEGED_PORT_LIMIT: u16 = 1024;
+    if port != 0 && port < PRIVILEGED_PORT_LIMIT && !can_bind_privileged {
+        return Err(SyscallError::EACCES);
+    }
+
     // Bind via socket_table (includes LSM hook_net_bind check)
     net::socket_table()
         .bind_udp(
@@ -5874,6 +5888,7 @@ fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
             cap_id,
             ip,
             if port == 0 { None } else { Some(port) },
+            can_bind_privileged,
         )
         .map_err(socket_error_to_syscall)?;
 

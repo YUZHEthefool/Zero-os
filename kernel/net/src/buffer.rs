@@ -68,6 +68,14 @@ unsafe impl Sync for NetBuf {}
 /// the buddy allocator. Without this Drop impl, a malicious device could
 /// repeatedly trigger error paths to exhaust physical memory.
 ///
+/// # R49-1 FIX: Zero page before release to prevent information leak.
+///
+/// Network buffers may contain sensitive data (credentials, tokens, private
+/// communications). When dropped via error paths (not through BufPool::free
+/// which calls reset()), the page must be zeroed before returning to the
+/// allocator. Otherwise, the next user of this physical page could read
+/// residual network data, causing cross-process information disclosure.
+///
 /// # Safety
 ///
 /// This impl assumes that `phys_base` always refers to a valid, owned physical
@@ -75,7 +83,18 @@ unsafe impl Sync for NetBuf {}
 /// maintained by the constructor which only accepts valid PhysFrame values.
 impl Drop for NetBuf {
     fn drop(&mut self) {
-        // Return the physical page to the buddy allocator
+        // R49-1 FIX: Zero the entire page before returning to prevent
+        // information leakage. Network buffers often contain sensitive
+        // data that must not be exposed to subsequent page users.
+        //
+        // Note: Normal recycle path (BufPool::free) already calls reset()
+        // which zeroes the buffer. This is defense-in-depth for error paths.
+        unsafe {
+            let virt = phys_to_virt(self.phys_base);
+            core::ptr::write_bytes(virt, 0, 4096);
+        }
+
+        // Return the zeroed page to the buddy allocator
         let frame = PhysFrame::containing_address(self.phys_base);
         mm::buddy_allocator::free_physical_pages(frame, 1);
     }

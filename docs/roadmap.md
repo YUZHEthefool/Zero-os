@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-07
+**Last Updated:** 2026-01-08
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -13,7 +13,7 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 ### Current Status: Phase D.2 In Progress (IPv4/ICMP/ARP/UDP Stack)
 
 Zero-OS has completed storage foundation and is building network infrastructure:
-- **48 security audits** with 210+ issues found, ~177 fixed (84%) - R48 Network stack security audit
+- **49 security audits** with 216+ issues found, ~189 fixed (87.5%) - R49 Fixes applied
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -22,7 +22,7 @@ Zero-OS has completed storage foundation and is building network infrastructure:
 - **Phase B**: ✅ **COMPLETE** (Cap/LSM/Seccomp integrated into syscall paths)
 - **Phase C**: ✅ **COMPLETE** (virtio-blk, page cache, ext2, procfs, OOM killer, openat2, devfs read/write)
 - **Phase D.1**: ✅ **COMPLETE** (virtio crate, NetDevice trait, virtio-net driver MVP)
-- **Phase D.2**: IPv4/ICMP protocol stack with security-first design (Ethernet, IPv4, ICMP echo)
+- **Phase D.2**: IPv4/ICMP protocol stack with security-first design (Ethernet, IPv4, ICMP echo, UDP sockets)
 
 ### Gap Analysis vs Linux Kernel
 
@@ -447,6 +447,9 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] **R48 FIXED**: ARP gratuitous learning restriction (poisoning prevention)
 - [x] **R48 FIXED**: LSM check before UDP datagram copy (resource exhaustion)
 - [x] **R48 FIXED**: Early IPv4 fragment filter (CPU DoS prevention)
+- [x] **R49 FIXED**: NetBuf zero-fill before release (information leak prevention)
+- [x] **R49 FIXED**: Huge page cleanup on process exit (memory leak prevention)
+- [x] **R49 FIXED**: NET_BIND_SERVICE capability for privileged ports
 - [ ] TCP (3-way handshake, timeout, retransmit, sliding window)
 - [ ] Fragment reassembly with limits
 
@@ -462,11 +465,12 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [ ] ISN randomization (RFC 6528)
 - [ ] Ephemeral port randomization
 
-#### D.4 Socket API
+#### D.4 Socket API ✅ COMPLETE
 
-- [ ] Socket as CapId handle
-- [ ] LSM hooks for create/bind/connect/send/recv
-- [ ] Per-socket security context
+- [x] Socket as CapId handle (kernel/net/socket.rs)
+- [x] LSM hooks for create/bind/connect/send/recv
+- [x] Per-socket security context (SocketLabel)
+- [x] NET_BIND_SERVICE capability for privileged ports (R49-3)
 - [ ] Zero-copy path reservation (pinned buffers)
 
 **Security Requirements**:

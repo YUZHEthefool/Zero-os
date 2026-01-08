@@ -760,12 +760,15 @@ impl SocketTable {
     /// * `cap_id` - Capability used for this operation
     /// * `ip` - Local IP address
     /// * `port` - Port number (None for ephemeral)
+    /// * `can_bind_privileged` - Whether caller can bind to privileged ports
+    ///                           (euid == 0 or NET_BIND_SERVICE capability)
     ///
     /// # Security
     ///
     /// - Invokes `hook_net_bind` for LSM policy check
-    /// - Ports < 1024 require current euid == 0 or CAP_NET_BIND_SERVICE
+    /// - Ports < 1024 require can_bind_privileged == true
     /// - R47-1 FIX: Uses current creds, not creation creds
+    /// - R49-3 FIX: Respects NET_BIND_SERVICE capability via flag
     ///
     /// # Returns
     ///
@@ -777,6 +780,7 @@ impl SocketTable {
         cap_id: CapId,
         ip: Ipv4Addr,
         port: Option<u16>,
+        can_bind_privileged: bool,
     ) -> Result<u16, SocketError> {
         // Validate socket type
         if sock.ty != SocketType::Dgram || sock.proto != SocketProtocol::Udp {
@@ -790,10 +794,9 @@ impl SocketTable {
 
         // Determine port
         let chosen_port = if let Some(p) = port {
-            // R47-1 FIX: Check privileged port permission using CURRENT creds
-            // Ports < 1024 require root (euid == 0) at bind time
-            // TODO: Also check CAP_NET_BIND_SERVICE capability
-            if p < PRIVILEGED_PORT_LIMIT && current.euid != 0 {
+            // R49-3 FIX: Privileged port check uses flag from syscall layer
+            // This ensures NET_BIND_SERVICE capability is properly honored
+            if p < PRIVILEGED_PORT_LIMIT && !can_bind_privileged {
                 return Err(SocketError::PrivilegedPort);
             }
             p
@@ -878,8 +881,9 @@ impl SocketTable {
         let local_port = match sock.local_port() {
             Some(p) => p,
             None => {
-                // Auto-bind to ephemeral port (uses current creds)
-                self.bind_udp(sock, current, cap_id, src_ip, None)?
+                // Auto-bind to ephemeral port - no privilege needed for ephemeral ports
+                // (ephemeral range is 49152-65535, well above privileged port limit)
+                self.bind_udp(sock, current, cap_id, src_ip, None, false)?
             }
         };
 
