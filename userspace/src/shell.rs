@@ -42,11 +42,12 @@
 #![no_std]
 #![no_main]
 
-use core::mem;
+use core::{cmp, mem, ptr};
 use userspace::libc::{getchar, print, print_int, println, putchar, strncmp};
 use userspace::syscall::{
-    is_error, sys_chdir, sys_close, sys_exit, sys_getcwd, sys_getdents64, sys_getpid, sys_getppid,
-    sys_open, sys_read, sys_stat, sys_uname, sys_write, Dirent64, Stat, UtsName,
+    is_error, parse_ipv4, sys_chdir, sys_close, sys_connect, sys_exit, sys_getcwd, sys_getdents64,
+    sys_getpid, sys_getppid, sys_open, sys_read, sys_recvfrom, sys_sendto, sys_socket, sys_stat,
+    sys_uname, sys_write, Dirent64, SockAddrIn, Stat, UtsName, AF_INET, IPPROTO_TCP, SOCK_STREAM,
 };
 
 /// Maximum command line length
@@ -96,6 +97,7 @@ Available commands:\n\
   stat  - Show file status (stat <file>)\n\
   ps    - List processes from /proc\n\
   free  - Show memory info from /proc/meminfo\n\
+  tcp   - TCP client test (tcp <ip> <port> <message>)\n\
   uname - Show system information\n\
   exit  - Exit shell\n\
 ";
@@ -237,6 +239,10 @@ fn execute_command(cmd: &[u8]) {
             do_ps();
         } else if strncmp(cmd.as_ptr(), b"free\0".as_ptr(), 4) == 0 && is_end(cmd, 4) {
             do_free();
+        } else if strncmp(cmd.as_ptr(), b"tcp \0".as_ptr(), 4) == 0 {
+            do_tcp(&cmd[4..]);
+        } else if strncmp(cmd.as_ptr(), b"tcp\0".as_ptr(), 3) == 0 && is_end(cmd, 3) {
+            println("tcp: usage: tcp <ip> <port> <message>");
         } else if strncmp(cmd.as_ptr(), b"uname\0".as_ptr(), 5) == 0 && is_end(cmd, 5) {
             do_uname();
         } else if strncmp(cmd.as_ptr(), b"exit\0".as_ptr(), 4) == 0 && is_end(cmd, 4) {
@@ -629,6 +635,172 @@ fn do_free() {
     if !stream_file(b"/proc/meminfo\0".as_ptr()) {
         println("free: unable to read /proc/meminfo");
     }
+}
+
+/// TCP client test: connect, send message, receive response.
+///
+/// Usage: tcp <ip> <port> <message>
+///
+/// Creates a TCP socket, connects to the specified server,
+/// sends the message, waits for a response, and prints it.
+fn do_tcp(args: &[u8]) {
+    let mut idx = 0usize;
+
+    // Skip leading whitespace and parse IP address
+    while idx < args.len() && (args[idx] == b' ' || args[idx] == b'\t') {
+        idx += 1;
+    }
+    let ip_start = idx;
+    while idx < args.len() && args[idx] != 0 && args[idx] != b' ' && args[idx] != b'\t' {
+        idx += 1;
+    }
+    if ip_start == idx {
+        println("tcp: missing ip address");
+        return;
+    }
+    let ip_slice = &args[ip_start..idx];
+
+    // Parse port number
+    while idx < args.len() && (args[idx] == b' ' || args[idx] == b'\t') {
+        idx += 1;
+    }
+    let port_start = idx;
+    while idx < args.len() && args[idx] != 0 && args[idx] != b' ' && args[idx] != b'\t' {
+        idx += 1;
+    }
+    if port_start == idx {
+        println("tcp: missing port");
+        return;
+    }
+    let port_slice = &args[port_start..idx];
+
+    // Parse message (rest of the line)
+    while idx < args.len() && (args[idx] == b' ' || args[idx] == b'\t') {
+        idx += 1;
+    }
+    let msg_start = idx;
+    while idx < args.len() && args[idx] != 0 {
+        idx += 1;
+    }
+    let msg_slice = &args[msg_start..idx];
+    if msg_slice.is_empty() {
+        println("tcp: missing message");
+        return;
+    }
+
+    // Convert IP address
+    let ip = match parse_ipv4(ip_slice) {
+        Some(ip) => ip,
+        None => {
+            println("tcp: invalid ip address");
+            return;
+        }
+    };
+
+    // Convert port number
+    let mut port_val: u32 = 0;
+    let mut saw_digit = false;
+    for &c in port_slice {
+        if c == 0 || c == b' ' || c == b'\t' {
+            break;
+        }
+        if c < b'0' || c > b'9' {
+            println("tcp: invalid port number");
+            return;
+        }
+        saw_digit = true;
+        port_val = port_val * 10 + (c - b'0') as u32;
+        if port_val > u16::MAX as u32 {
+            println("tcp: port number too large");
+            return;
+        }
+    }
+    if !saw_digit || port_val == 0 {
+        println("tcp: invalid port number");
+        return;
+    }
+    let port = port_val as u16;
+
+    // Create TCP socket
+    print("Creating TCP socket... ");
+    let sock = unsafe { sys_socket(AF_INET as i32, SOCK_STREAM as i32, IPPROTO_TCP as i32) };
+    if is_error(sock) {
+        println("FAILED");
+        return;
+    }
+    println("OK");
+
+    // Build destination address (network byte order)
+    let sockaddr = SockAddrIn::new(ip, port);
+
+    // Connect to server
+    print("Connecting to ");
+    for i in 0..4 {
+        print_int(ip[i] as i64);
+        if i < 3 {
+            print(".");
+        }
+    }
+    print(":");
+    print_int(port as i64);
+    print("... ");
+
+    let conn = unsafe { sys_connect(sock as i32, &sockaddr, mem::size_of::<SockAddrIn>() as u32) };
+    if is_error(conn) {
+        println("FAILED");
+        let _ = unsafe { sys_close(sock) };
+        return;
+    }
+    println("CONNECTED");
+
+    // Send message (TCP uses sendto with null dest_addr)
+    print("Sending ");
+    print_int(msg_slice.len() as i64);
+    print(" bytes... ");
+
+    let sent = unsafe {
+        sys_sendto(sock as i32, msg_slice.as_ptr(), msg_slice.len(), 0, ptr::null(), 0)
+    };
+    if is_error(sent) {
+        println("FAILED");
+        let _ = unsafe { sys_close(sock) };
+        return;
+    }
+    print_int(sent as i64);
+    println(" bytes sent");
+
+    // Receive response (TCP uses recvfrom with null src_addr)
+    print("Waiting for response... ");
+    let mut buf = [0u8; READ_BUF_SIZE];
+    let recv = unsafe {
+        sys_recvfrom(sock as i32, buf.as_mut_ptr(), buf.len(), 0, ptr::null_mut(), ptr::null_mut())
+    };
+    if is_error(recv) {
+        println("FAILED");
+        let _ = unsafe { sys_close(sock) };
+        return;
+    }
+
+    if recv == 0 {
+        println("connection closed by peer");
+        let _ = unsafe { sys_close(sock) };
+        return;
+    }
+
+    print_int(recv as i64);
+    println(" bytes received");
+
+    // Print response
+    let received = cmp::min(recv as usize, buf.len());
+    print("Response: ");
+    for i in 0..received {
+        putchar(buf[i]);
+    }
+    println("");
+
+    // Close socket
+    let _ = unsafe { sys_close(sock) };
+    println("Connection closed");
 }
 
 /// Show system uname info.

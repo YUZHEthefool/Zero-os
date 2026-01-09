@@ -890,7 +890,14 @@ pub enum SyscallError {
     EAFNOSUPPORT = -97,   // 地址族不支持
     EADDRINUSE = -98,     // 地址已被使用
     EADDRNOTAVAIL = -99,  // 无法分配请求的地址
-    ETIMEDOUT = -110, // R39-6 FIX: 操作超时
+    ENETDOWN = -100,      // 网络不可用
+    ECONNREFUSED = -111,  // 连接被拒绝
+    EISCONN = -106,       // 套接字已连接
+    ENOTCONN = -107,      // 传输端点未连接
+    ETIMEDOUT = -110,     // R39-6 FIX: 操作超时
+    EALREADY = -114,      // 操作已经在进行
+    EINPROGRESS = -115,   // 操作正在进行
+    EOPNOTSUPP = -95,     // 操作不支持
 }
 
 impl SyscallError {
@@ -1521,11 +1528,27 @@ fn socket_error_to_syscall(err: net::SocketError) -> SyscallError {
         net::SocketError::NoPorts => SyscallError::EAGAIN,
         net::SocketError::NotBound => SyscallError::EDESTADDRREQ,
         net::SocketError::Closed | net::SocketError::NotFound => SyscallError::EBADF,
-        net::SocketError::Timeout => SyscallError::EAGAIN,
+        net::SocketError::Timeout => SyscallError::ETIMEDOUT,
         net::SocketError::NoProcess => SyscallError::ESRCH,
+        net::SocketError::AlreadyConnected => SyscallError::EISCONN,
+        net::SocketError::InProgress => SyscallError::EINPROGRESS,
+        net::SocketError::InvalidState => SyscallError::ENOTCONN,
         net::SocketError::Udp(net::UdpError::PayloadTooLarge) => SyscallError::EMSGSIZE,
         net::SocketError::Udp(_) => SyscallError::EINVAL,
         net::SocketError::Lsm(e) => lsm_error_to_syscall(e),
+    }
+}
+
+/// Map network TX errors to syscall errno values.
+///
+/// Used when transmitting TCP segments or UDP datagrams via the network device.
+#[inline]
+fn tx_error_to_syscall(err: net::TxError) -> SyscallError {
+    match err {
+        net::TxError::QueueFull => SyscallError::EAGAIN,
+        net::TxError::LinkDown => SyscallError::ENETDOWN,
+        net::TxError::InvalidBuffer => SyscallError::EINVAL,
+        net::TxError::IoError => SyscallError::EIO,
     }
 }
 
@@ -1806,6 +1829,7 @@ pub fn syscall_dispatcher(
 
         // 套接字 (Socket syscalls - Linux x86_64 ABI)
         41 => sys_socket(arg0 as i32, arg1 as i32, arg2 as i32),
+        42 => sys_connect(arg0 as i32, arg1 as *const SockAddrIn, arg2 as u32),
         49 => sys_bind(arg0 as i32, arg1 as *const SockAddrIn, arg2 as u32),
         44 => sys_sendto(
             arg0 as i32,
@@ -5780,28 +5804,39 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
     let clean_ty = raw_ty & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
     let ty = net::SocketType::from_raw(clean_ty).ok_or(SyscallError::EPROTOTYPE)?;
 
-    // Parse protocol
-    let proto = net::SocketProtocol::from_raw(protocol as u32)
+    // Parse protocol (infers default from socket type)
+    let proto = net::SocketProtocol::from_raw(protocol as u32, ty)
         .ok_or(SyscallError::EPROTONOSUPPORT)?;
 
-    // Currently only support AF_INET + SOCK_DGRAM + UDP
+    // Currently only support AF_INET
     if domain_val != net::SocketDomain::Inet4 {
         return Err(SyscallError::EAFNOSUPPORT);
     }
-    if ty != net::SocketType::Dgram {
-        return Err(SyscallError::EPROTOTYPE);
-    }
-    if proto != net::SocketProtocol::Udp {
-        return Err(SyscallError::EPROTONOSUPPORT);
+
+    // Validate socket type and protocol combinations
+    match (ty, proto) {
+        (net::SocketType::Dgram, net::SocketProtocol::Udp) => {}
+        (net::SocketType::Stream, net::SocketProtocol::Tcp) => {}
+        _ => return Err(SyscallError::EPROTONOSUPPORT),
     }
 
     // Get security label from current process
     let label = net::SocketLabel::from_current(0).ok_or(SyscallError::ESRCH)?;
 
     // Create socket via socket_table (includes LSM hook_net_socket check)
-    let socket = net::socket_table()
-        .create_udp_socket(label)
-        .map_err(socket_error_to_syscall)?;
+    let socket = match (ty, proto) {
+        (net::SocketType::Dgram, net::SocketProtocol::Udp) => {
+            net::socket_table()
+                .create_udp_socket(label)
+                .map_err(socket_error_to_syscall)?
+        }
+        (net::SocketType::Stream, net::SocketProtocol::Tcp) => {
+            net::socket_table()
+                .create_tcp_socket(label)
+                .map_err(socket_error_to_syscall)?
+        }
+        _ => return Err(SyscallError::EPROTONOSUPPORT),
+    };
 
     // Create capability entry
     let cap_flags = if cloexec {
@@ -5895,6 +5930,110 @@ fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
     Ok(0)
 }
 
+/// sys_connect - Connect a TCP socket (syscall 42).
+///
+/// Initiates a TCP three-way handshake for stream sockets.
+///
+/// # Arguments
+/// * `fd` - Socket file descriptor
+/// * `addr` - Pointer to sockaddr_in with destination address
+/// * `addrlen` - Length of address structure
+///
+/// # Security
+/// - Verifies CapRights::WRITE for sending SYN
+/// - Verifies CapRights::BIND if socket not yet bound (auto-bind)
+/// - Invokes LSM hook_net_send for policy check
+///
+/// # Returns
+/// - 0 on success (connection established or in progress)
+/// - EINPROGRESS for non-blocking sockets when handshake is in progress
+/// - EISCONN if already connected
+fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
+    let (cap_id, socket_id, nonblock) = socket_handle_from_fd(fd)?;
+    let (entry, socket) = resolve_socket(cap_id, socket_id)?;
+
+    // Only stream sockets are supported for connect()
+    if socket.ty != net::SocketType::Stream || socket.proto != net::SocketProtocol::Tcp {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+
+    // WRITE right required to transmit SYN
+    if !entry.rights.allows(cap::CapRights::WRITE) {
+        return Err(SyscallError::EACCES);
+    }
+
+    // BIND right required if auto-bind is needed
+    if socket.local_port().is_none() && !entry.rights.allows(cap::CapRights::BIND) {
+        return Err(SyscallError::EACCES);
+    }
+
+    // Read destination address
+    let dest = read_sockaddr_in(addr, addrlen)?;
+    if dest.sin_family != AF_INET as u16 {
+        return Err(SyscallError::EAFNOSUPPORT);
+    }
+    let dst_port = dest.port();
+    if dst_port == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    let dst_ip = net::Ipv4Addr(dest.ip_bytes());
+
+    // Current process context for LSM
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
+
+    // Source IP: use bound value if present, else 0.0.0.0 placeholder
+    // The actual source IP will be determined by routing (future enhancement)
+    let src_ip = socket
+        .local_ip()
+        .map(net::Ipv4Addr)
+        .unwrap_or(net::Ipv4Addr([0, 0, 0, 0]));
+
+    // Non-blocking connect uses zero timeout to get EINPROGRESS
+    // Blocking connect uses a reasonable timeout to avoid indefinite blocks
+    const TCP_CONNECT_TIMEOUT_NS: u64 = 5_000_000_000; // 5 seconds (for testing)
+
+    // Phase 1: Build SYN segment and install TCB (always non-blocking first)
+    // We use timeout=Some(0) to just build the segment without waiting
+    let syn_result = net::socket_table()
+        .connect(&socket, &ctx, cap_id, src_ip, dst_ip, dst_port, Some(0))
+        .map_err(socket_error_to_syscall)?;
+
+    // Phase 2: Transmit the SYN segment via network device
+    net::transmit_tcp_segment(syn_result.dst_ip, &syn_result.segment)
+        .map_err(tx_error_to_syscall)?;
+
+    // Non-blocking connect returns EINPROGRESS after sending SYN
+    if nonblock {
+        return Err(SyscallError::EINPROGRESS);
+    }
+
+    // Phase 3: Blocking connect - wait for connection to complete
+    // Poll the TCP state with the specified timeout
+    let start_ticks = crate::time::get_ticks();
+    let timeout_ticks = TCP_CONNECT_TIMEOUT_NS / 1_000_000; // Convert ns to ms (1 tick = ~1ms)
+
+    loop {
+        // Check if connection established
+        match socket.tcp_state() {
+            Some(net::TcpState::Established) => return Ok(0),
+            Some(net::TcpState::Closed) => return Err(SyscallError::ECONNREFUSED),
+            _ => {}
+        }
+
+        // Check timeout
+        let elapsed = crate::time::get_ticks() - start_ticks;
+        if elapsed > timeout_ticks {
+            return Err(SyscallError::ETIMEDOUT);
+        }
+
+        // Yield to allow RX processing
+        unsafe {
+            core::arch::asm!("pause", options(nomem, nostack));
+        }
+        crate::force_reschedule();
+    }
+}
+
 /// sys_sendto - Send UDP datagram (syscall 44).
 ///
 /// # Arguments
@@ -5920,9 +6059,6 @@ fn sys_sendto(
     if len == 0 {
         return Ok(0);
     }
-    if len > UDP_MAX_PAYLOAD {
-        return Err(SyscallError::EMSGSIZE);
-    }
 
     // Check flags
     let flag_bits = flags as u32;
@@ -5936,6 +6072,52 @@ fn sys_sendto(
     // Check WRITE right
     if !entry.rights.allows(cap::CapRights::WRITE) {
         return Err(SyscallError::EACCES);
+    }
+
+    // Determine socket type
+    let is_tcp = socket.ty == net::SocketType::Stream && socket.proto == net::SocketProtocol::Tcp;
+    let is_udp = socket.ty == net::SocketType::Dgram && socket.proto == net::SocketProtocol::Udp;
+
+    // Get current process context early
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
+
+    // TCP: send() semantics when dest_addr is NULL (connected socket)
+    if dest_addr.is_null() {
+        if !is_tcp {
+            return Err(SyscallError::EDESTADDRREQ);
+        }
+
+        // Copy payload from user space
+        validate_user_ptr(buf, len)?;
+        let mut data = vec![0u8; len];
+        copy_from_user(&mut data, buf)?;
+
+        // Get remote IP for transmission
+        let remote_ip = socket
+            .remote_ip()
+            .map(net::Ipv4Addr)
+            .ok_or(SyscallError::ENOTCONN)?;
+
+        // Send via TCP
+        let segment = net::socket_table()
+            .tcp_send(&socket, &ctx, cap_id, &data)
+            .map_err(socket_error_to_syscall)?;
+
+        // Transmit the TCP segment via network device
+        net::transmit_tcp_segment(remote_ip, &segment)
+            .map_err(tx_error_to_syscall)?;
+
+        return Ok(len);
+    }
+
+    // Non-TCP with dest_addr: must be UDP
+    if !is_udp {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+
+    // UDP size check
+    if len > UDP_MAX_PAYLOAD {
+        return Err(SyscallError::EMSGSIZE);
     }
 
     // R48-REVIEW FIX: Check BIND right if socket is not already bound.
@@ -5962,9 +6144,6 @@ fn sys_sendto(
     let mut data = vec![0u8; len];
     copy_from_user(&mut data, buf)?;
 
-    // Get current process context
-    let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
-
     // R48-REVIEW FIX: Source IP - use actual bound address if available.
     // If not bound, use INADDR_ANY (0.0.0.0) which send_to_udp will use
     // when auto-binding to an ephemeral port.
@@ -5974,25 +6153,29 @@ fn sys_sendto(
         .unwrap_or(net::Ipv4Addr([0, 0, 0, 0]));
 
     // Send via socket_table (includes LSM hook_net_send check)
-    let _datagram = net::socket_table()
+    let datagram = net::socket_table()
         .send_to_udp(&socket, &ctx, cap_id, src_ip, dst_ip, dst_port, &data)
         .map_err(socket_error_to_syscall)?;
 
-    // TODO: Actually transmit the datagram via network device
-    // For now, the socket layer builds the datagram but we need
-    // network device integration to actually send it.
+    // Transmit the UDP datagram via network device
+    net::transmit_udp_datagram(dst_ip, &datagram)
+        .map_err(tx_error_to_syscall)?;
 
     Ok(len)
 }
 
-/// sys_recvfrom - Receive UDP datagram (syscall 45).
+/// sys_recvfrom - Receive data from socket (syscall 45).
+///
+/// Supports both UDP (connectionless) and TCP (connection-oriented) sockets.
+/// For TCP: use with NULL src_addr for recv() semantics.
+/// For UDP: use with non-NULL src_addr to get sender info.
 ///
 /// # Arguments
 /// * `fd` - Socket file descriptor
 /// * `buf` - Buffer for received data
 /// * `len` - Buffer length
 /// * `flags` - Receive flags (MSG_DONTWAIT supported)
-/// * `src_addr` - Buffer for source address (optional)
+/// * `src_addr` - Buffer for source address (optional, NULL for TCP recv)
 /// * `addrlen` - Pointer to address length (in/out)
 ///
 /// # Security
@@ -6024,6 +6207,10 @@ fn sys_recvfrom(
         return Err(SyscallError::EACCES);
     }
 
+    // Determine socket type
+    let is_tcp = socket.ty == net::SocketType::Stream && socket.proto == net::SocketProtocol::Tcp;
+    let is_udp = socket.ty == net::SocketType::Dgram && socket.proto == net::SocketProtocol::Udp;
+
     // Get current process context
     let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
 
@@ -6033,6 +6220,23 @@ fn sys_recvfrom(
     } else {
         None
     };
+
+    // TCP: recv() semantics when src_addr is NULL (connected socket)
+    if is_tcp && src_addr.is_null() {
+        let data = net::socket_table()
+            .tcp_recv(&socket, &ctx, cap_id, len, timeout)
+            .map_err(socket_error_to_syscall)?;
+
+        let copy_len = core::cmp::min(len, data.len());
+        validate_user_ptr_mut(buf, copy_len)?;
+        copy_to_user(buf, &data[..copy_len])?;
+        return Ok(copy_len);
+    }
+
+    // Must be UDP for recvfrom with address
+    if !is_udp {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
 
     // Receive via socket_table (includes LSM hook_net_recv check)
     let pkt = net::socket_table()

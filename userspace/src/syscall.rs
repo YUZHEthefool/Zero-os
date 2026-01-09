@@ -56,6 +56,21 @@ pub const SYS_YIELD: u64 = 24;
 /// Get current process ID
 pub const SYS_GETPID: u64 = 39;
 
+/// Create a socket
+pub const SYS_SOCKET: u64 = 41;
+
+/// Connect a socket to a peer
+pub const SYS_CONNECT: u64 = 42;
+
+/// Send data to a socket
+pub const SYS_SENDTO: u64 = 44;
+
+/// Receive data from a socket
+pub const SYS_RECVFROM: u64 = 45;
+
+/// Bind a socket to an address
+pub const SYS_BIND: u64 = 49;
+
 /// Get system information
 pub const SYS_UNAME: u64 = 63;
 
@@ -100,6 +115,28 @@ pub const SYS_SET_ROBUST_LIST: u64 = 273;
 
 /// Get random bytes
 pub const SYS_GETRANDOM: u64 = 318;
+
+// ============================================================================
+// Socket Constants
+// ============================================================================
+
+/// IPv4 address family
+pub const AF_INET: u32 = 2;
+
+/// Stream socket type (TCP)
+pub const SOCK_STREAM: u32 = 1;
+
+/// Datagram socket type (UDP)
+pub const SOCK_DGRAM: u32 = 2;
+
+/// TCP protocol number
+pub const IPPROTO_TCP: u32 = 6;
+
+/// UDP protocol number
+pub const IPPROTO_UDP: u32 = 17;
+
+/// Non-blocking send/recv flag
+pub const MSG_DONTWAIT: u32 = 0x40;
 
 // ============================================================================
 // Raw Syscall Primitives
@@ -557,6 +594,122 @@ pub unsafe fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> u64 {
 }
 
 // ============================================================================
+// Socket Syscall Wrappers
+// ============================================================================
+
+/// Create a socket
+///
+/// # Arguments
+/// - `domain`: Address family (AF_INET for IPv4)
+/// - `ty`: Socket type (SOCK_STREAM for TCP, SOCK_DGRAM for UDP)
+/// - `protocol`: Protocol number (IPPROTO_TCP, IPPROTO_UDP, or 0 for default)
+///
+/// # Returns
+/// Socket file descriptor on success, or negative error code
+#[inline(always)]
+pub unsafe fn sys_socket(domain: i32, ty: i32, protocol: i32) -> u64 {
+    syscall3(SYS_SOCKET, domain as u64, ty as u64, protocol as u64)
+}
+
+/// Bind a socket to an address
+///
+/// # Arguments
+/// - `fd`: Socket file descriptor
+/// - `addr`: Local address to bind to
+/// - `addrlen`: Size of the address structure
+///
+/// # Returns
+/// 0 on success, or negative error code
+#[inline(always)]
+pub unsafe fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> u64 {
+    syscall3(SYS_BIND, fd as u64, addr as u64, addrlen as u64)
+}
+
+/// Connect a socket to a peer address
+///
+/// # Arguments
+/// - `fd`: Socket file descriptor
+/// - `addr`: Remote address to connect to
+/// - `addrlen`: Size of the address structure
+///
+/// # Returns
+/// 0 on success, or negative error code
+#[inline(always)]
+pub unsafe fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> u64 {
+    syscall3(SYS_CONNECT, fd as u64, addr as u64, addrlen as u64)
+}
+
+/// Send data to a socket
+///
+/// For TCP (connected sockets), dest_addr should be NULL (use ptr::null()).
+/// For UDP, dest_addr specifies the destination.
+///
+/// # Arguments
+/// - `fd`: Socket file descriptor
+/// - `buf`: Data buffer to send
+/// - `len`: Number of bytes to send
+/// - `flags`: Send flags (e.g., MSG_DONTWAIT)
+/// - `dest_addr`: Destination address (NULL for TCP)
+/// - `addrlen`: Size of dest_addr (0 for TCP)
+///
+/// # Returns
+/// Number of bytes sent on success, or negative error code
+#[inline(always)]
+pub unsafe fn sys_sendto(
+    fd: i32,
+    buf: *const u8,
+    len: usize,
+    flags: i32,
+    dest_addr: *const SockAddrIn,
+    addrlen: u32,
+) -> u64 {
+    syscall6(
+        SYS_SENDTO,
+        fd as u64,
+        buf as u64,
+        len as u64,
+        flags as u64,
+        dest_addr as u64,
+        addrlen as u64,
+    )
+}
+
+/// Receive data from a socket
+///
+/// For TCP (connected sockets), src_addr should be NULL (use ptr::null_mut()).
+/// For UDP, src_addr will be filled with the sender's address.
+///
+/// # Arguments
+/// - `fd`: Socket file descriptor
+/// - `buf`: Buffer to receive data into
+/// - `len`: Maximum bytes to receive
+/// - `flags`: Receive flags (e.g., MSG_DONTWAIT)
+/// - `src_addr`: Source address output (NULL for TCP)
+/// - `addrlen`: Size of src_addr buffer (NULL for TCP)
+///
+/// # Returns
+/// Number of bytes received on success, or negative error code
+#[inline(always)]
+pub unsafe fn sys_recvfrom(
+    fd: i32,
+    buf: *mut u8,
+    len: usize,
+    flags: i32,
+    src_addr: *mut SockAddrIn,
+    addrlen: *mut u32,
+) -> u64 {
+    syscall6(
+        SYS_RECVFROM,
+        fd as u64,
+        buf as u64,
+        len as u64,
+        flags as u64,
+        src_addr as u64,
+        addrlen as u64,
+    )
+}
+
+// ============================================================================
 // Data Structures
 // ============================================================================
 
@@ -591,6 +744,38 @@ pub struct Dirent64 {
     pub d_reclen: u16,
     pub d_type: u8,
     // followed by name bytes + '\0'
+}
+
+/// IPv4 socket address (struct sockaddr_in)
+///
+/// Layout matches the kernel's SockAddrIn for syscall compatibility:
+/// - family: Address family (AF_INET = 2)
+/// - port: Port number in network byte order (big-endian)
+/// - addr: IPv4 address in network byte order (big-endian)
+/// - padding: 8 bytes to match sockaddr size
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SockAddrIn {
+    pub family: u16,
+    pub port: u16,
+    pub addr: u32,
+    pub padding: [u8; 8],
+}
+
+impl SockAddrIn {
+    /// Create a new IPv4 socket address.
+    ///
+    /// # Arguments
+    /// - `ip`: IPv4 address as 4 octets in network order
+    /// - `port`: Port number in host byte order (will be converted to network order)
+    pub fn new(ip: [u8; 4], port: u16) -> Self {
+        Self {
+            family: AF_INET as u16,
+            port: port.to_be(),
+            addr: u32::from_be_bytes(ip),
+            padding: [0; 8],
+        }
+    }
 }
 
 /// System name structure (uname)
@@ -636,4 +821,75 @@ pub unsafe fn print(s: &str) -> u64 {
 #[inline]
 pub unsafe fn eprint(s: &str) -> u64 {
     sys_write(2, s.as_ptr(), s.len() as u64)
+}
+
+// ============================================================================
+// Networking Helpers
+// ============================================================================
+
+/// Parse a dotted-decimal IPv4 address string into 4 octets.
+///
+/// Parses strings like "192.168.1.1" into `[192, 168, 1, 1]`.
+/// Leading/trailing whitespace is skipped. Parsing stops at null byte,
+/// space, or end of slice.
+///
+/// # Arguments
+/// - `input`: Byte slice containing the IPv4 address string
+///
+/// # Returns
+/// - `Some([a, b, c, d])` on success with octets in network order
+/// - `None` if the input is not a valid IPv4 address
+///
+/// # Example
+/// ```ignore
+/// assert_eq!(parse_ipv4(b"10.0.2.15"), Some([10, 0, 2, 15]));
+/// assert_eq!(parse_ipv4(b"256.0.0.1"), None); // octet > 255
+/// ```
+pub fn parse_ipv4(input: &[u8]) -> Option<[u8; 4]> {
+    let mut parts = [0u8; 4];
+    let mut idx = 0usize;
+    let mut value: u16 = 0;
+    let mut seen_digit = false;
+
+    // Skip leading whitespace
+    let mut i = 0;
+    while i < input.len() && (input[i] == b' ' || input[i] == b'\t') {
+        i += 1;
+    }
+
+    while i < input.len() {
+        let c = input[i];
+        // Stop at null byte or whitespace
+        if c == 0 || c == b' ' || c == b'\t' {
+            break;
+        }
+        match c {
+            b'0'..=b'9' => {
+                value = value * 10 + (c - b'0') as u16;
+                if value > 255 {
+                    return None;
+                }
+                seen_digit = true;
+            }
+            b'.' => {
+                if !seen_digit || idx >= 3 {
+                    return None;
+                }
+                parts[idx] = value as u8;
+                idx += 1;
+                value = 0;
+                seen_digit = false;
+            }
+            _ => return None,
+        }
+        i += 1;
+    }
+
+    // Must have exactly 4 parts (3 dots)
+    if !seen_digit || idx != 3 {
+        return None;
+    }
+
+    parts[3] = value as u8;
+    Some(parts)
 }

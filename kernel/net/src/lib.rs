@@ -48,6 +48,7 @@ pub mod ipv4;
 mod pci;
 pub mod socket;
 pub mod stack;
+pub mod tcp;
 pub mod udp;
 pub mod virtio_net;
 
@@ -67,7 +68,10 @@ pub use ethernet::{
     parse_ethernet, build_ethernet_frame, EthAddr, EthHeader, EthError,
     ETHERTYPE_IPV4, ETHERTYPE_ARP,
 };
-pub use stack::{process_frame, NetStats, ProcessResult, DropReason};
+pub use stack::{
+    process_frame, network_config, transmit_tcp_segment, transmit_udp_datagram,
+    DropReason, NetConfigSnapshot, NetStats, ProcessResult,
+};
 pub use virtio_net::VirtioNetDevice;
 pub use arp::{
     parse_arp, serialize_arp, build_arp_reply, build_arp_request, build_gratuitous_arp,
@@ -78,10 +82,18 @@ pub use udp::{
     parse_udp, parse_udp_header, build_udp_datagram, compute_udp_checksum, verify_udp_checksum,
     UdpError, UdpHeader, UdpResult, UdpStats, UDP_HEADER_LEN, UDP_PROTO,
 };
+pub use tcp::{
+    parse_tcp_header, parse_tcp_options, build_tcp_segment, compute_tcp_checksum,
+    verify_tcp_checksum, generate_isn, seq_lt, seq_le, seq_gt, seq_ge, seq_in_window,
+    TcpHeader, TcpOptions, TcpState, TcpControlBlock, TcpConnKey, TcpSegment,
+    TcpError, TcpResult, TcpStats,
+    TCP_HEADER_MIN_LEN, TCP_PROTO, TCP_DEFAULT_MSS, TCP_ETHERNET_MSS,
+    TCP_FLAG_FIN, TCP_FLAG_SYN, TCP_FLAG_RST, TCP_FLAG_PSH, TCP_FLAG_ACK, TCP_FLAG_URG,
+};
 pub use socket::{
     socket_table, register_socket_wait_hooks, PendingDatagram, SocketDomain, SocketError,
     SocketLabel, SocketProtocol, SocketState, SocketStats, SocketTable, SocketType,
-    SocketWaitHooks, TableStats, WaitOutcome, WaitQueue,
+    SocketWaitHooks, TableStats, TcpConnectResult, WaitOutcome, WaitQueue,
 };
 
 // ============================================================================

@@ -52,8 +52,18 @@ use spin::{Mutex, Once, RwLock};
 
 use cap::CapId;
 use lsm::{
-    hook_net_bind, hook_net_recv, hook_net_send, hook_net_socket,
+    hook_net_bind, hook_net_connect, hook_net_recv, hook_net_send, hook_net_socket,
     LsmError, NetCtx, ProcessCtx,
+};
+
+use crate::ipv4::Ipv4Addr;
+use crate::tcp::{
+    build_tcp_segment, generate_isn, TcpControlBlock, TcpConnKey, TcpHeader, TcpState,
+    TCP_DEFAULT_WINDOW, TCP_FLAG_ACK, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_PROTO,
+};
+use crate::udp::{
+    build_udp_datagram, UdpError,
+    EPHEMERAL_PORT_END, EPHEMERAL_PORT_START, UDP_PROTO,
 };
 
 // ============================================================================
@@ -263,12 +273,6 @@ impl Default for WaitQueue {
     }
 }
 
-use crate::ipv4::Ipv4Addr;
-use crate::udp::{
-    build_udp_datagram, UdpError,
-    EPHEMERAL_PORT_END, EPHEMERAL_PORT_START, UDP_PROTO,
-};
-
 // ============================================================================
 // Constants
 // ============================================================================
@@ -309,17 +313,22 @@ impl SocketDomain {
 /// Socket type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketType {
-    /// Datagram socket (SOCK_DGRAM)
+    /// Stream socket (SOCK_STREAM) - TCP
+    Stream,
+    /// Datagram socket (SOCK_DGRAM) - UDP
     Dgram,
 }
 
 impl SocketType {
+    /// Linux SOCK_STREAM value
+    pub const SOCK_STREAM: u32 = 1;
     /// Linux SOCK_DGRAM value
     pub const SOCK_DGRAM: u32 = 2;
 
     /// Parse from Linux type constant
     pub fn from_raw(ty: u32) -> Option<Self> {
         match ty {
+            Self::SOCK_STREAM => Some(SocketType::Stream),
             Self::SOCK_DGRAM => Some(SocketType::Dgram),
             _ => None,
         }
@@ -329,18 +338,30 @@ impl SocketType {
 /// Socket protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketProtocol {
+    /// TCP protocol (IPPROTO_TCP = 6)
+    Tcp,
     /// UDP protocol (IPPROTO_UDP = 17)
     Udp,
 }
 
 impl SocketProtocol {
+    /// Linux IPPROTO_TCP value
+    pub const IPPROTO_TCP: u32 = 6;
     /// Linux IPPROTO_UDP value
     pub const IPPROTO_UDP: u32 = 17;
 
-    /// Parse from Linux protocol constant
-    pub fn from_raw(proto: u32) -> Option<Self> {
+    /// Parse from Linux protocol constant with socket type inference
+    pub fn from_raw(proto: u32, sock_type: SocketType) -> Option<Self> {
         match proto {
-            0 | Self::IPPROTO_UDP => Some(SocketProtocol::Udp),
+            0 => {
+                // Default protocol based on socket type
+                match sock_type {
+                    SocketType::Stream => Some(SocketProtocol::Tcp),
+                    SocketType::Dgram => Some(SocketProtocol::Udp),
+                }
+            }
+            Self::IPPROTO_TCP => Some(SocketProtocol::Tcp),
+            Self::IPPROTO_UDP => Some(SocketProtocol::Udp),
             _ => None,
         }
     }
@@ -389,6 +410,48 @@ pub struct PendingDatagram {
     pub data: Vec<u8>,
     /// Receive timestamp (ticks)
     pub received_at: u64,
+}
+
+// ============================================================================
+// TCP Socket State
+// ============================================================================
+
+/// TCP socket-specific state for stream sockets.
+///
+/// This structure holds the TCP control block and dedicated wait queues for
+/// TCP state transitions (connect completion, close) and data availability.
+struct TcpSocketState {
+    /// TCP control block for this stream socket
+    control: TcpControlBlock,
+    /// Waiters interested in TCP state transitions (connect/close)
+    state_waiters: Arc<WaitQueue>,
+    /// Waiters for data availability (recv)
+    data_waiters: Arc<WaitQueue>,
+}
+
+impl TcpSocketState {
+    fn new(control: TcpControlBlock) -> Self {
+        TcpSocketState {
+            control,
+            state_waiters: Arc::new(WaitQueue::new()),
+            data_waiters: Arc::new(WaitQueue::new()),
+        }
+    }
+}
+
+/// Result of initiating a TCP connect (SYN sent).
+#[derive(Debug, Clone)]
+pub struct TcpConnectResult {
+    /// Serialized TCP segment (header + payload) ready for IPv4 encapsulation.
+    pub segment: Vec<u8>,
+    /// Local port used for the connection.
+    pub local_port: u16,
+    /// Source IP address.
+    pub src_ip: Ipv4Addr,
+    /// Destination IP address.
+    pub dst_ip: Ipv4Addr,
+    /// Destination port.
+    pub dst_port: u16,
 }
 
 // ============================================================================
@@ -456,6 +519,8 @@ pub struct SocketState {
     tx_datagrams: AtomicU64,
     /// Datagrams dropped due to queue full
     rx_dropped: AtomicU64,
+    /// TCP state (only populated for stream sockets)
+    tcp: Mutex<Option<TcpSocketState>>,
 }
 
 impl core::fmt::Debug for SocketState {
@@ -495,6 +560,7 @@ impl SocketState {
             rx_datagrams: AtomicU64::new(0),
             tx_datagrams: AtomicU64::new(0),
             rx_dropped: AtomicU64::new(0),
+            tcp: Mutex::new(None),
         }
     }
 
@@ -549,7 +615,18 @@ impl SocketState {
         if self.closed.swap(true, Ordering::AcqRel) {
             return; // Already closed
         }
+        // Wake UDP/datagram waiters
         self.waiters.wake_all();
+        // Wake TCP state waiters
+        if let Some(waiters) = self.tcp_waiters() {
+            waiters.close();
+            waiters.wake_all();
+        }
+        // Wake TCP data waiters
+        if let Some(waiters) = self.tcp_data_waiters() {
+            waiters.close();
+            waiters.wake_all();
+        }
     }
 
     /// Bind the socket to a local address.
@@ -569,6 +646,57 @@ impl SocketState {
     /// R48-REVIEW FIX: Expose bound local IP for correct source address in sendto.
     pub fn local_ip(&self) -> Option<[u8; 4]> {
         self.meta.lock().local_ip
+    }
+
+    /// Set the remote endpoint (for connect).
+    pub fn set_remote(&self, ip: Ipv4Addr, port: u16) {
+        let mut meta = self.meta.lock();
+        meta.remote_ip = Some(ip.0);
+        meta.remote_port = Some(port);
+    }
+
+    /// Get the remote port if connected.
+    pub fn remote_port(&self) -> Option<u16> {
+        self.meta.lock().remote_port
+    }
+
+    /// Get the remote IP address if connected.
+    pub fn remote_ip(&self) -> Option<[u8; 4]> {
+        self.meta.lock().remote_ip
+    }
+
+    /// Install a TCP control block for this socket.
+    fn attach_tcp(&self, control: TcpControlBlock) {
+        *self.tcp.lock() = Some(TcpSocketState::new(control));
+    }
+
+    /// Get the current TCP state (if any).
+    pub fn tcp_state(&self) -> Option<TcpState> {
+        self.tcp.lock().as_ref().map(|tcp| tcp.control.state)
+    }
+
+    /// Get a clone of the TCP state waiters (for blocking connect/wakeups).
+    fn tcp_waiters(&self) -> Option<Arc<WaitQueue>> {
+        self.tcp.lock().as_ref().map(|tcp| tcp.state_waiters.clone())
+    }
+
+    /// Wake TCP state waiters (called when state transitions occur).
+    pub fn wake_tcp_waiters(&self) {
+        if let Some(waiters) = self.tcp_waiters() {
+            waiters.wake_all();
+        }
+    }
+
+    /// Get a clone of the TCP data waiters (for blocking recv).
+    fn tcp_data_waiters(&self) -> Option<Arc<WaitQueue>> {
+        self.tcp.lock().as_ref().map(|tcp| tcp.data_waiters.clone())
+    }
+
+    /// Wake TCP data waiters (called when data arrives).
+    pub fn wake_tcp_data_waiters(&self) {
+        if let Some(waiters) = self.tcp_data_waiters() {
+            waiters.wake_all();
+        }
     }
 
     /// Get a snapshot of socket metadata.
@@ -660,6 +788,12 @@ pub enum SocketError {
     NotFound,
     /// Privileged port requires root
     PrivilegedPort,
+    /// Connection already established or in progress
+    AlreadyConnected,
+    /// Operation would block while connect is in progress (non-blocking)
+    InProgress,
+    /// Invalid socket state for the requested operation
+    InvalidState,
     /// UDP layer error
     Udp(UdpError),
     /// LSM policy denial
@@ -682,6 +816,9 @@ impl From<LsmError> for SocketError {
 // Socket Table
 // ============================================================================
 
+/// TCP connection lookup key type (local_ip, local_port, remote_ip, remote_port)
+type TcpLookupKey = (u32, u16, u32, u16);
+
 /// Global socket table: tracks all sockets and port bindings.
 ///
 /// Thread-safe via RwLock (read-heavy) and Mutex (write operations).
@@ -694,6 +831,10 @@ pub struct SocketTable {
     sockets: RwLock<BTreeMap<u64, Arc<SocketState>>>,
     /// UDP port bindings (port -> weak ref to socket)
     udp_bindings: Mutex<BTreeMap<u16, Weak<SocketState>>>,
+    /// TCP local port bindings
+    tcp_bindings: Mutex<BTreeMap<u16, Weak<SocketState>>>,
+    /// Active TCP connections keyed by 4-tuple
+    tcp_conns: Mutex<BTreeMap<TcpLookupKey, Weak<SocketState>>>,
     /// Statistics
     created: AtomicU64,
     closed_count: AtomicU64,
@@ -708,6 +849,8 @@ impl SocketTable {
             next_ephemeral: AtomicU16::new(EPHEMERAL_PORT_START),
             sockets: RwLock::new(BTreeMap::new()),
             udp_bindings: Mutex::new(BTreeMap::new()),
+            tcp_bindings: Mutex::new(BTreeMap::new()),
+            tcp_conns: Mutex::new(BTreeMap::new()),
             created: AtomicU64::new(0),
             closed_count: AtomicU64::new(0),
             bind_count: AtomicU64::new(0),
@@ -741,6 +884,43 @@ impl SocketTable {
             SocketDomain::Inet4,
             SocketType::Dgram,
             SocketProtocol::Udp,
+            label,
+        ));
+
+        // Register in table
+        self.sockets.write().insert(id, sock.clone());
+        self.created.fetch_add(1, Ordering::Relaxed);
+
+        Ok(sock)
+    }
+
+    /// Create a TCP socket.
+    ///
+    /// # Security
+    ///
+    /// - Invokes `hook_net_socket` for LSM policy check
+    /// - Captures creator context in socket label
+    ///
+    /// # Returns
+    ///
+    /// Arc to the new socket state, ready to be wrapped in a CapEntry.
+    pub fn create_tcp_socket(&self, label: SocketLabel) -> Result<Arc<SocketState>, SocketError> {
+        // Build LSM context
+        let mut ctx = NetCtx::new(0, TCP_PROTO as u16);
+        ctx.cap = Some(CapId::INVALID);
+
+        // Check LSM policy
+        hook_net_socket(&label.creator, &ctx)?;
+
+        // Allocate socket ID
+        let id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
+
+        // Create socket state
+        let sock = Arc::new(SocketState::new(
+            id,
+            SocketDomain::Inet4,
+            SocketType::Stream,
+            SocketProtocol::Tcp,
             label,
         ));
 
@@ -908,6 +1088,234 @@ impl SocketTable {
         Ok(datagram)
     }
 
+    /// Initiate a TCP connect (client-side SYN).
+    ///
+    /// Builds and returns the SYN segment and records the TCB.
+    /// The handshake completes asynchronously via the RX path (Phase 2).
+    ///
+    /// # Arguments
+    ///
+    /// * `sock` - TCP socket to connect
+    /// * `current` - Current process context
+    /// * `cap_id` - Capability used for this operation
+    /// * `src_ip` - Source IP address (0.0.0.0 for auto-select)
+    /// * `dst_ip` - Destination IP address
+    /// * `dst_port` - Destination port
+    /// * `timeout_ns` - Timeout for blocking connect (None = blocking indefinitely)
+    ///
+    /// # Security
+    ///
+    /// - Invokes `hook_net_connect` for LSM policy check on active open
+    /// - Auto-binds to ephemeral port if not already bound
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(TcpConnectResult)` with SYN segment on successful initiation
+    /// - `Err(InProgress)` for non-blocking connect (timeout_ns == Some(0))
+    /// - `Err(Timeout)` if blocking connect times out before ESTABLISHED
+    ///
+    /// # Note
+    ///
+    /// Phase 1 implementation only initiates the handshake (SYN). Full 3-way
+    /// handshake completion (SYN-ACK handling, ACK transmission) requires the
+    /// RX path integration in Phase 2.
+    pub fn connect(
+        &self,
+        sock: &Arc<SocketState>,
+        current: &ProcessCtx,
+        cap_id: CapId,
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        dst_port: u16,
+        timeout_ns: Option<u64>,
+    ) -> Result<TcpConnectResult, SocketError> {
+        // Validate socket type
+        if sock.ty != SocketType::Stream || sock.proto != SocketProtocol::Tcp {
+            return Err(SocketError::InvalidType);
+        }
+        if sock.is_closed() {
+            return Err(SocketError::Closed);
+        }
+        if dst_port == 0 {
+            return Err(SocketError::InvalidProtocol);
+        }
+
+        // Check if already connected or connecting
+        if sock.remote_port().is_some() {
+            return Err(SocketError::AlreadyConnected);
+        }
+        if let Some(state) = sock.tcp_state() {
+            if state != TcpState::Closed {
+                return Err(SocketError::AlreadyConnected);
+            }
+        }
+
+        // Determine local endpoint (bind if needed)
+        let local_port = match sock.local_port() {
+            Some(p) => p,
+            None => self.alloc_ephemeral_tcp_port()?,
+        };
+        let local_ip = sock.local_ip().map(Ipv4Addr).unwrap_or(src_ip);
+
+        // Build the connection key for uniqueness check
+        let conn_key = tcp_map_key_from_parts(local_ip, local_port, dst_ip, dst_port);
+
+        // Check for duplicate connection (but don't register yet - defer until after LSM)
+        {
+            let conns = self.tcp_conns.lock();
+            if conns.get(&conn_key).and_then(|w| w.upgrade()).is_some() {
+                return Err(SocketError::PortInUse);
+            }
+        }
+
+        // LSM policy check BEFORE registering connection
+        // Use hook_net_connect for active open (per LSM API)
+        let mut ctx = self.ctx_from_socket(sock);
+        ctx.local = ipv4_to_u64(local_ip.0);
+        ctx.local_port = local_port;
+        ctx.remote = ipv4_to_u64(dst_ip.0);
+        ctx.remote_port = dst_port;
+        ctx.cap = Some(cap_id);
+        hook_net_connect(current, &ctx)?;
+
+        // Track what we've registered for cleanup on failure
+        let mut binding_registered = false;
+        let mut conn_registered = false;
+
+        // Register local port binding and connection 4-tuple
+        // This is done AFTER LSM check to prevent resource leaks on denial
+        let registration_result: Result<(), SocketError> = (|| {
+            // Register local port in tcp_bindings
+            {
+                let mut bindings = self.tcp_bindings.lock();
+                if let Some(existing) = bindings.get(&local_port) {
+                    if let Some(existing_sock) = existing.upgrade() {
+                        if !Arc::ptr_eq(&existing_sock, sock) {
+                            return Err(SocketError::PortInUse);
+                        }
+                    }
+                }
+                bindings.insert(local_port, Arc::downgrade(sock));
+                binding_registered = true;
+            }
+
+            // Register connection 4-tuple
+            {
+                let mut conns = self.tcp_conns.lock();
+                // Re-check after lock acquisition (race-safe)
+                if conns.get(&conn_key).and_then(|w| w.upgrade()).is_some() {
+                    return Err(SocketError::PortInUse);
+                }
+                conns.insert(conn_key, Arc::downgrade(sock));
+                conn_registered = true;
+            }
+
+            Ok(())
+        })();
+
+        // On registration failure, clean up any partial registrations
+        if let Err(e) = registration_result {
+            if conn_registered {
+                self.tcp_conns.lock().remove(&conn_key);
+            }
+            if binding_registered {
+                self.tcp_bindings.lock().remove(&local_port);
+            }
+            return Err(e);
+        }
+
+        // Update socket metadata (connection is now registered)
+        sock.bind_local(local_ip, local_port);
+        sock.set_remote(dst_ip, dst_port);
+
+        // Generate Initial Sequence Number (ISN) per RFC 6528
+        let iss = generate_isn(local_ip, local_port, dst_ip, dst_port);
+
+        // Build TCB in SYN_SENT state
+        let mut tcb = TcpControlBlock::new_client(local_ip, local_port, dst_ip, dst_port, iss);
+        tcb.state = TcpState::SynSent;
+        tcb.snd_una = iss;
+        tcb.snd_nxt = iss.wrapping_add(1); // SYN consumes one sequence number
+        tcb.snd_wnd = TCP_DEFAULT_WINDOW as u32;
+        sock.attach_tcp(tcb);
+
+        // Build the SYN segment
+        let segment = build_tcp_segment(
+            local_ip,
+            dst_ip,
+            local_port,
+            dst_port,
+            iss,
+            0,
+            TCP_FLAG_SYN,
+            TCP_DEFAULT_WINDOW,
+            &[],
+        );
+
+        let result = TcpConnectResult {
+            segment,
+            local_port,
+            src_ip: local_ip,
+            dst_ip,
+            dst_port,
+        };
+
+        // Non-blocking connect: return result immediately with InProgress
+        // The caller should transmit the SYN and poll for state transition
+        if timeout_ns == Some(0) {
+            // For non-blocking, we still return the result so the SYN can be transmitted
+            // The socket is in SYN_SENT state; completion happens via RX path
+            return Ok(result);
+        }
+
+        // Blocking connect: wait for state transition signaled via TCP waiters
+        // Note: Full handshake completion requires RX path integration (Phase 2)
+        // For now, we wait but the RX path to process SYN-ACK is not yet implemented
+        if let Some(waiters) = sock.tcp_waiters() {
+            match waiters.wait_with_timeout(timeout_ns) {
+                WaitOutcome::Woken => {
+                    if matches!(sock.tcp_state(), Some(TcpState::Established)) {
+                        return Ok(result);
+                    }
+                    // Connection was reset or failed
+                    if matches!(sock.tcp_state(), Some(TcpState::Closed)) {
+                        // Clean up on failed connection
+                        self.tcp_bindings.lock().remove(&local_port);
+                        self.tcp_conns.lock().remove(&conn_key);
+                        return Err(SocketError::Closed);
+                    }
+                    // Still in SYN_SENT or other intermediate state
+                    return Err(SocketError::InProgress);
+                }
+                WaitOutcome::TimedOut => {
+                    // Timeout - the SYN was sent but no response
+                    // Clean up resources to allow retry or close
+                    self.tcp_bindings.lock().remove(&local_port);
+                    self.tcp_conns.lock().remove(&conn_key);
+                    // Reset socket metadata to allow retry after close
+                    {
+                        let mut meta = sock.meta.lock();
+                        meta.remote_ip = None;
+                        meta.remote_port = None;
+                    }
+                    // Clear TCB
+                    *sock.tcp.lock() = None;
+                    return Err(SocketError::Timeout);
+                }
+                WaitOutcome::Closed => {
+                    self.tcp_bindings.lock().remove(&local_port);
+                    self.tcp_conns.lock().remove(&conn_key);
+                    return Err(SocketError::Closed);
+                }
+                WaitOutcome::NoProcess => return Err(SocketError::NoProcess),
+            }
+        }
+
+        // No waiters registered (early boot) - return result for async processing
+        // The SYN segment is ready to be transmitted by the caller
+        Ok(result)
+    }
+
     /// Receive a UDP datagram (blocking with optional timeout).
     ///
     /// # Arguments
@@ -959,6 +1367,208 @@ impl SocketTable {
 
             // Block on wait queue
             match sock.waiters.wait_with_timeout(timeout_ns) {
+                WaitOutcome::Woken => continue,
+                WaitOutcome::TimedOut => return Err(SocketError::Timeout),
+                WaitOutcome::Closed => return Err(SocketError::Closed),
+                WaitOutcome::NoProcess => return Err(SocketError::NoProcess),
+            }
+        }
+    }
+
+    // ========================================================================
+    // TCP Data Transfer (Phase 3)
+    // ========================================================================
+
+    /// Send TCP data (PSH+ACK segment).
+    ///
+    /// Builds and returns the TCP segment for transmission.
+    ///
+    /// # Arguments
+    ///
+    /// * `sock` - TCP socket (must be in ESTABLISHED state)
+    /// * `current` - Current process context
+    /// * `cap_id` - Capability used for this operation
+    /// * `payload` - Data to send
+    ///
+    /// # Security
+    ///
+    /// - Invokes `hook_net_send` for LSM policy check
+    /// - Validates socket is in ESTABLISHED state
+    ///
+    /// # Returns
+    ///
+    /// Serialized TCP segment for transmission on success.
+    pub fn tcp_send(
+        &self,
+        sock: &Arc<SocketState>,
+        current: &ProcessCtx,
+        cap_id: CapId,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, SocketError> {
+        // Validate socket type
+        if sock.ty != SocketType::Stream || sock.proto != SocketProtocol::Tcp {
+            return Err(SocketError::InvalidType);
+        }
+        if sock.is_closed() {
+            return Err(SocketError::Closed);
+        }
+
+        // Get connection endpoints from metadata
+        let meta = sock.meta_snapshot();
+        let (local_ip, local_port, remote_ip, remote_port) = match (
+            meta.local_ip.map(Ipv4Addr),
+            meta.local_port,
+            meta.remote_ip.map(Ipv4Addr),
+            meta.remote_port,
+        ) {
+            (Some(li), Some(lp), Some(ri), Some(rp)) => (li, lp, ri, rp),
+            _ => return Err(SocketError::InvalidState),
+        };
+
+        // LSM policy check
+        let mut ctx = self.ctx_from_socket(sock);
+        ctx.local = ipv4_to_u64(local_ip.0);
+        ctx.local_port = local_port;
+        ctx.remote = ipv4_to_u64(remote_ip.0);
+        ctx.remote_port = remote_port;
+        ctx.cap = Some(cap_id);
+        hook_net_send(current, &ctx, payload.len())?;
+
+        // Build segment under TCP lock
+        let mut guard = sock.tcp.lock();
+        let tcp_state = guard.as_mut().ok_or(SocketError::InvalidState)?;
+
+        // Must be in a send-capable state (ESTABLISHED or CLOSE_WAIT)
+        if !tcp_state.control.state.can_send() {
+            return Err(SocketError::InvalidState);
+        }
+
+        // Respect the peer-advertised send window; refuse to emit data that would overflow it
+        let window_avail = tcp_state.control.send_window_available() as usize;
+        if !payload.is_empty() && payload.len() > window_avail {
+            // Window too small - caller should retry later
+            return Err(SocketError::Timeout);
+        }
+
+        // Get current sequence numbers
+        let seq = tcp_state.control.snd_nxt;
+        let ack = tcp_state.control.rcv_nxt;
+
+        // Advertise our actual receive window (rcv_wnd minus buffered data)
+        let advertised_wnd = tcp_state
+            .control
+            .rcv_wnd
+            .saturating_sub(tcp_state.control.recv_buffer.len() as u32) as u16;
+
+        // Use PSH flag if we have data
+        let flags = TCP_FLAG_ACK | if !payload.is_empty() { TCP_FLAG_PSH } else { 0 };
+
+        // Update send next sequence number
+        tcp_state.control.snd_nxt = tcp_state
+            .control
+            .snd_nxt
+            .wrapping_add(payload.len() as u32);
+
+        drop(guard);
+
+        // Build the TCP segment
+        let segment = build_tcp_segment(
+            local_ip,
+            remote_ip,
+            local_port,
+            remote_port,
+            seq,
+            ack,
+            flags,
+            advertised_wnd,
+            payload,
+        );
+
+        // Update statistics
+        sock.tx_bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
+
+        Ok(segment)
+    }
+
+    /// Receive TCP data (blocking with optional timeout).
+    ///
+    /// Returns data from the receive buffer, blocking if empty.
+    ///
+    /// # Arguments
+    ///
+    /// * `sock` - TCP socket (must be in ESTABLISHED state)
+    /// * `current` - Current process context
+    /// * `cap_id` - Capability used for this operation
+    /// * `max_len` - Maximum bytes to return
+    /// * `timeout_ns` - Timeout in nanoseconds (None for blocking indefinitely)
+    ///
+    /// # Security
+    ///
+    /// - Invokes `hook_net_recv` for LSM policy check
+    ///
+    /// # Returns
+    ///
+    /// Vector of received bytes (may be less than max_len).
+    pub fn tcp_recv(
+        &self,
+        sock: &Arc<SocketState>,
+        current: &ProcessCtx,
+        cap_id: CapId,
+        max_len: usize,
+        timeout_ns: Option<u64>,
+    ) -> Result<Vec<u8>, SocketError> {
+        // Validate socket type
+        if sock.ty != SocketType::Stream || sock.proto != SocketProtocol::Tcp {
+            return Err(SocketError::InvalidType);
+        }
+        if sock.is_closed() {
+            return Err(SocketError::Closed);
+        }
+
+        loop {
+            // Get data waiters for blocking
+            let waiters = sock.tcp_data_waiters().ok_or(SocketError::Closed)?;
+
+            // Try to get data from buffer
+            {
+                let mut guard = sock.tcp.lock();
+                let tcp_state = guard.as_mut().ok_or(SocketError::Closed)?;
+
+                // Check connection state for receive capability
+                if tcp_state.control.state.is_closed() {
+                    return Err(SocketError::Closed);
+                }
+                if !tcp_state.control.state.can_receive() {
+                    return Err(SocketError::InvalidState);
+                }
+
+                // Check if we have data in the buffer
+                if !tcp_state.control.recv_buffer.is_empty() {
+                    let mut data = Vec::new();
+                    let take = core::cmp::min(max_len, tcp_state.control.recv_buffer.len());
+
+                    for _ in 0..take {
+                        if let Some(b) = tcp_state.control.recv_buffer.pop_front() {
+                            data.push(b);
+                        }
+                    }
+
+                    drop(guard);
+
+                    // LSM check for recv delivery
+                    let mut ctx = self.ctx_from_socket(sock);
+                    ctx.cap = Some(cap_id);
+                    hook_net_recv(current, &ctx, data.len())?;
+
+                    // Update statistics
+                    sock.rx_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+
+                    return Ok(data);
+                }
+            }
+
+            // No data available, block on wait queue
+            match waiters.wait_with_timeout(timeout_ns) {
                 WaitOutcome::Woken => continue,
                 WaitOutcome::TimedOut => return Err(SocketError::Timeout),
                 WaitOutcome::Closed => return Err(SocketError::Closed),
@@ -1059,10 +1669,36 @@ impl SocketTable {
     /// Called when the capability is revoked or explicitly closed.
     pub fn close(&self, socket_id: u64) {
         if let Some(sock) = self.sockets.write().remove(&socket_id) {
-            // Remove port binding
             let meta = sock.meta_snapshot();
+
+            // Remove port bindings based on protocol
             if let Some(port) = meta.local_port {
-                self.udp_bindings.lock().remove(&port);
+                match sock.proto {
+                    SocketProtocol::Udp => {
+                        self.udp_bindings.lock().remove(&port);
+                    }
+                    SocketProtocol::Tcp => {
+                        self.tcp_bindings.lock().remove(&port);
+                    }
+                }
+            }
+
+            // Remove TCP connection from 4-tuple map
+            if sock.proto == SocketProtocol::Tcp {
+                if let (Some(lip), Some(lport), Some(rip), Some(rport)) = (
+                    meta.local_ip,
+                    meta.local_port,
+                    meta.remote_ip,
+                    meta.remote_port,
+                ) {
+                    let key = tcp_map_key_from_parts(
+                        Ipv4Addr(lip),
+                        lport,
+                        Ipv4Addr(rip),
+                        rport,
+                    );
+                    self.tcp_conns.lock().remove(&key);
+                }
             }
 
             // Mark closed and wake waiters
@@ -1104,10 +1740,40 @@ impl SocketTable {
         Err(SocketError::NoPorts)
     }
 
+    /// Allocate an ephemeral port for TCP (ensures no existing TCP socket uses it).
+    fn alloc_ephemeral_tcp_port(&self) -> Result<u16, SocketError> {
+        let range = (EPHEMERAL_PORT_END - EPHEMERAL_PORT_START + 1) as u16;
+        let tcp_bindings = self.tcp_bindings.lock();
+        let tcp_conns = self.tcp_conns.lock();
+
+        // Try up to `range` ports
+        for _ in 0..range {
+            let seed = self.next_ephemeral.fetch_add(1, Ordering::Relaxed);
+            let candidate = EPHEMERAL_PORT_START + (seed % range);
+
+            // Check if port is in use by TCP bindings or connections
+            if tcp_bindings.contains_key(&candidate) {
+                continue;
+            }
+            // Also check if any connection uses this as local port
+            let in_use = tcp_conns.keys().any(|(_, port, _, _)| *port == candidate);
+            if !in_use {
+                return Ok(candidate);
+            }
+        }
+
+        Err(SocketError::NoPorts)
+    }
+
     /// Build LSM NetCtx from socket state.
     fn ctx_from_socket(&self, sock: &SocketState) -> NetCtx {
         let meta = sock.meta_snapshot();
-        let mut ctx = NetCtx::new(sock.id, UDP_PROTO as u16);
+        // Use correct protocol based on socket type
+        let proto = match sock.proto {
+            SocketProtocol::Udp => UDP_PROTO as u16,
+            SocketProtocol::Tcp => TCP_PROTO as u16,
+        };
+        let mut ctx = NetCtx::new(sock.id, proto);
 
         if let Some(ip) = meta.local_ip {
             ctx.local = ipv4_to_u64(ip);
@@ -1124,6 +1790,407 @@ impl SocketTable {
         ctx.cap = Some(CapId::INVALID);
 
         ctx
+    }
+
+    // ========================================================================
+    // TCP RX Path (Phase 2)
+    // ========================================================================
+
+    /// Look up a TCP connection by 4-tuple, removing stale entries.
+    ///
+    /// # Arguments
+    /// * `local_ip` - Our IP (destination in incoming packet)
+    /// * `local_port` - Our port (destination port in incoming packet)
+    /// * `remote_ip` - Peer IP (source in incoming packet)
+    /// * `remote_port` - Peer port (source port in incoming packet)
+    pub fn lookup_tcp_conn(
+        &self,
+        local_ip: Ipv4Addr,
+        local_port: u16,
+        remote_ip: Ipv4Addr,
+        remote_port: u16,
+    ) -> Option<Arc<SocketState>> {
+        let key = tcp_map_key_from_parts(local_ip, local_port, remote_ip, remote_port);
+        let mut conns = self.tcp_conns.lock();
+        match conns.get(&key).and_then(|w| w.upgrade()) {
+            Some(sock) => Some(sock),
+            None => {
+                // Clean up stale weak reference
+                conns.remove(&key);
+                None
+            }
+        }
+    }
+
+    /// Process an inbound TCP segment for handshake completion.
+    ///
+    /// This implements Phase 2 of the TCP state machine:
+    /// - SYN_SENT + SYN-ACK → ESTABLISHED (send ACK)
+    /// - Unknown connection → RST
+    ///
+    /// # Arguments
+    /// * `src_ip` - Source IP (remote peer)
+    /// * `dst_ip` - Destination IP (our IP)
+    /// * `header` - Parsed TCP header
+    /// * `payload` - TCP payload (after header)
+    ///
+    /// # Returns
+    /// TCP segment to transmit (ACK or RST) if a response is required.
+    pub fn process_tcp_segment(
+        &self,
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        header: &TcpHeader,
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
+        // RFC 793: Never respond to RST segments
+        if header.flags & TCP_FLAG_RST != 0 {
+            // If we have a connection, abort it and clean up resources
+            if let Some(sock) = self.lookup_tcp_conn(dst_ip, header.dst_port, src_ip, header.src_port) {
+                let mut guard = sock.tcp.lock();
+                if let Some(tcp_state) = guard.as_mut() {
+                    let old_state = tcp_state.control.state;
+                    if old_state == TcpState::SynSent || old_state == TcpState::Established {
+                        tcp_state.control.state = TcpState::Closed;
+                        drop(guard);
+
+                        // Clean up connection resources
+                        self.cleanup_tcp_connection(&sock);
+                        sock.wake_tcp_waiters();
+                    }
+                }
+            }
+            return None;
+        }
+
+        // Look up existing connection by 4-tuple
+        let sock = match self.lookup_tcp_conn(dst_ip, header.dst_port, src_ip, header.src_port) {
+            Some(s) => s,
+            None => {
+                // No connection found - send RST per RFC 793
+                return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+            }
+        };
+
+        // Process based on current TCP state
+        let mut guard = sock.tcp.lock();
+        let tcp_state = match guard.as_mut() {
+            Some(s) => s,
+            None => {
+                // Socket has no TCP state (shouldn't happen for TCP sockets)
+                drop(guard);
+                return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+            }
+        };
+
+        match tcp_state.control.state {
+            TcpState::SynSent => {
+                // Expecting SYN-ACK to complete active open
+                let is_syn = header.flags & TCP_FLAG_SYN != 0;
+                let is_ack = header.flags & TCP_FLAG_ACK != 0;
+
+                // RFC 793: In SYN-SENT, must receive SYN+ACK
+                // A pure ACK or other segment should elicit RST
+                if !is_ack {
+                    // No ACK flag - ignore (could be simultaneous open SYN)
+                    return None;
+                }
+
+                if !is_syn {
+                    // ACK without SYN in SYN-SENT is invalid per RFC 793
+                    // Send RST and abort connection
+                    tcp_state.control.state = TcpState::Closed;
+                    drop(guard);
+                    self.cleanup_tcp_connection(&sock);
+                    sock.wake_tcp_waiters();
+                    return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                }
+
+                // Validate ACK number: must acknowledge our SYN (ISS + 1)
+                let expected_ack = tcp_state.control.snd_nxt;
+                if header.ack_num != expected_ack {
+                    // Invalid ACK - send RST and abort connection
+                    tcp_state.control.state = TcpState::Closed;
+                    drop(guard);
+                    self.cleanup_tcp_connection(&sock);
+                    sock.wake_tcp_waiters();
+                    return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                }
+
+                // Accept the remote's ISN and transition to ESTABLISHED
+                tcp_state.control.irs = header.seq_num;
+                // RFC 793: ACK the SYN (1 byte) plus any payload data
+                let syn_len = 1u32;
+                let data_len = payload.len() as u32;
+                tcp_state.control.rcv_nxt = header.seq_num.wrapping_add(syn_len).wrapping_add(data_len);
+                tcp_state.control.snd_una = header.ack_num;
+                // Initialize send window from SYN-ACK (RFC 793)
+                tcp_state.control.snd_wnd = header.window as u32;
+                tcp_state.control.snd_wl1 = header.seq_num;
+                tcp_state.control.snd_wl2 = header.ack_num;
+                tcp_state.control.state = TcpState::Established;
+
+                // Build ACK segment to complete 3-way handshake
+                let ack_segment = build_tcp_segment(
+                    dst_ip,                          // src (our IP)
+                    src_ip,                          // dst (peer IP)
+                    header.dst_port,                 // src port (our port)
+                    header.src_port,                 // dst port (peer port)
+                    tcp_state.control.snd_nxt,       // seq = our next seq
+                    tcp_state.control.rcv_nxt,       // ack = their ISN + 1 + data
+                    TCP_FLAG_ACK,
+                    TCP_DEFAULT_WINDOW,
+                    &[],
+                );
+
+                // Wake any threads blocked in connect()
+                drop(guard);
+                sock.wake_tcp_waiters();
+
+                Some(ack_segment)
+            }
+
+            TcpState::Established => {
+                let is_ack = header.flags & TCP_FLAG_ACK != 0;
+
+                // RFC 793: in synchronized states, segments must carry ACK
+                if !is_ack {
+                    return None;
+                }
+
+                // Calculate current advertised receive window
+                let advertised_wnd = tcp_state
+                    .control
+                    .rcv_wnd
+                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+
+                // Validate ACK is within acceptable range
+                // ACK must be: snd_una <= ack_num <= snd_nxt
+                let ack_in_range = {
+                    let diff_una = header.ack_num.wrapping_sub(tcp_state.control.snd_una) as i32;
+                    let diff_nxt = header.ack_num.wrapping_sub(tcp_state.control.snd_nxt) as i32;
+                    diff_una >= 0 && diff_nxt <= 0
+                };
+
+                if ack_in_range {
+                    // Update snd_una to acknowledge sent data
+                    tcp_state.control.snd_una = header.ack_num;
+
+                    // Refresh send window using newest SEG.SEQ/SEG.ACK (RFC 793)
+                    if header.seq_num > tcp_state.control.snd_wl1
+                        || (header.seq_num == tcp_state.control.snd_wl1
+                            && header.ack_num >= tcp_state.control.snd_wl2)
+                    {
+                        tcp_state.control.snd_wnd = header.window as u32;
+                        tcp_state.control.snd_wl1 = header.seq_num;
+                        tcp_state.control.snd_wl2 = header.ack_num;
+                    }
+                } else {
+                    // Unacceptable ACK: send duplicate ACK without aborting (RFC 793)
+                    let dup_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        advertised_wnd as u16,
+                        &[],
+                    );
+                    drop(guard);
+                    return Some(dup_ack);
+                }
+
+                // Process incoming data if present
+                if !payload.is_empty() {
+                    // Recalculate window after ACK processing
+                    let window_after_ack = tcp_state
+                        .control
+                        .rcv_wnd
+                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+
+                    // Check if segment is in-order (seq == rcv_nxt)
+                    if header.seq_num != tcp_state.control.rcv_nxt {
+                        // Out-of-order segment: send ACK with expected seq
+                        let dup_ack = build_tcp_segment(
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
+                            tcp_state.control.snd_nxt,
+                            tcp_state.control.rcv_nxt,
+                            TCP_FLAG_ACK,
+                            window_after_ack as u16,
+                            &[],
+                        );
+                        return Some(dup_ack);
+                    }
+
+                    // Drop data that would overrun the advertised receive window
+                    if (payload.len() as u32) > window_after_ack {
+                        let win_ack = build_tcp_segment(
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
+                            tcp_state.control.snd_nxt,
+                            tcp_state.control.rcv_nxt,
+                            TCP_FLAG_ACK,
+                            window_after_ack as u16,
+                            &[],
+                        );
+                        return Some(win_ack);
+                    }
+
+                    // LSM check before buffering data
+                    let mut ctx = self.ctx_from_socket(&sock);
+                    ctx.remote = ipv4_to_u64(src_ip.0);
+                    ctx.remote_port = header.src_port;
+                    if hook_net_recv(&sock.label.creator, &ctx, payload.len()).is_err() {
+                        // LSM denied - silently drop
+                        return None;
+                    }
+
+                    // Buffer the in-order data
+                    tcp_state.control.recv_buffer.extend(payload.iter().copied());
+
+                    // Update rcv_nxt
+                    tcp_state.control.rcv_nxt = tcp_state
+                        .control
+                        .rcv_nxt
+                        .wrapping_add(payload.len() as u32);
+
+                    // Recalculate window after buffering
+                    let window_after = tcp_state
+                        .control
+                        .rcv_wnd
+                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+
+                    // Build ACK for the received data
+                    let data_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        window_after as u16,
+                        &[],
+                    );
+
+                    drop(guard);
+
+                    // Wake any threads blocked in tcp_recv()
+                    sock.wake_tcp_data_waiters();
+
+                    return Some(data_ack);
+                }
+
+                // Pure ACK with no data - nothing more to do
+                None
+            }
+
+            _ => {
+                // Other states not yet implemented
+                None
+            }
+        }
+    }
+
+    /// Clean up TCP connection resources (bindings and 4-tuple registration).
+    ///
+    /// Called when a connection is aborted (RST received, timeout, error).
+    fn cleanup_tcp_connection(&self, sock: &Arc<SocketState>) {
+        let meta = sock.meta_snapshot();
+
+        // Remove local port binding
+        if let Some(port) = meta.local_port {
+            self.tcp_bindings.lock().remove(&port);
+        }
+
+        // Remove 4-tuple from connection map
+        if let (Some(lip), Some(lport), Some(rip), Some(rport)) = (
+            meta.local_ip,
+            meta.local_port,
+            meta.remote_ip,
+            meta.remote_port,
+        ) {
+            let key = tcp_map_key_from_parts(Ipv4Addr(lip), lport, Ipv4Addr(rip), rport);
+            self.tcp_conns.lock().remove(&key);
+        }
+
+        // Clear remote metadata to allow retry
+        {
+            let mut meta = sock.meta.lock();
+            meta.remote_ip = None;
+            meta.remote_port = None;
+        }
+
+        // Close and wake TCP waiters before dropping the TCB
+        let mut tcp_guard = sock.tcp.lock();
+        if let Some(tcp_state) = tcp_guard.as_ref() {
+            tcp_state.state_waiters.close();
+            tcp_state.state_waiters.wake_all();
+            tcp_state.data_waiters.close();
+            tcp_state.data_waiters.wake_all();
+        }
+        *tcp_guard = None;
+    }
+
+    /// Build a TCP RST segment for invalid/unknown connections.
+    ///
+    /// Per RFC 793:
+    /// - If ACK was set: RST seq = incoming ACK number, no ACK flag
+    /// - If ACK was not set: RST seq = 0, ACK = incoming SEQ + segment length
+    fn build_tcp_rst(
+        &self,
+        local_ip: Ipv4Addr,
+        remote_ip: Ipv4Addr,
+        header: &TcpHeader,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let is_ack = header.flags & TCP_FLAG_ACK != 0;
+        let is_syn = header.flags & TCP_FLAG_SYN != 0;
+        let is_fin = header.flags & 0x01 != 0; // FIN flag
+
+        if is_ack {
+            // RFC 793: <SEQ=SEG.ACK><CTL=RST>
+            build_tcp_segment(
+                local_ip,
+                remote_ip,
+                header.dst_port,
+                header.src_port,
+                header.ack_num,
+                0,
+                TCP_FLAG_RST,
+                0,
+                &[],
+            )
+        } else {
+            // RFC 793: <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>
+            let mut seg_len = payload.len() as u32;
+            if is_syn {
+                seg_len = seg_len.wrapping_add(1);
+            }
+            if is_fin {
+                seg_len = seg_len.wrapping_add(1);
+            }
+            let ack_num = header.seq_num.wrapping_add(seg_len);
+
+            build_tcp_segment(
+                local_ip,
+                remote_ip,
+                header.dst_port,
+                header.src_port,
+                0,
+                ack_num,
+                TCP_FLAG_RST | TCP_FLAG_ACK,
+                0,
+                &[],
+            )
+        }
     }
 }
 
@@ -1157,6 +2224,34 @@ fn ipv4_to_u64(bytes: [u8; 4]) -> u64 {
     u32::from_be_bytes(bytes) as u64
 }
 
+/// Build TCP lookup key from connection parts.
+#[inline]
+fn tcp_map_key_from_parts(
+    local_ip: Ipv4Addr,
+    local_port: u16,
+    remote_ip: Ipv4Addr,
+    remote_port: u16,
+) -> TcpLookupKey {
+    (
+        u32::from_be_bytes(local_ip.0),
+        local_port,
+        u32::from_be_bytes(remote_ip.0),
+        remote_port,
+    )
+}
+
+/// Build TCP lookup key from TcpConnKey.
+#[inline]
+#[allow(dead_code)]
+fn tcp_map_key_from_conn_key(key: &TcpConnKey) -> TcpLookupKey {
+    (
+        u32::from_be_bytes(key.local_ip.0),
+        key.local_port,
+        u32::from_be_bytes(key.remote_ip.0),
+        key.remote_port,
+    )
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1175,14 +2270,19 @@ mod tests {
     #[test]
     fn test_socket_type_from_raw() {
         assert_eq!(SocketType::from_raw(2), Some(SocketType::Dgram));
-        assert_eq!(SocketType::from_raw(1), None); // SOCK_STREAM
+        assert_eq!(SocketType::from_raw(1), Some(SocketType::Stream)); // SOCK_STREAM
     }
 
     #[test]
     fn test_socket_protocol_from_raw() {
-        assert_eq!(SocketProtocol::from_raw(17), Some(SocketProtocol::Udp));
-        assert_eq!(SocketProtocol::from_raw(0), Some(SocketProtocol::Udp));
-        assert_eq!(SocketProtocol::from_raw(6), None); // TCP
+        // UDP tests
+        assert_eq!(SocketProtocol::from_raw(17, SocketType::Dgram), Some(SocketProtocol::Udp));
+        assert_eq!(SocketProtocol::from_raw(0, SocketType::Dgram), Some(SocketProtocol::Udp));
+        // TCP tests
+        assert_eq!(SocketProtocol::from_raw(6, SocketType::Stream), Some(SocketProtocol::Tcp));
+        assert_eq!(SocketProtocol::from_raw(0, SocketType::Stream), Some(SocketProtocol::Tcp));
+        // Invalid
+        assert_eq!(SocketProtocol::from_raw(99, SocketType::Dgram), None);
     }
 
     #[test]

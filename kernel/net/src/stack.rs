@@ -38,17 +38,22 @@
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use spin::{Mutex, Once};
 
-use crate::arp::{process_arp, ArpCache, ArpError, ArpResult, ArpStats};
+use crate::arp::{process_arp, ArpCache, ArpEntryKind, ArpError, ArpResult, ArpStats};
 use crate::buffer::NetBuf;
+use crate::device::TxError;
 use crate::ethernet::{parse_ethernet, build_ethernet_frame, EthAddr, EthHeader, ETHERTYPE_IPV4, ETHERTYPE_ARP};
+use crate::get_device;
 use crate::icmp::{build_echo_reply, parse_icmp, IcmpError, ICMP_RATE_LIMITER, ICMP_TYPE_ECHO_REQUEST};
 use crate::ipv4::{
     build_ipv4_header, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
     IPV4_HEADER_MIN_LEN,
 };
 use crate::socket::socket_table;
+use crate::tcp::{parse_tcp_header, verify_tcp_checksum, TcpError, TCP_HEADER_MIN_LEN};
 use crate::udp::{parse_udp, UdpError, UdpResult, UdpStats};
+use crate::DEFAULT_MTU;
 
 // ============================================================================
 // Statistics
@@ -165,6 +170,8 @@ pub enum DropReason {
     ArpError(ArpError),
     /// UDP processing error
     UdpError(UdpError),
+    /// TCP processing error
+    TcpError(TcpError),
     /// Unsupported EtherType
     UnsupportedEtherType,
     /// Unsupported IP protocol
@@ -312,9 +319,8 @@ fn process_ipv4(
             process_udp(payload, &ip_hdr, stats, is_broadcast_dst, now_ms)
         }
         Some(Ipv4Proto::Tcp) => {
-            // TODO: TCP handling
-            stats.inc_unsupported_proto();
-            ProcessResult::Dropped(DropReason::UnsupportedProtocol)
+            // Process TCP packet
+            process_tcp(payload, &ip_hdr, eth_hdr, stats, is_broadcast_dst)
         }
         None => {
             stats.inc_unsupported_proto();
@@ -467,6 +473,289 @@ fn process_icmp(
 
     // Other ICMP types are just handled (logged but no response)
     ProcessResult::Handled
+}
+
+/// Process a TCP segment.
+///
+/// # Security
+///
+/// - Does NOT process segments sent to broadcast/multicast addresses
+///   (prevents amplification attacks)
+/// - Validates checksum before processing
+/// - Sends RST for unknown connections
+fn process_tcp(
+    payload: &[u8],
+    ip_hdr: &Ipv4Header,
+    eth_hdr: &EthHeader,
+    stats: &NetStats,
+    is_broadcast_dst: bool,
+) -> ProcessResult {
+    // Security: ignore TCP to broadcast/multicast destinations
+    if is_broadcast_dst || ip_hdr.dst.is_multicast() {
+        stats.inc_unsupported_proto();
+        return ProcessResult::Handled;
+    }
+
+    // Parse TCP header
+    let tcp_hdr = match parse_tcp_header(payload) {
+        Ok(h) => h,
+        Err(e) => {
+            stats.inc_rx_errors();
+            return ProcessResult::Dropped(DropReason::TcpError(e));
+        }
+    };
+
+    // Validate header length
+    let hdr_len = tcp_hdr.header_len();
+    if payload.len() < hdr_len || hdr_len < TCP_HEADER_MIN_LEN {
+        stats.inc_rx_errors();
+        return ProcessResult::Dropped(DropReason::TcpError(TcpError::Truncated));
+    }
+
+    // Verify checksum
+    if !verify_tcp_checksum(ip_hdr.src, ip_hdr.dst, payload) {
+        stats.inc_rx_errors();
+        return ProcessResult::Dropped(DropReason::TcpError(TcpError::BadChecksum));
+    }
+
+    // Extract payload (data after TCP header)
+    let tcp_payload = &payload[hdr_len..];
+
+    // Delegate to socket layer for stateful TCP processing
+    if let Some(resp_seg) = socket_table().process_tcp_segment(
+        ip_hdr.src,
+        ip_hdr.dst,
+        &tcp_hdr,
+        tcp_payload,
+    ) {
+        // Build IPv4 header (swap src/dst)
+        let ip_reply = build_ipv4_header(
+            ip_hdr.dst,      // Our IP as source
+            ip_hdr.src,      // Original source as destination
+            Ipv4Proto::Tcp,
+            resp_seg.len() as u16,
+            64,              // Default TTL
+        );
+
+        // Combine IP header and TCP segment
+        let mut ip_packet = Vec::with_capacity(ip_reply.len() + resp_seg.len());
+        ip_packet.extend_from_slice(&ip_reply);
+        ip_packet.extend_from_slice(&resp_seg);
+
+        // Build Ethernet frame (swap MACs)
+        let frame = build_ethernet_frame(
+            eth_hdr.src,     // Original source as destination
+            eth_hdr.dst,     // Our MAC as source
+            ETHERTYPE_IPV4,
+            &ip_packet,
+        );
+
+        return ProcessResult::Reply(frame);
+    }
+
+    ProcessResult::Handled
+}
+
+// ============================================================================
+// Outbound Transmission (TX path)
+// ============================================================================
+
+/// Default IP address for Zero-OS in QEMU user-mode networking.
+const DEFAULT_OUR_IP: Ipv4Addr = Ipv4Addr([10, 0, 2, 15]);
+
+/// Default gateway IP in QEMU user-mode networking.
+const DEFAULT_GATEWAY_IP: Ipv4Addr = Ipv4Addr([10, 0, 2, 2]);
+
+/// Default gateway MAC (QEMU's virtual router).
+/// This is the standard MAC QEMU assigns to its SLIRP gateway.
+const DEFAULT_GATEWAY_MAC: EthAddr = EthAddr([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+
+/// Network configuration for TX path.
+#[derive(Clone, Copy)]
+struct NetConfig {
+    our_ip: Ipv4Addr,
+    our_mac: EthAddr,
+    gateway_ip: Ipv4Addr,
+    gateway_mac: EthAddr,
+}
+
+impl Default for NetConfig {
+    fn default() -> Self {
+        NetConfig {
+            our_ip: DEFAULT_OUR_IP,
+            our_mac: EthAddr::ZERO,
+            gateway_ip: DEFAULT_GATEWAY_IP,
+            gateway_mac: DEFAULT_GATEWAY_MAC,
+        }
+    }
+}
+
+/// Public snapshot of network configuration.
+#[derive(Clone, Copy)]
+pub struct NetConfigSnapshot {
+    pub our_ip: Ipv4Addr,
+    pub our_mac: EthAddr,
+    pub gateway_ip: Ipv4Addr,
+    pub gateway_mac: EthAddr,
+}
+
+/// Global network state for TX path.
+struct NetState {
+    config: Mutex<NetConfig>,
+    arp: Mutex<ArpCache>,
+}
+
+static NET_STATE: Once<NetState> = Once::new();
+
+#[inline]
+fn net_state() -> &'static NetState {
+    NET_STATE.call_once(|| NetState {
+        config: Mutex::new(NetConfig::default()),
+        arp: Mutex::new(ArpCache::with_defaults()),
+    })
+}
+
+/// Resolve MAC address from network device if not yet set.
+fn resolve_mac_from_device(cfg: &mut NetConfig) {
+    if cfg.our_mac != EthAddr::ZERO {
+        return;
+    }
+    if let Some(dev) = get_device("eth0") {
+        let mac_bytes = dev.lock().mac_address();
+        cfg.our_mac = EthAddr(mac_bytes);
+    }
+}
+
+/// Get a snapshot of the current network configuration.
+///
+/// Lazily initializes our MAC address from the network device.
+pub fn network_config() -> NetConfigSnapshot {
+    let state = net_state();
+    let mut cfg = state.config.lock();
+    resolve_mac_from_device(&mut cfg);
+    NetConfigSnapshot {
+        our_ip: cfg.our_ip,
+        our_mac: cfg.our_mac,
+        gateway_ip: cfg.gateway_ip,
+        gateway_mac: cfg.gateway_mac,
+    }
+}
+
+/// Resolve destination MAC address.
+///
+/// For now, we use the gateway MAC for all destinations.
+/// A proper implementation would check if dst_ip is on the local subnet
+/// and use ARP for local destinations.
+fn resolve_dst_mac(dst_ip: Ipv4Addr, cfg: &NetConfigSnapshot) -> EthAddr {
+    let state = net_state();
+    let mut cache = state.arp.lock();
+
+    // Static timestamp (proper implementation would use kernel time)
+    let now_ms = 0;
+
+    // Ensure gateway is always in cache
+    let _ = cache.insert(cfg.gateway_ip, cfg.gateway_mac, ArpEntryKind::Static, now_ms);
+
+    // Try direct lookup first
+    if let Some(mac) = cache.lookup(dst_ip, now_ms) {
+        return mac;
+    }
+
+    // Fall back to gateway MAC for off-link destinations
+    cfg.gateway_mac
+}
+
+/// Build complete Ethernet frame and transmit via network device.
+fn build_frame_and_transmit(proto: Ipv4Proto, dst_ip: Ipv4Addr, payload: &[u8]) -> Result<(), TxError> {
+    if payload.is_empty() || payload.len() > DEFAULT_MTU {
+        return Err(TxError::InvalidBuffer);
+    }
+
+    let cfg = network_config();
+    if cfg.our_mac == EthAddr::ZERO {
+        // No network device available
+        return Err(TxError::LinkDown);
+    }
+
+    let dst_mac = resolve_dst_mac(dst_ip, &cfg);
+
+    // Build IPv4 header
+    let ip_hdr = build_ipv4_header(cfg.our_ip, dst_ip, proto, payload.len() as u16, 64);
+
+    // Construct complete IP packet
+    let mut ip_packet = Vec::with_capacity(ip_hdr.len() + payload.len());
+    ip_packet.extend_from_slice(&ip_hdr);
+    ip_packet.extend_from_slice(payload);
+
+    // Build Ethernet frame
+    let frame = build_ethernet_frame(dst_mac, cfg.our_mac, ETHERTYPE_IPV4, &ip_packet);
+
+    // Allocate NetBuf and copy frame data
+    let frame_phys = mm::buddy_allocator::alloc_physical_pages(1)
+        .ok_or(TxError::InvalidBuffer)?;
+
+    let mut buf = match NetBuf::with_defaults(frame_phys) {
+        Some(b) => b,
+        None => {
+            mm::buddy_allocator::free_physical_pages(frame_phys, 1);
+            return Err(TxError::InvalidBuffer);
+        }
+    };
+
+    let data = match buf.push_tail(frame.len()) {
+        Some(d) => d,
+        None => {
+            // NetBuf Drop will free the frame
+            return Err(TxError::InvalidBuffer);
+        }
+    };
+    data.copy_from_slice(&frame);
+
+    // Transmit via network device
+    let dev = match get_device("eth0") {
+        Some(d) => d,
+        None => {
+            return Err(TxError::LinkDown);
+        }
+    };
+
+    let result = match dev.lock().transmit(buf) {
+        Ok(()) => Ok(()),
+        Err((err, _returned)) => Err(err),
+    };
+    result
+}
+
+/// Transmit a serialized TCP segment (without IP/Ethernet headers).
+///
+/// The segment should be a complete TCP header + payload as built by
+/// the socket layer's tcp_send() or connect().
+///
+/// # Arguments
+/// * `dst_ip` - Destination IP address
+/// * `segment` - Complete TCP segment (header + payload)
+///
+/// # Returns
+/// * `Ok(())` on successful transmission
+/// * `Err(TxError)` on failure
+pub fn transmit_tcp_segment(dst_ip: Ipv4Addr, segment: &[u8]) -> Result<(), TxError> {
+    build_frame_and_transmit(Ipv4Proto::Tcp, dst_ip, segment)
+}
+
+/// Transmit a serialized UDP datagram (without IP/Ethernet headers).
+///
+/// The datagram should be a complete UDP header + payload as built by
+/// the socket layer's send_to_udp().
+///
+/// # Arguments
+/// * `dst_ip` - Destination IP address
+/// * `datagram` - Complete UDP datagram (header + payload)
+///
+/// # Returns
+/// * `Ok(())` on successful transmission
+/// * `Err(TxError)` on failure
+pub fn transmit_udp_datagram(dst_ip: Ipv4Addr, datagram: &[u8]) -> Result<(), TxError> {
+    build_frame_and_transmit(Ipv4Proto::Udp, dst_ip, datagram)
 }
 
 // ============================================================================

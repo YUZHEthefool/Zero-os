@@ -1,5 +1,6 @@
 #![no_std]
 #![feature(abi_x86_interrupt)]
+#![feature(thread_local)]
 extern crate alloc;
 
 // 导入 drivers crate 的宏
