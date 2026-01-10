@@ -10,6 +10,12 @@ static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 /// 系统启动时间的 TSC 值（用于更精确的时间测量）
 static BOOT_TSC: AtomicU64 = AtomicU64::new(0);
 
+/// Last TIME_WAIT sweep timestamp (ms)
+static LAST_TIME_WAIT_SWEEP: AtomicU64 = AtomicU64::new(0);
+
+/// TIME_WAIT sweep interval in milliseconds (5 seconds)
+const TIME_WAIT_SWEEP_INTERVAL_MS: u64 = 5000;
+
 /// 初始化时间子系统
 pub fn init() {
     // 记录启动时的 TSC 值
@@ -22,7 +28,20 @@ pub fn init() {
 /// 应由定时器中断处理程序调用
 #[inline]
 pub fn on_timer_tick() {
-    TICK_COUNT.fetch_add(1, Ordering::SeqCst);
+    let current = TICK_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+
+    // Periodically sweep TIME_WAIT connections (every TIME_WAIT_SWEEP_INTERVAL_MS)
+    let last_sweep = LAST_TIME_WAIT_SWEEP.load(Ordering::Relaxed);
+    if current.saturating_sub(last_sweep) >= TIME_WAIT_SWEEP_INTERVAL_MS {
+        // Try to claim the sweep (avoid multiple concurrent sweeps)
+        if LAST_TIME_WAIT_SWEEP
+            .compare_exchange(last_sweep, current, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            // Call the TIME_WAIT sweep function
+            net::socket_table().sweep_time_wait(current);
+        }
+    }
 }
 
 /// 获取当前时钟计数（自启动以来的时钟周期数）

@@ -1847,6 +1847,7 @@ pub fn syscall_dispatcher(
             arg4 as *mut SockAddrIn,
             arg5 as *mut u32,
         ),
+        48 => sys_shutdown(arg0 as i32, arg1 as i32),
 
         _ => Err(SyscallError::ENOSYS),
     };
@@ -6013,16 +6014,28 @@ fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult 
     let timeout_ticks = TCP_CONNECT_TIMEOUT_NS / 1_000_000; // Convert ns to ms (1 tick = ~1ms)
 
     loop {
-        // Check if connection established
+        // Check if connection established or failed
         match socket.tcp_state() {
             Some(net::TcpState::Established) => return Ok(0),
-            Some(net::TcpState::Closed) => return Err(SyscallError::ECONNREFUSED),
-            _ => {}
+            Some(net::TcpState::Closed) => {
+                // R50-3 FIX: Clean up resources on connection refused
+                net::socket_table().abort_tcp_connect(&socket);
+                return Err(SyscallError::ECONNREFUSED);
+            }
+            None => {
+                // R50-3 FIX (codex review): TCB was cleaned up by RST or error
+                // Return connection refused since the connection attempt failed
+                return Err(SyscallError::ECONNREFUSED);
+            }
+            _ => {} // Still connecting (SYN_SENT)
         }
 
         // Check timeout
         let elapsed = crate::time::get_ticks() - start_ticks;
         if elapsed > timeout_ticks {
+            // R50-3 FIX: Clean up TCB, port binding, and 4-tuple on timeout
+            // This prevents resource exhaustion from abandoned connection attempts
+            net::socket_table().abort_tcp_connect(&socket);
             return Err(SyscallError::ETIMEDOUT);
         }
 
@@ -6255,6 +6268,61 @@ fn sys_recvfrom(
     }
 
     Ok(copy_len)
+}
+
+/// sys_shutdown - Shutdown TCP connection (syscall 48).
+///
+/// Implements graceful connection shutdown per RFC 793.
+///
+/// # Arguments
+/// * `fd` - Socket file descriptor
+/// * `how` - Shutdown mode: 0 = SHUT_RD, 1 = SHUT_WR, 2 = SHUT_RDWR
+///
+/// # State Transitions
+/// - ESTABLISHED + SHUT_WR → FIN_WAIT_1 (sends FIN)
+/// - CLOSE_WAIT + SHUT_WR → LAST_ACK (sends FIN)
+///
+/// # Security
+/// - Verifies CapRights::WRITE for SHUT_WR/SHUT_RDWR
+/// - Invokes LSM hook_net_shutdown for policy check
+fn sys_shutdown(fd: i32, how: i32) -> SyscallResult {
+    // Validate how parameter
+    const SHUT_RD: i32 = 0;
+    const SHUT_WR: i32 = 1;
+    const SHUT_RDWR: i32 = 2;
+
+    if how != SHUT_RD && how != SHUT_WR && how != SHUT_RDWR {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let (cap_id, socket_id, _nonblock) = socket_handle_from_fd(fd)?;
+    let (entry, socket) = resolve_socket(cap_id, socket_id)?;
+
+    // Only TCP sockets support shutdown
+    if socket.ty != net::SocketType::Stream || socket.proto != net::SocketProtocol::Tcp {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+
+    // WRITE right required for SHUT_WR or SHUT_RDWR
+    if how != SHUT_RD && !entry.rights.allows(cap::CapRights::WRITE) {
+        return Err(SyscallError::EACCES);
+    }
+
+    // Get current process context
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
+
+    // Call tcp_shutdown
+    match net::socket_table().tcp_shutdown(&socket, &ctx, cap_id, how) {
+        Ok(Some(fin_segment)) => {
+            // Transmit the FIN segment
+            if let Some(dst_ip) = socket.remote_ip() {
+                let _ = net::transmit_tcp_segment(net::Ipv4Addr(dst_ip), &fin_segment);
+            }
+            Ok(0)
+        }
+        Ok(None) => Ok(0), // SHUT_RD or FIN already sent
+        Err(e) => Err(socket_error_to_syscall(e)),
+    }
 }
 
 /// 系统调用统计

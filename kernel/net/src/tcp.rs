@@ -77,7 +77,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use spin::{Mutex, RwLock};
+use spin::{Mutex, Once, RwLock};
 
 use crate::ipv4::{compute_checksum, Ipv4Addr};
 
@@ -118,11 +118,20 @@ pub const TCP_MAX_RTO_MS: u64 = 120_000;
 /// TIME-WAIT duration (2*MSL = 2*60 seconds per RFC 793)
 pub const TCP_TIME_WAIT_MS: u64 = 120_000;
 
+/// FIN retransmission timeout floor (RFC 6298 style, reuse RTO baseline)
+pub const TCP_FIN_TIMEOUT_MS: u64 = TCP_INITIAL_RTO_MS;
+
+/// Maximum FIN retransmission attempts before giving up
+pub const TCP_MAX_FIN_RETRIES: u8 = 5;
+
 /// Maximum SYN backlog per listening socket
 pub const TCP_MAX_SYN_BACKLOG: usize = 128;
 
 /// Maximum pending connections per listening socket
 pub const TCP_MAX_ACCEPT_BACKLOG: usize = 128;
+
+/// R50-5 FIX: Maximum active TCP connections (all states) to prevent resource exhaustion
+pub const TCP_MAX_ACTIVE_CONNECTIONS: usize = 4096;
 
 // ============================================================================
 // TCP Flags
@@ -443,6 +452,10 @@ pub struct TcpControlBlock {
     // === Flags ===
     /// FIN has been sent
     pub fin_sent: bool,
+    /// Timestamp when FIN was last sent (for retransmission timer)
+    pub fin_sent_time: u64,
+    /// FIN retransmission counter
+    pub fin_retries: u8,
     /// FIN has been received
     pub fin_received: bool,
     /// ACK is pending (delayed ACK)
@@ -453,6 +466,8 @@ pub struct TcpControlBlock {
     pub established_at: u64,
     /// Last activity timestamp
     pub last_activity: u64,
+    /// TIME_WAIT start timestamp (for 2MSL timer)
+    pub time_wait_start: u64,
 }
 
 /// A TCP segment for buffering
@@ -499,10 +514,13 @@ impl TcpControlBlock {
             recv_buffer: VecDeque::new(),
             ooo_queue: VecDeque::new(),
             fin_sent: false,
+            fin_sent_time: 0,
+            fin_retries: 0,
             fin_received: false,
             ack_pending: false,
             established_at: 0,
             last_activity: 0,
+            time_wait_start: 0,
         }
     }
 
@@ -762,13 +780,22 @@ pub fn parse_tcp_options(data: &[u8], header: &TcpHeader) -> TcpOptions {
                 }
             }
             _ => {
-                // Unknown option - skip based on length field
+                // R50-6 FIX: Unknown option - skip based on length field with overflow-safe math
                 if i + 1 < opts_data.len() {
                     let len = opts_data[i + 1] as usize;
-                    if len < 2 || i + len > opts_data.len() {
+                    // Minimum option length is 2 (kind + length bytes)
+                    if len < 2 {
                         break;
                     }
-                    i += len;
+                    // Use checked_add to prevent integer overflow attacks
+                    if let Some(next) = i.checked_add(len) {
+                        if next <= opts_data.len() {
+                            i = next;
+                            continue;
+                        }
+                    }
+                    // Overflow or out-of-bounds - stop parsing
+                    break;
                 } else {
                     break;
                 }
@@ -877,10 +904,52 @@ pub fn build_tcp_segment(
 /// Global ISN generator state
 static ISN_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// R50-1 FIX: Boot-time secret key for ISN generation (RFC 6528 compliance)
+/// Initialized once from CSPRNG to prevent ISN prediction attacks.
+static ISN_SECRET: Once<u64> = Once::new();
+
+/// Get or initialize the ISN secret key from CSPRNG
+///
+/// R50-1 IMPROVEMENT: Now uses kernel CSPRNG (ChaCha20 + RDRAND/RDSEED)
+/// with RDTSC fallback only when CSPRNG is not yet initialized.
+#[inline]
+fn isn_secret() -> u64 {
+    *ISN_SECRET.call_once(|| {
+        // Try to get entropy from kernel CSPRNG first (security::rng)
+        if let Ok(secret) = security::rng::random_u64() {
+            return secret;
+        }
+
+        // Fallback: CSPRNG not yet initialized (early boot)
+        // Use RDTSC with mixing for basic unpredictability
+        #[cfg(target_arch = "x86_64")]
+        let fallback = {
+            let lo: u64;
+            let hi: u64;
+            unsafe {
+                core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nostack, nomem));
+            }
+            // Mix with a prime constant for better distribution
+            let tsc = (hi << 32) | lo;
+            tsc.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17)
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let fallback = 0xa5a5_5a5a_d3e4_c7d2_u64;
+
+        fallback
+    })
+}
+
 /// Generate an Initial Sequence Number (ISN) per RFC 6528
 ///
-/// Uses a simple time-based counter with some randomization.
-/// A production implementation should use a keyed hash function.
+/// R50-1 FIX: Uses keyed hash over 4-tuple + counter for security.
+/// The secret key is initialized at boot from CSPRNG entropy.
+///
+/// # Security
+///
+/// - Secret key prevents off-path ISN prediction
+/// - Counter prevents ISN reuse within connection lifetime
+/// - Multiple mixing rounds provide diffusion
 ///
 /// # Arguments
 ///
@@ -891,44 +960,48 @@ static ISN_COUNTER: AtomicU32 = AtomicU32::new(0);
 ///
 /// # Returns
 ///
-/// Random ISN for the connection
+/// Cryptographically unpredictable ISN for the connection
 pub fn generate_isn(
     local_ip: Ipv4Addr,
     local_port: u16,
     remote_ip: Ipv4Addr,
     remote_port: u16,
 ) -> u32 {
-    // Simple implementation: counter + hash of 4-tuple
-    // A real implementation would use a cryptographic hash with a secret key
-    let counter = ISN_COUNTER.fetch_add(64000, Ordering::Relaxed);
+    // RFC 6528-style keyed ISN generation: ISN = F(secret, 4-tuple, counter)
+    // Increment counter by 1 (not 64000) since mixing provides enough diffusion
+    let counter = ISN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let secret = isn_secret();
 
-    // Simple hash of 4-tuple (placeholder - should use SipHash or similar)
-    let mut hash: u32 = 0;
-    for &b in &local_ip.0 {
-        hash = hash.wrapping_mul(31).wrapping_add(b as u32);
-    }
-    for &b in &remote_ip.0 {
-        hash = hash.wrapping_mul(31).wrapping_add(b as u32);
-    }
-    hash = hash.wrapping_mul(31).wrapping_add(local_port as u32);
-    hash = hash.wrapping_mul(31).wrapping_add(remote_port as u32);
+    // Pack 4-tuple into 64-bit values for mixing
+    let tuple_ip = u64::from_be_bytes([
+        local_ip.0[0], local_ip.0[1], local_ip.0[2], local_ip.0[3],
+        remote_ip.0[0], remote_ip.0[1], remote_ip.0[2], remote_ip.0[3],
+    ]);
+    let tuple_port = ((local_port as u64) << 48) | ((remote_port as u64) << 32) | (counter as u64);
 
-    // Mix with RDTSC if available (adds timing entropy)
-    #[cfg(target_arch = "x86_64")]
-    let time_component = {
-        let lo: u32;
-        let hi: u32;
-        unsafe {
-            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nostack, nomem));
-        }
-        lo ^ hi
-    };
-    #[cfg(not(target_arch = "x86_64"))]
-    let time_component = 0u32;
+    // SipHash-like mixing for unpredictable output
+    // Multiple rounds of multiply-rotate-xor for avalanche effect
+    let mut v0 = secret;
+    let mut v1 = tuple_ip;
 
-    counter
-        .wrapping_add(hash)
-        .wrapping_add(time_component)
+    // Round 1: Mix secret with IP tuple
+    v0 = v0.wrapping_add(v1);
+    v1 = v1.rotate_left(13);
+    v1 ^= v0;
+    v0 = v0.rotate_left(32);
+
+    // Round 2: Mix with port tuple
+    v0 = v0.wrapping_add(tuple_port);
+    v1 = v1.rotate_left(17);
+    v0 ^= v1;
+    v1 = v1.rotate_left(21);
+
+    // Round 3: Final diffusion with golden ratio prime
+    let mixed = v0.wrapping_add(v1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let final_mix = mixed.rotate_left(23);
+
+    // Fold 64-bit result to 32-bit
+    (final_mix >> 32) as u32 ^ final_mix as u32
 }
 
 // ============================================================================

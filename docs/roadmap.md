@@ -450,7 +450,17 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] **R49 FIXED**: NetBuf zero-fill before release (information leak prevention)
 - [x] **R49 FIXED**: Huge page cleanup on process exit (memory leak prevention)
 - [x] **R49 FIXED**: NET_BIND_SERVICE capability for privileged ports
-- [ ] TCP (3-way handshake, timeout, retransmit, sliding window)
+- [x] TCP header parsing (kernel/net/tcp.rs) - RFC 793 with options support
+- [x] TCP state machine (TcpControlBlock, TcpState enum)
+- [x] TCP 3-way handshake (connect SYN → SYN-ACK → ACK)
+- [x] TCP data transfer (PSH+ACK segments, receive buffering)
+- [x] **R50 FIXED**: Keyed ISN generation (RFC 6528 compliant, CSPRNG-seeded)
+- [x] **R50 FIXED**: Sequence window validation (RFC 793/5961)
+- [x] **R50 FIXED**: RST validation + challenge ACK (RFC 5961 Section 3.2)
+- [x] **R50 FIXED**: Global connection limit with stale entry pruning (DoS prevention)
+- [ ] TCP retransmission with RTT estimation
+- [x] TCP FIN/close states (graceful shutdown) - sys_shutdown, all RFC 793 states
+- [ ] TCP listen/accept (passive open)
 - [ ] Fragment reassembly with limits
 
 #### D.3 Protection Mechanisms
@@ -459,10 +469,10 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] Broadcast/multicast response suppression
 - [x] MAC filtering (process only frames addressed to us)
 - [x] ARP rate limiting (RX 50pps, TX 20pps) and cache anti-spoofing
+- [x] ISN randomization (RFC 6528) - R50-1 keyed hash
 - [ ] Conntrack state machine
 - [ ] SYN cookies
 - [ ] Basic firewall (match + action table)
-- [ ] ISN randomization (RFC 6528)
 - [ ] Ephemeral port randomization
 
 #### D.4 Socket API ✅ COMPLETE

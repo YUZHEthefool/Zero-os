@@ -52,15 +52,18 @@ use spin::{Mutex, Once, RwLock};
 
 use cap::CapId;
 use lsm::{
-    hook_net_bind, hook_net_connect, hook_net_recv, hook_net_send, hook_net_socket,
-    LsmError, NetCtx, ProcessCtx,
+    hook_net_bind, hook_net_connect, hook_net_recv, hook_net_send, hook_net_shutdown,
+    hook_net_socket, LsmError, NetCtx, ProcessCtx,
 };
 
 use crate::ipv4::Ipv4Addr;
 use crate::tcp::{
-    build_tcp_segment, generate_isn, TcpControlBlock, TcpConnKey, TcpHeader, TcpState,
-    TCP_DEFAULT_WINDOW, TCP_FLAG_ACK, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_PROTO,
+    build_tcp_segment, generate_isn, seq_ge, seq_gt, seq_in_window, TcpControlBlock, TcpConnKey,
+    TcpHeader, TcpState, TCP_DEFAULT_WINDOW, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH,
+    TCP_FLAG_RST, TCP_FLAG_SYN, TCP_FIN_TIMEOUT_MS, TCP_MAX_ACTIVE_CONNECTIONS,
+    TCP_MAX_FIN_RETRIES, TCP_PROTO, TCP_TIME_WAIT_MS,
 };
+use crate::stack::transmit_tcp_segment;
 use crate::udp::{
     build_udp_datagram, UdpError,
     EPHEMERAL_PORT_END, EPHEMERAL_PORT_START, UDP_PROTO,
@@ -835,6 +838,9 @@ pub struct SocketTable {
     tcp_bindings: Mutex<BTreeMap<u16, Weak<SocketState>>>,
     /// Active TCP connections keyed by 4-tuple
     tcp_conns: Mutex<BTreeMap<TcpLookupKey, Weak<SocketState>>>,
+    /// Last observed timestamp (ms) used for TIME_WAIT bookkeeping.
+    /// Updated by sweep_time_wait() and used by RX path when transitioning to TIME_WAIT.
+    time_wait_clock: AtomicU64,
     /// Statistics
     created: AtomicU64,
     closed_count: AtomicU64,
@@ -851,6 +857,7 @@ impl SocketTable {
             udp_bindings: Mutex::new(BTreeMap::new()),
             tcp_bindings: Mutex::new(BTreeMap::new()),
             tcp_conns: Mutex::new(BTreeMap::new()),
+            time_wait_clock: AtomicU64::new(0),
             created: AtomicU64::new(0),
             closed_count: AtomicU64::new(0),
             bind_count: AtomicU64::new(0),
@@ -1202,6 +1209,16 @@ impl SocketTable {
             // Register connection 4-tuple
             {
                 let mut conns = self.tcp_conns.lock();
+
+                // R50-5 IMPROVEMENT: Prune stale Weak entries before counting
+                // This prevents false exhaustion when connections have been dropped
+                // but their Weak references haven't been cleaned up yet
+                conns.retain(|_, weak| weak.strong_count() > 0);
+
+                // R50-5 FIX: Enforce global TCP connection limit to prevent resource exhaustion
+                if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
+                    return Err(SocketError::NoPorts);
+                }
                 // Re-check after lock acquisition (race-safe)
                 if conns.get(&conn_key).and_then(|w| w.upgrade()).is_some() {
                     return Err(SocketError::PortInUse);
@@ -1490,6 +1507,132 @@ impl SocketTable {
         Ok(segment)
     }
 
+    /// Shutdown TCP connection (half-close).
+    ///
+    /// Implements graceful shutdown per RFC 793. SHUT_RD is a no-op (we continue
+    /// receiving data until FIN). SHUT_WR sends FIN and transitions state.
+    ///
+    /// # Arguments
+    ///
+    /// * `sock` - TCP socket
+    /// * `current` - Current process context
+    /// * `cap_id` - Capability used for this operation
+    /// * `how` - Shutdown mode: 0 = SHUT_RD, 1 = SHUT_WR, 2 = SHUT_RDWR
+    ///
+    /// # State Transitions
+    ///
+    /// - ESTABLISHED + SHUT_WR → FIN_WAIT_1 (send FIN)
+    /// - CLOSE_WAIT + SHUT_WR → LAST_ACK (send FIN)
+    ///
+    /// # Security
+    ///
+    /// - Invokes `hook_net_shutdown` for LSM policy check
+    ///
+    /// # Returns
+    ///
+    /// Serialized FIN segment for transmission (if needed), or None.
+    pub fn tcp_shutdown(
+        &self,
+        sock: &Arc<SocketState>,
+        current: &ProcessCtx,
+        cap_id: CapId,
+        how: i32,
+    ) -> Result<Option<Vec<u8>>, SocketError> {
+        const SHUT_RD: i32 = 0;
+        const SHUT_WR: i32 = 1;
+        const SHUT_RDWR: i32 = 2;
+
+        // Validate socket type
+        if sock.ty != SocketType::Stream || sock.proto != SocketProtocol::Tcp {
+            return Err(SocketError::InvalidType);
+        }
+        if sock.is_closed() {
+            return Err(SocketError::Closed);
+        }
+
+        // Validate how parameter
+        if how != SHUT_RD && how != SHUT_WR && how != SHUT_RDWR {
+            return Err(SocketError::InvalidState);
+        }
+
+        // SHUT_RD is a no-op for TCP (we continue receiving until FIN)
+        if how == SHUT_RD {
+            return Ok(None);
+        }
+
+        // Get connection endpoints from metadata
+        let meta = sock.meta_snapshot();
+        let (local_ip, local_port, remote_ip, remote_port) = match (
+            meta.local_ip.map(Ipv4Addr),
+            meta.local_port,
+            meta.remote_ip.map(Ipv4Addr),
+            meta.remote_port,
+        ) {
+            (Some(li), Some(lp), Some(ri), Some(rp)) => (li, lp, ri, rp),
+            _ => return Err(SocketError::InvalidState),
+        };
+
+        // LSM policy check
+        let mut ctx = self.ctx_from_socket(sock);
+        ctx.local = ipv4_to_u64(local_ip.0);
+        ctx.local_port = local_port;
+        ctx.remote = ipv4_to_u64(remote_ip.0);
+        ctx.remote_port = remote_port;
+        ctx.cap = Some(cap_id);
+        hook_net_shutdown(current, &ctx, how).map_err(|_| SocketError::PermissionDenied)?;
+
+        let mut guard = sock.tcp.lock();
+        let tcp_state = guard.as_mut().ok_or(SocketError::InvalidState)?;
+
+        // Check if FIN already sent
+        if tcp_state.control.fin_sent {
+            return Ok(None);
+        }
+
+        // Can only send FIN from states that allow sending
+        if !tcp_state.control.state.can_send() {
+            return Err(SocketError::InvalidState);
+        }
+
+        // Build FIN segment
+        let seq = tcp_state.control.snd_nxt;
+        let ack = tcp_state.control.rcv_nxt;
+        let advertised_wnd = tcp_state
+            .control
+            .rcv_wnd
+            .saturating_sub(tcp_state.control.recv_buffer.len() as u32) as u16;
+
+        // FIN consumes 1 sequence number
+        tcp_state.control.snd_nxt = tcp_state.control.snd_nxt.wrapping_add(1);
+        tcp_state.control.fin_sent = true;
+        tcp_state.control.fin_sent_time = self.time_wait_now();
+        tcp_state.control.fin_retries = 0;
+
+        // State transition
+        tcp_state.control.state = match tcp_state.control.state {
+            TcpState::Established => TcpState::FinWait1,
+            TcpState::CloseWait => TcpState::LastAck,
+            other => other, // Should not happen due to can_send() check
+        };
+
+        let fin_segment = build_tcp_segment(
+            local_ip,
+            remote_ip,
+            local_port,
+            remote_port,
+            seq,
+            ack,
+            TCP_FLAG_FIN | TCP_FLAG_ACK,
+            advertised_wnd,
+            &[],
+        );
+
+        drop(guard);
+        sock.wake_tcp_waiters();
+
+        Ok(Some(fin_segment))
+    }
+
     /// Receive TCP data (blocking with optional timeout).
     ///
     /// Returns data from the receive buffer, blocking if empty.
@@ -1664,11 +1807,137 @@ impl SocketTable {
         sock.enqueue_rx(pkt)
     }
 
-    /// Close and remove a socket.
+    /// Close a socket, initiating TCP graceful shutdown if needed.
     ///
-    /// Called when the capability is revoked or explicitly closed.
+    /// Called when the capability is revoked or file descriptor is closed.
+    ///
+    /// # TCP Graceful Shutdown
+    ///
+    /// For TCP sockets in ESTABLISHED or CLOSE_WAIT state, this function:
+    /// 1. Sends a FIN segment to initiate graceful shutdown
+    /// 2. Transitions state to FIN_WAIT_1 or LAST_ACK
+    /// 3. Keeps the socket registered for FIN retransmission and TIME_WAIT handling
+    ///
+    /// The sweep_time_wait function will clean up the socket after:
+    /// - TIME_WAIT expires (120 seconds per RFC 793)
+    /// - FIN retransmission limit exceeded (peer unresponsive)
+    ///
+    /// For UDP sockets or TCP sockets already closing, immediate cleanup occurs.
     pub fn close(&self, socket_id: u64) {
-        if let Some(sock) = self.sockets.write().remove(&socket_id) {
+        // Fetch the socket without removing it; TCP may need graceful FIN shutdown.
+        let sock = {
+            let sockets = self.sockets.read();
+            sockets.get(&socket_id).cloned()
+        };
+
+        let Some(sock) = sock else {
+            return;
+        };
+
+        let mut keep_registered = false;
+        let mut fin_to_send: Option<(Ipv4Addr, Vec<u8>)> = None;
+
+        // TCP sockets may need to send FIN and stay registered for TIME_WAIT/ACK handling.
+        if sock.proto == SocketProtocol::Tcp {
+            let meta = sock.meta_snapshot();
+            if let (Some(local_ip), Some(local_port), Some(remote_ip), Some(remote_port)) = (
+                meta.local_ip.map(Ipv4Addr),
+                meta.local_port,
+                meta.remote_ip.map(Ipv4Addr),
+                meta.remote_port,
+            ) {
+                let mut guard = sock.tcp.lock();
+                if let Some(tcp_state) = guard.as_mut() {
+                    match tcp_state.control.state {
+                        TcpState::Established => {
+                            keep_registered = true;
+
+                            if !tcp_state.control.fin_sent {
+                                let seq = tcp_state.control.snd_nxt;
+                                let ack = tcp_state.control.rcv_nxt;
+                                let advertised_wnd = tcp_state
+                                    .control
+                                    .rcv_wnd
+                                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32)
+                                    as u16;
+
+                                // FIN consumes one sequence number
+                                tcp_state.control.snd_nxt =
+                                    tcp_state.control.snd_nxt.wrapping_add(1);
+                                tcp_state.control.fin_sent = true;
+                                tcp_state.control.fin_sent_time = self.time_wait_now();
+                                tcp_state.control.fin_retries = 0;
+                                tcp_state.control.state = TcpState::FinWait1;
+
+                                let fin_segment = build_tcp_segment(
+                                    local_ip,
+                                    remote_ip,
+                                    local_port,
+                                    remote_port,
+                                    seq,
+                                    ack,
+                                    TCP_FLAG_FIN | TCP_FLAG_ACK,
+                                    advertised_wnd,
+                                    &[],
+                                );
+                                fin_to_send = Some((remote_ip, fin_segment));
+                            }
+                        }
+                        TcpState::CloseWait => {
+                            keep_registered = true;
+
+                            if !tcp_state.control.fin_sent {
+                                let seq = tcp_state.control.snd_nxt;
+                                let ack = tcp_state.control.rcv_nxt;
+                                let advertised_wnd = tcp_state
+                                    .control
+                                    .rcv_wnd
+                                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32)
+                                    as u16;
+
+                                tcp_state.control.snd_nxt =
+                                    tcp_state.control.snd_nxt.wrapping_add(1);
+                                tcp_state.control.fin_sent = true;
+                                tcp_state.control.fin_sent_time = self.time_wait_now();
+                                tcp_state.control.fin_retries = 0;
+                                tcp_state.control.state = TcpState::LastAck;
+
+                                let fin_segment = build_tcp_segment(
+                                    local_ip,
+                                    remote_ip,
+                                    local_port,
+                                    remote_port,
+                                    seq,
+                                    ack,
+                                    TCP_FLAG_FIN | TCP_FLAG_ACK,
+                                    advertised_wnd,
+                                    &[],
+                                );
+                                fin_to_send = Some((remote_ip, fin_segment));
+                            }
+                        }
+                        TcpState::FinWait1
+                        | TcpState::FinWait2
+                        | TcpState::Closing
+                        | TcpState::LastAck
+                        | TcpState::TimeWait => {
+                            // Already in closing states; leave registered for sweep_time_wait.
+                            keep_registered = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if keep_registered {
+            // Mark closed but leave in the tables so FIN/ACK/TIME_WAIT can complete.
+            // The sweep_time_wait timer will clean up after TIME_WAIT expires or
+            // FIN retransmission gives up.
+            sock.mark_closed();
+            sock.wake_tcp_waiters();
+            self.closed_count.fetch_add(1, Ordering::Relaxed);
+        } else if let Some(sock) = self.sockets.write().remove(&socket_id) {
             let meta = sock.meta_snapshot();
 
             // Remove port bindings based on protocol
@@ -1704,6 +1973,11 @@ impl SocketTable {
             // Mark closed and wake waiters
             sock.mark_closed();
             self.closed_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Transmit FIN after releasing locks to avoid blocking critical sections.
+        if let Some((dst_ip, segment)) = fin_to_send {
+            let _ = transmit_tcp_segment(dst_ip, &segment);
         }
     }
 
@@ -1843,13 +2117,54 @@ impl SocketTable {
         header: &TcpHeader,
         payload: &[u8],
     ) -> Option<Vec<u8>> {
-        // RFC 793: Never respond to RST segments
+        // RFC 793/5961: Handle RST segments with sequence validation
         if header.flags & TCP_FLAG_RST != 0 {
-            // If we have a connection, abort it and clean up resources
+            // If we have a connection, validate RST before accepting
             if let Some(sock) = self.lookup_tcp_conn(dst_ip, header.dst_port, src_ip, header.src_port) {
                 let mut guard = sock.tcp.lock();
                 if let Some(tcp_state) = guard.as_mut() {
                     let old_state = tcp_state.control.state;
+
+                    // R50-4 FIX: Validate RST sequence/ack per RFC 5961 before honoring
+                    // This prevents off-path RST injection attacks
+                    let accept_rst = match old_state {
+                        TcpState::SynSent => {
+                            // In SYN_SENT: RST is valid if ACK acknowledges our SYN
+                            header.ack_num == tcp_state.control.snd_nxt
+                        }
+                        TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 |
+                        TcpState::CloseWait | TcpState::Closing | TcpState::LastAck => {
+                            // In synchronized states: RST must be in receive window
+                            let wnd = tcp_state.control.rcv_wnd.max(1);
+                            seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, wnd)
+                        }
+                        _ => false, // Ignore RST in other states
+                    };
+
+                    if !accept_rst {
+                        // R50-4 IMPROVEMENT: Send challenge ACK per RFC 5961 Section 3.2
+                        // This allows legitimate endpoints to prove their connection state
+                        // while preventing blind RST injection attacks
+                        let advertised_wnd = tcp_state
+                            .control
+                            .rcv_wnd
+                            .saturating_sub(tcp_state.control.recv_buffer.len() as u32) as u16;
+
+                        let challenge_ack = build_tcp_segment(
+                            dst_ip,                          // Our IP
+                            src_ip,                          // Peer IP
+                            header.dst_port,                 // Our port
+                            header.src_port,                 // Peer port
+                            tcp_state.control.snd_nxt,       // Our next seq
+                            tcp_state.control.rcv_nxt,       // Expected peer seq
+                            TCP_FLAG_ACK,
+                            advertised_wnd,
+                            &[],
+                        );
+                        drop(guard);
+                        return Some(challenge_ack);
+                    }
+
                     if old_state == TcpState::SynSent || old_state == TcpState::Established {
                         tcp_state.control.state = TcpState::Closed;
                         drop(guard);
@@ -1952,6 +2267,7 @@ impl SocketTable {
 
             TcpState::Established => {
                 let is_ack = header.flags & TCP_FLAG_ACK != 0;
+                let is_fin = header.flags & TCP_FLAG_FIN != 0;
 
                 // RFC 793: in synchronized states, segments must carry ACK
                 if !is_ack {
@@ -1964,22 +2280,41 @@ impl SocketTable {
                     .rcv_wnd
                     .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
 
-                // Validate ACK is within acceptable range
+                // R50-2 FIX: Validate ACK with wraparound-safe sequence comparisons
                 // ACK must be: snd_una <= ack_num <= snd_nxt
-                let ack_in_range = {
-                    let diff_una = header.ack_num.wrapping_sub(tcp_state.control.snd_una) as i32;
-                    let diff_nxt = header.ack_num.wrapping_sub(tcp_state.control.snd_nxt) as i32;
-                    diff_una >= 0 && diff_nxt <= 0
-                };
+                let ack_in_range = seq_ge(header.ack_num, tcp_state.control.snd_una)
+                    && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
+
+                // R50-2 FIX: Validate segment sequence number is within receive window
+                // This prevents blind data injection attacks
+                let recv_wnd = tcp_state.control.rcv_wnd.max(1);
+                let seq_in_recv_window = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
+
+                // If sequence is outside receive window, send challenge ACK
+                if !seq_in_recv_window {
+                    let win_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        advertised_wnd as u16,
+                        &[],
+                    );
+                    drop(guard);
+                    return Some(win_ack);
+                }
 
                 if ack_in_range {
                     // Update snd_una to acknowledge sent data
                     tcp_state.control.snd_una = header.ack_num;
 
-                    // Refresh send window using newest SEG.SEQ/SEG.ACK (RFC 793)
-                    if header.seq_num > tcp_state.control.snd_wl1
+                    // R50-2 FIX: Use seq_gt/seq_ge for wraparound-safe window update (RFC 793)
+                    if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
-                            && header.ack_num >= tcp_state.control.snd_wl2)
+                            && seq_ge(header.ack_num, tcp_state.control.snd_wl2))
                     {
                         tcp_state.control.snd_wnd = header.window as u32;
                         tcp_state.control.snd_wl1 = header.seq_num;
@@ -2001,6 +2336,9 @@ impl SocketTable {
                     drop(guard);
                     return Some(dup_ack);
                 }
+
+                let mut data_received = false;
+                let mut response: Option<Vec<u8>> = None;
 
                 // Process incoming data if present
                 if !payload.is_empty() {
@@ -2068,7 +2406,271 @@ impl SocketTable {
                         .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
 
                     // Build ACK for the received data
-                    let data_ack = build_tcp_segment(
+                    response = Some(build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        window_after as u16,
+                        &[],
+                    ));
+                    data_received = true;
+                }
+
+                // RFC 793: Handle FIN flag - peer wants to close
+                if is_fin {
+                    // FIN must be in-order (seq_num == rcv_nxt after any data)
+                    if header.seq_num.wrapping_add(payload.len() as u32) != tcp_state.control.rcv_nxt {
+                        let dup_ack = build_tcp_segment(
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
+                            tcp_state.control.snd_nxt,
+                            tcp_state.control.rcv_nxt,
+                            TCP_FLAG_ACK,
+                            advertised_wnd as u16,
+                            &[],
+                        );
+                        return Some(dup_ack);
+                    }
+
+                    // FIN consumes 1 sequence number
+                    tcp_state.control.rcv_nxt = tcp_state.control.rcv_nxt.wrapping_add(1);
+                    tcp_state.control.fin_received = true;
+
+                    let window_after = tcp_state
+                        .control
+                        .rcv_wnd
+                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+
+                    let fin_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        window_after as u16,
+                        &[],
+                    );
+
+                    // Transition to CLOSE_WAIT (passive close)
+                    tcp_state.control.state = TcpState::CloseWait;
+
+                    drop(guard);
+                    sock.wake_tcp_waiters();
+                    sock.wake_tcp_data_waiters();
+
+                    return Some(fin_ack);
+                }
+
+                if let Some(data_ack) = response {
+                    drop(guard);
+
+                    if data_received {
+                        // Wake any threads blocked in tcp_recv()
+                        sock.wake_tcp_data_waiters();
+                    }
+
+                    return Some(data_ack);
+                }
+
+                // Pure ACK with no data - nothing more to do
+                None
+            }
+
+            // ================================================================
+            // FIN-WAIT-1: We sent FIN, waiting for ACK and/or peer's FIN
+            // ================================================================
+            TcpState::FinWait1 => {
+                let is_ack = header.flags & TCP_FLAG_ACK != 0;
+                let is_fin = header.flags & TCP_FLAG_FIN != 0;
+
+                if !is_ack {
+                    return None;
+                }
+
+                let advertised_wnd = tcp_state
+                    .control
+                    .rcv_wnd
+                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                let recv_wnd = tcp_state.control.rcv_wnd.max(1);
+                let seq_in_recv_window = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
+
+                if !seq_in_recv_window {
+                    let win_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        advertised_wnd as u16,
+                        &[],
+                    );
+                    drop(guard);
+                    return Some(win_ack);
+                }
+
+                let ack_in_range = seq_ge(header.ack_num, tcp_state.control.snd_una)
+                    && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
+
+                if ack_in_range {
+                    tcp_state.control.snd_una = header.ack_num;
+
+                    if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
+                        || (header.seq_num == tcp_state.control.snd_wl1
+                            && seq_ge(header.ack_num, tcp_state.control.snd_wl2))
+                    {
+                        tcp_state.control.snd_wnd = header.window as u32;
+                        tcp_state.control.snd_wl1 = header.seq_num;
+                        tcp_state.control.snd_wl2 = header.ack_num;
+                    }
+                } else {
+                    let dup_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        advertised_wnd as u16,
+                        &[],
+                    );
+                    drop(guard);
+                    return Some(dup_ack);
+                }
+
+                // Check if our FIN was ACKed
+                let acked_fin = seq_ge(header.ack_num, tcp_state.control.snd_nxt);
+                if acked_fin {
+                    // FIN ACKed - clear retransmission timer
+                    tcp_state.control.fin_sent_time = 0;
+                    tcp_state.control.fin_retries = 0;
+                    tcp_state.control.state = TcpState::FinWait2;
+                }
+
+                let mut data_received = false;
+                let mut response: Option<Vec<u8>> = None;
+
+                // Process incoming data (we can still receive in FIN_WAIT_1)
+                if !payload.is_empty() {
+                    let window_after_ack = tcp_state
+                        .control
+                        .rcv_wnd
+                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+
+                    if header.seq_num != tcp_state.control.rcv_nxt {
+                        let dup_ack = build_tcp_segment(
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
+                            tcp_state.control.snd_nxt,
+                            tcp_state.control.rcv_nxt,
+                            TCP_FLAG_ACK,
+                            window_after_ack as u16,
+                            &[],
+                        );
+                        return Some(dup_ack);
+                    }
+
+                    if (payload.len() as u32) > window_after_ack {
+                        let win_ack = build_tcp_segment(
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
+                            tcp_state.control.snd_nxt,
+                            tcp_state.control.rcv_nxt,
+                            TCP_FLAG_ACK,
+                            window_after_ack as u16,
+                            &[],
+                        );
+                        return Some(win_ack);
+                    }
+
+                    let mut ctx = self.ctx_from_socket(&sock);
+                    ctx.remote = ipv4_to_u64(src_ip.0);
+                    ctx.remote_port = header.src_port;
+                    if hook_net_recv(&sock.label.creator, &ctx, payload.len()).is_err() {
+                        return None;
+                    }
+
+                    tcp_state.control.recv_buffer.extend(payload.iter().copied());
+                    tcp_state.control.rcv_nxt = tcp_state
+                        .control
+                        .rcv_nxt
+                        .wrapping_add(payload.len() as u32);
+
+                    let window_after = tcp_state
+                        .control
+                        .rcv_wnd
+                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+
+                    response = Some(build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        window_after as u16,
+                        &[],
+                    ));
+                    data_received = true;
+                }
+
+                // Handle peer's FIN
+                if is_fin {
+                    let expected_fin_seq = tcp_state.control.rcv_nxt;
+                    if header.seq_num.wrapping_add(payload.len() as u32) != expected_fin_seq {
+                        let dup_ack = build_tcp_segment(
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
+                            tcp_state.control.snd_nxt,
+                            tcp_state.control.rcv_nxt,
+                            TCP_FLAG_ACK,
+                            advertised_wnd as u16,
+                            &[],
+                        );
+                        return Some(dup_ack);
+                    }
+
+                    tcp_state.control.rcv_nxt = tcp_state.control.rcv_nxt.wrapping_add(1);
+                    tcp_state.control.fin_received = true;
+
+                    let window_after = tcp_state
+                        .control
+                        .rcv_wnd
+                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+
+                    // If our FIN was ACKed: FIN_WAIT_1 + FIN → TIME_WAIT
+                    // If not ACKed: FIN_WAIT_1 + FIN → CLOSING (simultaneous close)
+                    if acked_fin {
+                        // Record TIME_WAIT start for 2MSL timer
+                        tcp_state.control.time_wait_start = self.time_wait_now();
+                        // FIN ACKed - clear retransmission timer
+                        tcp_state.control.fin_sent_time = 0;
+                        tcp_state.control.fin_retries = 0;
+                    }
+                    tcp_state.control.state = if acked_fin {
+                        TcpState::TimeWait
+                    } else {
+                        TcpState::Closing
+                    };
+
+                    let fin_ack = build_tcp_segment(
                         dst_ip,
                         src_ip,
                         header.dst_port,
@@ -2082,26 +2684,828 @@ impl SocketTable {
 
                     drop(guard);
 
-                    // Wake any threads blocked in tcp_recv()
+                    // Wake waiters (cleanup will be done by sweep_time_wait after 2MSL)
+                    sock.wake_tcp_waiters();
                     sock.wake_tcp_data_waiters();
 
-                    return Some(data_ack);
+                    return Some(fin_ack);
                 }
 
-                // Pure ACK with no data - nothing more to do
+                if let Some(resp) = response {
+                    drop(guard);
+                    if data_received {
+                        sock.wake_tcp_data_waiters();
+                    }
+                    if acked_fin {
+                        sock.wake_tcp_waiters();
+                    }
+                    return Some(resp);
+                }
+
+                if acked_fin {
+                    drop(guard);
+                    sock.wake_tcp_waiters();
+                }
+
                 None
             }
 
+            // ================================================================
+            // FIN-WAIT-2: Our FIN was ACKed, waiting for peer's FIN
+            // ================================================================
+            TcpState::FinWait2 => {
+                let is_ack = header.flags & TCP_FLAG_ACK != 0;
+                let is_fin = header.flags & TCP_FLAG_FIN != 0;
+
+                if !is_ack {
+                    return None;
+                }
+
+                let advertised_wnd = tcp_state
+                    .control
+                    .rcv_wnd
+                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                let recv_wnd = tcp_state.control.rcv_wnd.max(1);
+                let seq_in_recv_window = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
+
+                if !seq_in_recv_window {
+                    let win_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        advertised_wnd as u16,
+                        &[],
+                    );
+                    drop(guard);
+                    return Some(win_ack);
+                }
+
+                let ack_in_range = seq_ge(header.ack_num, tcp_state.control.snd_una)
+                    && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
+
+                if ack_in_range {
+                    tcp_state.control.snd_una = header.ack_num;
+
+                    if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
+                        || (header.seq_num == tcp_state.control.snd_wl1
+                            && seq_ge(header.ack_num, tcp_state.control.snd_wl2))
+                    {
+                        tcp_state.control.snd_wnd = header.window as u32;
+                        tcp_state.control.snd_wl1 = header.seq_num;
+                        tcp_state.control.snd_wl2 = header.ack_num;
+                    }
+                } else {
+                    let dup_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        advertised_wnd as u16,
+                        &[],
+                    );
+                    drop(guard);
+                    return Some(dup_ack);
+                }
+
+                let mut data_received = false;
+                let mut response: Option<Vec<u8>> = None;
+
+                // We can still receive data in FIN_WAIT_2
+                if !payload.is_empty() {
+                    let window_after_ack = tcp_state
+                        .control
+                        .rcv_wnd
+                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+
+                    if header.seq_num != tcp_state.control.rcv_nxt {
+                        let dup_ack = build_tcp_segment(
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
+                            tcp_state.control.snd_nxt,
+                            tcp_state.control.rcv_nxt,
+                            TCP_FLAG_ACK,
+                            window_after_ack as u16,
+                            &[],
+                        );
+                        return Some(dup_ack);
+                    }
+
+                    if (payload.len() as u32) > window_after_ack {
+                        let win_ack = build_tcp_segment(
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
+                            tcp_state.control.snd_nxt,
+                            tcp_state.control.rcv_nxt,
+                            TCP_FLAG_ACK,
+                            window_after_ack as u16,
+                            &[],
+                        );
+                        return Some(win_ack);
+                    }
+
+                    let mut ctx = self.ctx_from_socket(&sock);
+                    ctx.remote = ipv4_to_u64(src_ip.0);
+                    ctx.remote_port = header.src_port;
+                    if hook_net_recv(&sock.label.creator, &ctx, payload.len()).is_err() {
+                        return None;
+                    }
+
+                    tcp_state.control.recv_buffer.extend(payload.iter().copied());
+                    tcp_state.control.rcv_nxt = tcp_state
+                        .control
+                        .rcv_nxt
+                        .wrapping_add(payload.len() as u32);
+
+                    let window_after = tcp_state
+                        .control
+                        .rcv_wnd
+                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+
+                    response = Some(build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        window_after as u16,
+                        &[],
+                    ));
+                    data_received = true;
+                }
+
+                // Handle peer's FIN
+                if is_fin {
+                    let expected_fin_seq = tcp_state.control.rcv_nxt;
+                    if header.seq_num.wrapping_add(payload.len() as u32) != expected_fin_seq {
+                        let dup_ack = build_tcp_segment(
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
+                            tcp_state.control.snd_nxt,
+                            tcp_state.control.rcv_nxt,
+                            TCP_FLAG_ACK,
+                            advertised_wnd as u16,
+                            &[],
+                        );
+                        return Some(dup_ack);
+                    }
+
+                    tcp_state.control.rcv_nxt = tcp_state.control.rcv_nxt.wrapping_add(1);
+                    tcp_state.control.fin_received = true;
+
+                    let window_after = tcp_state
+                        .control
+                        .rcv_wnd
+                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+
+                    let fin_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        window_after as u16,
+                        &[],
+                    );
+
+                    // FIN_WAIT_2 + FIN → TIME_WAIT
+                    tcp_state.control.time_wait_start = self.time_wait_now();
+                    tcp_state.control.state = TcpState::TimeWait;
+
+                    drop(guard);
+                    // Wake waiters (cleanup will be done by sweep_time_wait after 2MSL)
+                    sock.wake_tcp_waiters();
+                    sock.wake_tcp_data_waiters();
+
+                    return Some(fin_ack);
+                }
+
+                if let Some(resp) = response {
+                    drop(guard);
+                    if data_received {
+                        sock.wake_tcp_data_waiters();
+                    }
+                    return Some(resp);
+                }
+
+                None
+            }
+
+            // ================================================================
+            // CLOSE-WAIT: Peer sent FIN, waiting for local close
+            // ================================================================
+            TcpState::CloseWait => {
+                let is_ack = header.flags & TCP_FLAG_ACK != 0;
+
+                if !is_ack {
+                    return None;
+                }
+
+                let advertised_wnd = tcp_state
+                    .control
+                    .rcv_wnd
+                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                let recv_wnd = tcp_state.control.rcv_wnd.max(1);
+                let seq_in_recv_window = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
+
+                if !seq_in_recv_window {
+                    let win_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        advertised_wnd as u16,
+                        &[],
+                    );
+                    drop(guard);
+                    return Some(win_ack);
+                }
+
+                let ack_in_range = seq_ge(header.ack_num, tcp_state.control.snd_una)
+                    && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
+
+                if ack_in_range {
+                    tcp_state.control.snd_una = header.ack_num;
+
+                    if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
+                        || (header.seq_num == tcp_state.control.snd_wl1
+                            && seq_ge(header.ack_num, tcp_state.control.snd_wl2))
+                    {
+                        tcp_state.control.snd_wnd = header.window as u32;
+                        tcp_state.control.snd_wl1 = header.seq_num;
+                        tcp_state.control.snd_wl2 = header.ack_num;
+                    }
+                } else {
+                    let dup_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        advertised_wnd as u16,
+                        &[],
+                    );
+                    drop(guard);
+                    return Some(dup_ack);
+                }
+
+                // In CLOSE_WAIT, we don't expect more data but still ACK segments
+                if !payload.is_empty() || (header.flags & TCP_FLAG_FIN != 0) {
+                    let window_after = tcp_state
+                        .control
+                        .rcv_wnd
+                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+
+                    let ack_seg = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        window_after as u16,
+                        &[],
+                    );
+
+                    drop(guard);
+                    return Some(ack_seg);
+                }
+
+                None
+            }
+
+            // ================================================================
+            // CLOSING: Simultaneous close, waiting for ACK of our FIN
+            // ================================================================
+            TcpState::Closing => {
+                let is_ack = header.flags & TCP_FLAG_ACK != 0;
+
+                if !is_ack {
+                    return None;
+                }
+
+                let advertised_wnd = tcp_state
+                    .control
+                    .rcv_wnd
+                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                let recv_wnd = tcp_state.control.rcv_wnd.max(1);
+                let seq_in_recv_window = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
+
+                if !seq_in_recv_window {
+                    let win_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        advertised_wnd as u16,
+                        &[],
+                    );
+                    drop(guard);
+                    return Some(win_ack);
+                }
+
+                let ack_in_range = seq_ge(header.ack_num, tcp_state.control.snd_una)
+                    && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
+
+                if ack_in_range {
+                    tcp_state.control.snd_una = header.ack_num;
+
+                    if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
+                        || (header.seq_num == tcp_state.control.snd_wl1
+                            && seq_ge(header.ack_num, tcp_state.control.snd_wl2))
+                    {
+                        tcp_state.control.snd_wnd = header.window as u32;
+                        tcp_state.control.snd_wl1 = header.seq_num;
+                        tcp_state.control.snd_wl2 = header.ack_num;
+                    }
+                } else {
+                    let dup_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        advertised_wnd as u16,
+                        &[],
+                    );
+                    drop(guard);
+                    return Some(dup_ack);
+                }
+
+                // Handle retransmitted FIN from peer
+                let mut fin_ack = None;
+                if header.flags & TCP_FLAG_FIN != 0 {
+                    let window_after = tcp_state
+                        .control
+                        .rcv_wnd
+                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+
+                    // Re-ACK the FIN
+                    fin_ack = Some(build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        window_after as u16,
+                        &[],
+                    ));
+                }
+
+                // Check if our FIN was ACKed
+                if seq_ge(header.ack_num, tcp_state.control.snd_nxt) {
+                    // CLOSING + ACK of FIN → TIME_WAIT
+                    tcp_state.control.time_wait_start = self.time_wait_now();
+                    // FIN ACKed - clear retransmission timer
+                    tcp_state.control.fin_sent_time = 0;
+                    tcp_state.control.fin_retries = 0;
+                    tcp_state.control.state = TcpState::TimeWait;
+                    drop(guard);
+                    // Wake waiters (cleanup will be done by sweep_time_wait after 2MSL)
+                    sock.wake_tcp_waiters();
+                    sock.wake_tcp_data_waiters();
+                    return fin_ack;
+                }
+
+                if let Some(seg) = fin_ack {
+                    drop(guard);
+                    return Some(seg);
+                }
+
+                None
+            }
+
+            // ================================================================
+            // LAST-ACK: Waiting for ACK of our FIN (passive close)
+            // ================================================================
+            TcpState::LastAck => {
+                let is_ack = header.flags & TCP_FLAG_ACK != 0;
+
+                if !is_ack {
+                    return None;
+                }
+
+                let advertised_wnd = tcp_state
+                    .control
+                    .rcv_wnd
+                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                let recv_wnd = tcp_state.control.rcv_wnd.max(1);
+                let seq_in_recv_window = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
+
+                if !seq_in_recv_window {
+                    let win_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        advertised_wnd as u16,
+                        &[],
+                    );
+                    drop(guard);
+                    return Some(win_ack);
+                }
+
+                let ack_in_range = seq_ge(header.ack_num, tcp_state.control.snd_una)
+                    && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
+
+                if ack_in_range {
+                    tcp_state.control.snd_una = header.ack_num;
+
+                    if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
+                        || (header.seq_num == tcp_state.control.snd_wl1
+                            && seq_ge(header.ack_num, tcp_state.control.snd_wl2))
+                    {
+                        tcp_state.control.snd_wnd = header.window as u32;
+                        tcp_state.control.snd_wl1 = header.seq_num;
+                        tcp_state.control.snd_wl2 = header.ack_num;
+                    }
+                } else {
+                    let dup_ack = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        advertised_wnd as u16,
+                        &[],
+                    );
+                    drop(guard);
+                    return Some(dup_ack);
+                }
+
+                // Check if our FIN was ACKed
+                if seq_ge(header.ack_num, tcp_state.control.snd_nxt) {
+                    // LAST_ACK + ACK of FIN → CLOSED
+                    // FIN ACKed - clear retransmission timer
+                    tcp_state.control.fin_sent_time = 0;
+                    tcp_state.control.fin_retries = 0;
+                    tcp_state.control.state = TcpState::Closed;
+                    drop(guard);
+                    self.cleanup_tcp_connection(&sock);
+                    return None;
+                }
+
+                // Handle retransmitted FIN from peer
+                if header.flags & TCP_FLAG_FIN != 0 {
+                    let window_after = tcp_state
+                        .control
+                        .rcv_wnd
+                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+
+                    let ack_seg = build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        window_after as u16,
+                        &[],
+                    );
+
+                    drop(guard);
+                    return Some(ack_seg);
+                }
+
+                None
+            }
+
+            // ================================================================
+            // TIME-WAIT: Wait for 2MSL before final cleanup
+            // ================================================================
+            TcpState::TimeWait => {
+                let advertised_wnd = tcp_state
+                    .control
+                    .rcv_wnd
+                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                let recv_wnd = tcp_state.control.rcv_wnd.max(1);
+                let seq_in_recv_window = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
+
+                // Do not collapse TIME_WAIT on out-of-window traffic; prevents spoofed
+                // segments from forcing premature cleanup and RSTs on legitimate retransmits.
+                if !seq_in_recv_window {
+                    drop(guard);
+                    return None;
+                }
+
+                // Handle retransmitted FIN from peer
+                let mut fin_ack = None;
+                if header.flags & TCP_FLAG_FIN != 0 {
+                    let window_after = tcp_state
+                        .control
+                        .rcv_wnd
+                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+
+                    // Re-ACK the FIN and restart 2MSL timer
+                    fin_ack = Some(build_tcp_segment(
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        window_after as u16,
+                        &[],
+                    ));
+
+                    // Restart 2MSL timer on retransmitted FIN
+                    tcp_state.control.time_wait_start = self.time_wait_now();
+                }
+
+                drop(guard);
+
+                // No immediate cleanup - sweep_time_wait() will handle it after 2MSL
+                if fin_ack.is_some() {
+                    sock.wake_tcp_waiters();
+                    sock.wake_tcp_data_waiters();
+                }
+
+                fin_ack
+            }
+
             _ => {
-                // Other states not yet implemented
+                // Other states not yet implemented (Listen, SynReceived)
                 None
             }
         }
     }
 
+    /// Get the most recent timestamp used for TIME_WAIT timers.
+    ///
+    /// This returns the value set by the last `sweep_time_wait()` call.
+    /// Used by the RX path when transitioning to TIME_WAIT state to record
+    /// the start time without requiring access to kernel time functions.
+    #[inline]
+    fn time_wait_now(&self) -> u64 {
+        self.time_wait_clock.load(Ordering::Relaxed)
+    }
+
+    /// Sweep TIME_WAIT connections and clean up those that exceeded 2MSL.
+    ///
+    /// This function should be called periodically from kernel_core's timer
+    /// interrupt handler (e.g., every 1-10 seconds) to expire TIME_WAIT
+    /// connections after TCP_TIME_WAIT_MS (120 seconds).
+    ///
+    /// # Arguments
+    ///
+    /// * `current_time_ms` - Monotonic timestamp in milliseconds
+    ///
+    /// # Design
+    ///
+    /// The sweep function performs two roles:
+    /// 1. Updates the cached time_wait_clock for new TIME_WAIT transitions
+    /// 2. Iterates through all sockets to find and clean up expired TIME_WAIT
+    /// 3. Handles FIN retransmissions for connections waiting for FIN ACK
+    ///
+    /// The two-phase approach (collect then cleanup) avoids holding locks
+    /// across cleanup operations which may wake blocked processes.
+    ///
+    /// # Safety
+    ///
+    /// This function uses try_lock to avoid deadlock when called from timer
+    /// interrupt context. If the sockets lock is held, the sweep is skipped
+    /// and will be retried on the next timer tick.
+    pub fn sweep_time_wait(&self, current_time_ms: u64) {
+        // Update cached time so RX path can stamp new TIME_WAIT transitions
+        self.time_wait_clock.store(current_time_ms, Ordering::Relaxed);
+
+        // Collect sockets for cleanup and FIN retransmissions
+        let mut to_cleanup: Vec<Arc<SocketState>> = Vec::new();
+        let mut fin_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
+
+        // Use try_read to avoid blocking in interrupt context
+        // If the lock is held (e.g., by TCP RX/TX), skip this sweep cycle
+        let sockets_guard = match self.sockets.try_read() {
+            Some(guard) => guard,
+            None => return, // Lock held, skip this sweep
+        };
+
+        for sock in sockets_guard.values() {
+            // Get socket metadata for FIN retransmission
+            let meta = sock.meta_snapshot();
+            let key_parts = match (
+                meta.local_ip.map(Ipv4Addr),
+                meta.local_port,
+                meta.remote_ip.map(Ipv4Addr),
+                meta.remote_port,
+            ) {
+                (Some(li), Some(lp), Some(ri), Some(rp)) => Some((li, lp, ri, rp)),
+                _ => None,
+            };
+
+            // Use try_lock to avoid blocking on per-socket lock
+            let tcp_guard = match sock.tcp.try_lock() {
+                Some(guard) => guard,
+                None => continue, // Skip this socket, try next
+            };
+
+            let mut should_cleanup = false;
+            let mut need_init_timestamp = false;
+            let mut need_init_fin_time = false;
+            let mut need_fin_retransmit = false;
+
+            if let Some(tcp_state) = tcp_guard.as_ref() {
+                // TIME_WAIT handling
+                if tcp_state.control.state == TcpState::TimeWait {
+                    let start = tcp_state.control.time_wait_start;
+                    if start == 0 {
+                        need_init_timestamp = true;
+                    } else if current_time_ms.saturating_sub(start) >= TCP_TIME_WAIT_MS {
+                        should_cleanup = true;
+                    }
+                }
+
+                // FIN retransmission handling for FIN_WAIT_1 / CLOSING / LAST_ACK
+                if matches!(
+                    tcp_state.control.state,
+                    TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
+                ) && tcp_state.control.fin_sent
+                {
+                    let fin_start = tcp_state.control.fin_sent_time;
+                    if fin_start == 0 {
+                        need_init_fin_time = true;
+                    } else {
+                        let fin_timeout = core::cmp::max(
+                            tcp_state.control.rto_ms,
+                            TCP_FIN_TIMEOUT_MS,
+                        );
+                        if current_time_ms.saturating_sub(fin_start) >= fin_timeout {
+                            if tcp_state.control.fin_retries >= TCP_MAX_FIN_RETRIES {
+                                // Max retries exceeded - cleanup connection
+                                should_cleanup = true;
+                            } else {
+                                // Need to retransmit FIN
+                                need_fin_retransmit = true;
+                            }
+                        }
+                    }
+                }
+            }
+            drop(tcp_guard);
+
+            // Initialize TIME_WAIT timestamp if needed
+            if need_init_timestamp {
+                if let Some(mut guard) = sock.tcp.try_lock() {
+                    if let Some(tcp_state) = guard.as_mut() {
+                        if tcp_state.control.state == TcpState::TimeWait
+                            && tcp_state.control.time_wait_start == 0
+                        {
+                            tcp_state.control.time_wait_start = current_time_ms;
+                        }
+                    }
+                }
+            }
+
+            // Initialize FIN timestamp if needed
+            if need_init_fin_time {
+                if let Some(mut guard) = sock.tcp.try_lock() {
+                    if let Some(tcp_state) = guard.as_mut() {
+                        if matches!(
+                            tcp_state.control.state,
+                            TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
+                        ) && tcp_state.control.fin_sent
+                            && tcp_state.control.fin_sent_time == 0
+                        {
+                            tcp_state.control.fin_sent_time = current_time_ms;
+                        }
+                    }
+                }
+            }
+
+            // Build FIN retransmission segment
+            if need_fin_retransmit {
+                if let Some((local_ip, local_port, remote_ip, remote_port)) = key_parts {
+                    if let Some(mut guard) = sock.tcp.try_lock() {
+                        if let Some(tcp_state) = guard.as_mut() {
+                            if matches!(
+                                tcp_state.control.state,
+                                TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
+                            ) && tcp_state.control.fin_sent
+                                && tcp_state.control.fin_retries < TCP_MAX_FIN_RETRIES
+                            {
+                                let window_after = tcp_state
+                                    .control
+                                    .rcv_wnd
+                                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                                // FIN sequence is snd_nxt - 1 (since FIN consumed one seq number)
+                                let seq = tcp_state.control.snd_nxt.wrapping_sub(1);
+                                let ack = tcp_state.control.rcv_nxt;
+
+                                let seg = build_tcp_segment(
+                                    local_ip,
+                                    remote_ip,
+                                    local_port,
+                                    remote_port,
+                                    seq,
+                                    ack,
+                                    TCP_FLAG_FIN | TCP_FLAG_ACK,
+                                    window_after as u16,
+                                    &[],
+                                );
+
+                                // Update retransmission bookkeeping
+                                tcp_state.control.fin_retries =
+                                    tcp_state.control.fin_retries.saturating_add(1);
+                                tcp_state.control.fin_sent_time = current_time_ms;
+
+                                fin_retransmit.push((remote_ip, seg));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Handle cleanup
+            if should_cleanup {
+                if let Some(mut guard) = sock.tcp.try_lock() {
+                    if let Some(tcp_state) = guard.as_mut() {
+                        if tcp_state.control.state == TcpState::TimeWait
+                            || matches!(
+                                tcp_state.control.state,
+                                TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
+                            )
+                        {
+                            tcp_state.control.state = TcpState::Closed;
+                            to_cleanup.push(sock.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        drop(sockets_guard);
+
+        // Cleanup phase (outside sockets lock to avoid deadlock)
+        // First, collect socket IDs to remove (those marked closed by close())
+        let mut ids_to_remove: Vec<u64> = Vec::new();
+        for sock in &to_cleanup {
+            self.cleanup_tcp_connection(sock);
+            // Remove from sockets map if socket was marked closed by close()
+            // This handles the case where close() initiated graceful shutdown
+            // and sweep_time_wait is completing the cleanup after TIME_WAIT
+            if sock.is_closed() {
+                ids_to_remove.push(sock.id);
+            }
+        }
+
+        // Remove closed sockets from the sockets map
+        if !ids_to_remove.is_empty() {
+            let mut sockets = self.sockets.write();
+            for id in ids_to_remove {
+                sockets.remove(&id);
+            }
+        }
+
+        // Transmit any pending FIN retransmissions (best-effort)
+        for (dst_ip, seg) in fin_retransmit {
+            let _ = transmit_tcp_segment(dst_ip, &seg);
+        }
+    }
+
     /// Clean up TCP connection resources (bindings and 4-tuple registration).
     ///
-    /// Called when a connection is aborted (RST received, timeout, error).
+    /// Called when a connection is aborted (RST received, timeout, error) or
+    /// when graceful shutdown completes (LAST_ACK→CLOSED, TIME_WAIT expiry).
+    ///
+    /// If the socket was marked closed by close() (indicating graceful shutdown
+    /// initiated by the local side), this function also removes the socket from
+    /// the sockets map to prevent memory leaks.
     fn cleanup_tcp_connection(&self, sock: &Arc<SocketState>) {
         let meta = sock.meta_snapshot();
 
@@ -2137,6 +3541,35 @@ impl SocketTable {
             tcp_state.data_waiters.wake_all();
         }
         *tcp_guard = None;
+        drop(tcp_guard);
+
+        // If socket was marked closed by close() (graceful shutdown path),
+        // remove it from the sockets map to complete cleanup and prevent leak.
+        // This handles the case where close() kept the socket registered for
+        // FIN/ACK handling and the TCP state machine has now completed.
+        if sock.is_closed() {
+            self.sockets.write().remove(&sock.id);
+        }
+    }
+
+    /// R50-3 FIX: Abort an in-flight outbound TCP connection (timeout/reset path).
+    ///
+    /// Called from sys_connect when a blocking connect times out to ensure
+    /// TCB and port bindings are properly released.
+    ///
+    /// # Arguments
+    ///
+    /// * `sock` - The socket with a connection attempt to abort
+    pub fn abort_tcp_connect(&self, sock: &Arc<SocketState>) {
+        // Transition TCB to Closed state
+        {
+            let mut guard = sock.tcp.lock();
+            if let Some(tcp_state) = guard.as_mut() {
+                tcp_state.control.state = TcpState::Closed;
+            }
+        }
+        // Clean up all connection resources
+        self.cleanup_tcp_connection(sock);
     }
 
     /// Build a TCP RST segment for invalid/unknown connections.
