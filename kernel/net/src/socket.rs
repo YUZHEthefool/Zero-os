@@ -52,16 +52,17 @@ use spin::{Mutex, Once, RwLock};
 
 use cap::CapId;
 use lsm::{
-    hook_net_bind, hook_net_connect, hook_net_recv, hook_net_send, hook_net_shutdown,
-    hook_net_socket, LsmError, NetCtx, ProcessCtx,
+    hook_net_accept, hook_net_bind, hook_net_connect, hook_net_listen, hook_net_recv,
+    hook_net_send, hook_net_shutdown, hook_net_socket, LsmError, NetCtx, ProcessCtx,
 };
 
 use crate::ipv4::Ipv4Addr;
 use crate::tcp::{
     build_tcp_segment, generate_isn, seq_ge, seq_gt, seq_in_window, TcpControlBlock, TcpConnKey,
-    TcpHeader, TcpState, TCP_DEFAULT_WINDOW, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH,
-    TCP_FLAG_RST, TCP_FLAG_SYN, TCP_FIN_TIMEOUT_MS, TCP_MAX_ACTIVE_CONNECTIONS,
-    TCP_MAX_FIN_RETRIES, TCP_PROTO, TCP_TIME_WAIT_MS,
+    TcpHeader, TcpState, TCP_DEFAULT_WINDOW, TCP_ETHERNET_MSS, TCP_FLAG_ACK, TCP_FLAG_FIN,
+    TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_FIN_TIMEOUT_MS, TCP_MAX_ACTIVE_CONNECTIONS,
+    TCP_MAX_FIN_RETRIES, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_ACCEPT_BACKLOG,
+    TCP_PROTO, TCP_TIME_WAIT_MS,
 };
 use crate::stack::transmit_tcp_segment;
 use crate::udp::{
@@ -137,6 +138,18 @@ pub trait SocketWaitHooks: Send + Sync {
 
     /// Wake all waiters blocked on this queue.
     fn wake_all(&self, queue: &WaitQueue);
+
+    /// Get the current kernel tick count (monotonic milliseconds since boot).
+    ///
+    /// Used for TIME_WAIT timer initialization when the periodic sweep hasn't
+    /// yet primed the cached clock. This provides accurate timing instead of
+    /// relying on TSC assumptions.
+    ///
+    /// # R51-6 Enhancement
+    ///
+    /// Replaces the RDTSC-based fallback which assumed a 2GHz TSC frequency.
+    /// The kernel tick counter is calibrated and reliable.
+    fn get_ticks(&self) -> u64;
 }
 
 /// Static storage for the registered wait hooks.
@@ -442,6 +455,109 @@ impl TcpSocketState {
     }
 }
 
+// ============================================================================
+// TCP Listen State (R51-1: Passive Open)
+// ============================================================================
+
+/// TCP connection lookup key type (local_ip, local_port, remote_ip, remote_port)
+///
+/// Used for both active and passive TCP connection tracking.
+type TcpLookupKey = (u32, u16, u32, u16);
+
+/// Half-open connection (SYN received, SYN-ACK sent, awaiting final ACK).
+struct PendingSyn {
+    /// Connection lookup key (4-tuple)
+    key: TcpLookupKey,
+    /// Child socket in SynReceived state
+    sock: Arc<SocketState>,
+    /// Cached SYN-ACK segment for retransmission
+    syn_ack: Vec<u8>,
+    /// Timestamp when SYN-ACK was sent (for SYN timeout)
+    syn_sent_at: u64,
+}
+
+/// Passive-open bookkeeping for a listening TCP socket.
+///
+/// A listening socket maintains two bounded queues:
+/// - SYN queue: Half-open connections (SYN received, SYN-ACK sent)
+/// - Accept queue: Fully established connections ready for accept()
+///
+/// Both queues are bounded to prevent resource exhaustion from SYN floods.
+struct TcpListenState {
+    /// Maximum half-open connections (SYN queue size)
+    syn_backlog: usize,
+    /// Maximum pending accept connections (accept queue size)
+    accept_backlog: usize,
+    /// Half-open connections indexed by 4-tuple
+    syn_queue: BTreeMap<TcpLookupKey, PendingSyn>,
+    /// Fully established connections awaiting accept()
+    accept_queue: VecDeque<Arc<SocketState>>,
+    /// Wait queue for blocking accept()
+    accept_waiters: Arc<WaitQueue>,
+}
+
+impl TcpListenState {
+    /// Create new listen state with bounded backlogs.
+    fn new(backlog: usize) -> Self {
+        // Clamp backlog to valid range
+        let effective = backlog.clamp(1, TCP_MAX_ACCEPT_BACKLOG);
+        TcpListenState {
+            syn_backlog: TCP_MAX_SYN_BACKLOG.min(effective),
+            accept_backlog: effective,
+            syn_queue: BTreeMap::new(),
+            accept_queue: VecDeque::new(),
+            accept_waiters: Arc::new(WaitQueue::new()),
+        }
+    }
+
+    /// Enqueue a half-open connection.
+    ///
+    /// Returns false if SYN queue is full (silent drop for SYN flood mitigation).
+    fn queue_syn(&mut self, entry: PendingSyn) -> bool {
+        if self.syn_queue.len() >= self.syn_backlog {
+            return false;
+        }
+        self.syn_queue.insert(entry.key, entry);
+        true
+    }
+
+    /// Remove and return a half-open connection by key.
+    fn take_syn(&mut self, key: &TcpLookupKey) -> Option<PendingSyn> {
+        self.syn_queue.remove(key)
+    }
+
+    /// Get a reference to a half-open connection.
+    fn get_syn(&self, key: &TcpLookupKey) -> Option<&PendingSyn> {
+        self.syn_queue.get(key)
+    }
+
+    /// Enqueue a fully established connection for accept().
+    ///
+    /// Returns false if accept queue is full.
+    fn queue_accept(&mut self, sock: Arc<SocketState>) -> bool {
+        if self.accept_queue.len() >= self.accept_backlog {
+            return false;
+        }
+        self.accept_queue.push_back(sock);
+        true
+    }
+
+    /// Dequeue an established connection for accept().
+    fn pop_accept(&mut self) -> Option<Arc<SocketState>> {
+        self.accept_queue.pop_front()
+    }
+
+    /// Check if accept queue has pending connections.
+    fn has_pending(&self) -> bool {
+        !self.accept_queue.is_empty()
+    }
+
+    /// Get the accept wait queue for blocking.
+    fn waiters(&self) -> Arc<WaitQueue> {
+        self.accept_waiters.clone()
+    }
+}
+
 /// Result of initiating a TCP connect (SYN sent).
 #[derive(Debug, Clone)]
 pub struct TcpConnectResult {
@@ -524,6 +640,8 @@ pub struct SocketState {
     rx_dropped: AtomicU64,
     /// TCP state (only populated for stream sockets)
     tcp: Mutex<Option<TcpSocketState>>,
+    /// Listen state (only for listening TCP sockets)
+    listen: Mutex<Option<TcpListenState>>,
 }
 
 impl core::fmt::Debug for SocketState {
@@ -564,6 +682,7 @@ impl SocketState {
             tx_datagrams: AtomicU64::new(0),
             rx_dropped: AtomicU64::new(0),
             tcp: Mutex::new(None),
+            listen: Mutex::new(None),
         }
     }
 
@@ -627,6 +746,11 @@ impl SocketState {
         }
         // Wake TCP data waiters
         if let Some(waiters) = self.tcp_data_waiters() {
+            waiters.close();
+            waiters.wake_all();
+        }
+        // Wake accept waiters (for listening sockets)
+        if let Some(waiters) = self.listen_waiters() {
             waiters.close();
             waiters.wake_all();
         }
@@ -700,6 +824,51 @@ impl SocketState {
         if let Some(waiters) = self.tcp_data_waiters() {
             waiters.wake_all();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Listen State Helpers (R51-1)
+    // -----------------------------------------------------------------------
+
+    /// Install listen state for a listening socket.
+    fn install_listen_state(&self, state: TcpListenState) {
+        *self.listen.lock() = Some(state);
+    }
+
+    /// Clear listen state when socket is closed.
+    fn clear_listen_state(&self) {
+        self.listen.lock().take();
+    }
+
+    /// Get the accept wait queue for blocking accept().
+    pub fn listen_waiters(&self) -> Option<Arc<WaitQueue>> {
+        self.listen.lock().as_ref().map(|l| l.waiters())
+    }
+
+    /// Pop the next established connection from the accept queue.
+    pub fn pop_accept_ready(&self) -> Option<Arc<SocketState>> {
+        self.listen.lock().as_mut().and_then(|l| l.pop_accept())
+    }
+
+    /// Push an established connection to the accept queue.
+    ///
+    /// Returns false if the accept queue is full.
+    fn push_accept_ready(&self, child: Arc<SocketState>) -> bool {
+        let mut guard = self.listen.lock();
+        if let Some(state) = guard.as_mut() {
+            let queued = state.queue_accept(child);
+            if queued {
+                state.waiters().wake_one();
+            }
+            queued
+        } else {
+            false
+        }
+    }
+
+    /// Check if this socket is in Listen state.
+    pub fn is_listening(&self) -> bool {
+        matches!(self.tcp_state(), Some(TcpState::Listen))
     }
 
     /// Get a snapshot of socket metadata.
@@ -785,6 +954,8 @@ pub enum SocketError {
     Closed,
     /// Operation timed out
     Timeout,
+    /// Payload exceeds TCP/UDP size limits (R51-2)
+    MessageTooLarge,
     /// No current process context
     NoProcess,
     /// Socket not found
@@ -795,6 +966,8 @@ pub enum SocketError {
     AlreadyConnected,
     /// Operation would block while connect is in progress (non-blocking)
     InProgress,
+    /// Operation would block on non-blocking socket (R51-1)
+    WouldBlock,
     /// Invalid socket state for the requested operation
     InvalidState,
     /// UDP layer error
@@ -819,8 +992,7 @@ impl From<LsmError> for SocketError {
 // Socket Table
 // ============================================================================
 
-/// TCP connection lookup key type (local_ip, local_port, remote_ip, remote_port)
-type TcpLookupKey = (u32, u16, u32, u16);
+// TcpLookupKey is defined earlier in this file, near TcpListenState.
 
 /// Global socket table: tracks all sockets and port bindings.
 ///
@@ -1021,6 +1193,168 @@ impl SocketTable {
         self.bind_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(chosen_port)
+    }
+
+    // NOTE: alloc_ephemeral_tcp_port is defined later in this impl block.
+
+    /// Bind a TCP socket (stream) to a local address/port (R51-1).
+    ///
+    /// # Arguments
+    ///
+    /// * `sock` - Socket to bind
+    /// * `current` - Current process context
+    /// * `cap_id` - Capability used for this operation
+    /// * `ip` - Local IP address to bind to
+    /// * `port` - Port to bind (None for ephemeral)
+    /// * `can_bind_privileged` - Whether privileged ports are allowed
+    ///
+    /// # Security
+    ///
+    /// - Invokes `hook_net_bind` for LSM policy check
+    /// - Privileged ports require root or NET_BIND_SERVICE
+    pub fn bind_tcp(
+        &self,
+        sock: &Arc<SocketState>,
+        current: &ProcessCtx,
+        cap_id: CapId,
+        ip: Ipv4Addr,
+        port: Option<u16>,
+        can_bind_privileged: bool,
+    ) -> Result<u16, SocketError> {
+        // Validate socket type
+        if sock.ty != SocketType::Stream || sock.proto != SocketProtocol::Tcp {
+            return Err(SocketError::InvalidType);
+        }
+
+        // Check if already bound
+        if sock.local_port().is_some() {
+            return Err(SocketError::PortInUse);
+        }
+
+        // Determine port
+        let chosen_port = if let Some(p) = port {
+            if p < PRIVILEGED_PORT_LIMIT && !can_bind_privileged {
+                return Err(SocketError::PrivilegedPort);
+            }
+            p
+        } else {
+            self.alloc_ephemeral_tcp_port()?
+        };
+
+        // Build LSM context
+        let mut ctx = self.ctx_from_socket(sock);
+        ctx.local = ipv4_to_u64(ip.0);
+        ctx.local_port = chosen_port;
+        ctx.cap = Some(cap_id);
+
+        // Check LSM policy
+        hook_net_bind(current, &ctx)?;
+
+        // Register port binding
+        {
+            let mut bindings = self.tcp_bindings.lock();
+
+            // Check for existing binding
+            if let Some(existing) = bindings.get(&chosen_port) {
+                if existing.upgrade().is_some() {
+                    return Err(SocketError::PortInUse);
+                }
+                bindings.remove(&chosen_port);
+            }
+
+            bindings.insert(chosen_port, Arc::downgrade(sock));
+        }
+
+        // Update socket state
+        sock.bind_local(ip, chosen_port);
+        self.bind_count.fetch_add(1, Ordering::Relaxed);
+
+        Ok(chosen_port)
+    }
+
+    /// Transition a TCP socket into LISTEN state (R51-1).
+    ///
+    /// # Arguments
+    ///
+    /// * `sock` - Socket to put into listen mode
+    /// * `current` - Current process context
+    /// * `cap_id` - Capability used for this operation
+    /// * `backlog` - Maximum pending connections (clamped to limits)
+    /// * `can_bind_privileged` - Whether privileged ports are allowed (for auto-bind)
+    ///
+    /// # Security
+    ///
+    /// - Invokes `hook_net_listen` for LSM policy check
+    /// - Auto-binds to ephemeral port if not already bound
+    pub fn listen(
+        &self,
+        sock: &Arc<SocketState>,
+        current: &ProcessCtx,
+        cap_id: CapId,
+        backlog: u32,
+        can_bind_privileged: bool,
+    ) -> Result<(), SocketError> {
+        // Validate socket type
+        if sock.ty != SocketType::Stream || sock.proto != SocketProtocol::Tcp {
+            return Err(SocketError::InvalidType);
+        }
+
+        // Cannot listen on connected socket
+        if sock.remote_port().is_some() {
+            return Err(SocketError::AlreadyConnected);
+        }
+
+        // Already listening?
+        if sock.is_listening() {
+            return Ok(());
+        }
+
+        let backlog = backlog.max(1) as usize;
+
+        // Auto-bind if not bound
+        if sock.local_port().is_none() {
+            let local_ip = sock.local_ip().map(Ipv4Addr).unwrap_or(Ipv4Addr([0, 0, 0, 0]));
+            let _ = self.bind_tcp(sock, current, cap_id, local_ip, None, can_bind_privileged)?;
+        }
+
+        // LSM listen hook
+        let mut ctx = self.ctx_from_socket(sock);
+        ctx.cap = Some(cap_id);
+        hook_net_listen(current, &ctx, backlog as u32)?;
+
+        // Install listen TCB + queues
+        let meta = sock.meta_snapshot();
+        let lip = meta.local_ip.map(Ipv4Addr).unwrap_or(Ipv4Addr([0, 0, 0, 0]));
+        let lport = meta.local_port.ok_or(SocketError::InvalidState)?;
+
+        sock.attach_tcp(TcpControlBlock::new_listen(lip, lport));
+        sock.install_listen_state(TcpListenState::new(backlog));
+
+        Ok(())
+    }
+
+    /// Lookup a listening socket by local port (R51-1).
+    fn lookup_tcp_listener(&self, local_port: u16) -> Option<Arc<SocketState>> {
+        let mut bindings = self.tcp_bindings.lock();
+        match bindings.get(&local_port).and_then(|w| w.upgrade()) {
+            Some(sock) if sock.is_listening() => Some(sock),
+            Some(_) => None, // Bound but not listening
+            None => {
+                bindings.remove(&local_port); // Clean up stale weak ref
+                None
+            }
+        }
+    }
+
+    /// Poll the accept queue of a listening socket (non-blocking) (R51-1).
+    pub fn poll_accept_ready(
+        &self,
+        listener: &Arc<SocketState>,
+    ) -> Result<Option<Arc<SocketState>>, SocketError> {
+        if !listener.is_listening() {
+            return Err(SocketError::InvalidState);
+        }
+        Ok(listener.pop_accept_ready())
     }
 
     /// Build a UDP datagram for transmission.
@@ -1398,7 +1732,8 @@ impl SocketTable {
 
     /// Send TCP data (PSH+ACK segment).
     ///
-    /// Builds and returns the TCP segment for transmission.
+    /// Builds MSS-sized TCP segments for transmission.
+    /// Large payloads are split into multiple segments to fit within MTU.
     ///
     /// # Arguments
     ///
@@ -1411,23 +1746,31 @@ impl SocketTable {
     ///
     /// - Invokes `hook_net_send` for LSM policy check
     /// - Validates socket is in ESTABLISHED state
+    /// - Enforces TCP_MAX_SEND_SIZE limit
     ///
     /// # Returns
     ///
-    /// Serialized TCP segment for transmission on success.
+    /// Tuple of (bytes_queued, segments) on success.
+    /// Caller is responsible for transmitting each segment.
     pub fn tcp_send(
         &self,
         sock: &Arc<SocketState>,
         current: &ProcessCtx,
         cap_id: CapId,
         payload: &[u8],
-    ) -> Result<Vec<u8>, SocketError> {
+    ) -> Result<(usize, Vec<Vec<u8>>), SocketError> {
         // Validate socket type
         if sock.ty != SocketType::Stream || sock.proto != SocketProtocol::Tcp {
             return Err(SocketError::InvalidType);
         }
         if sock.is_closed() {
             return Err(SocketError::Closed);
+        }
+
+        // R51-2 FIX: Enforce send size limit to prevent OOM DoS
+        // This is the canonical enforcement point for all TCP send paths.
+        if payload.len() > TCP_MAX_SEND_SIZE {
+            return Err(SocketError::MessageTooLarge);
         }
 
         // Get connection endpoints from metadata
@@ -1468,7 +1811,7 @@ impl SocketTable {
         }
 
         // Get current sequence numbers
-        let seq = tcp_state.control.snd_nxt;
+        let base_seq = tcp_state.control.snd_nxt;
         let ack = tcp_state.control.rcv_nxt;
 
         // Advertise our actual receive window (rcv_wnd minus buffered data)
@@ -1477,34 +1820,44 @@ impl SocketTable {
             .rcv_wnd
             .saturating_sub(tcp_state.control.recv_buffer.len() as u32) as u16;
 
-        // Use PSH flag if we have data
-        let flags = TCP_FLAG_ACK | if !payload.is_empty() { TCP_FLAG_PSH } else { 0 };
+        // TCP segmentation: split payload into MSS-sized chunks
+        let mss = TCP_ETHERNET_MSS as usize;
+        let mut segments = Vec::with_capacity((payload.len() + mss - 1) / mss.max(1));
+        let mut offset = 0usize;
+
+        while offset < payload.len() {
+            let end = core::cmp::min(offset + mss, payload.len());
+            let seg_payload = &payload[offset..end];
+
+            // PSH flag on non-empty data (typically set on last segment)
+            let is_last = end == payload.len();
+            let flags = TCP_FLAG_ACK | if !seg_payload.is_empty() && is_last { TCP_FLAG_PSH } else { 0 };
+
+            let segment = build_tcp_segment(
+                local_ip,
+                remote_ip,
+                local_port,
+                remote_port,
+                base_seq.wrapping_add(offset as u32),
+                ack,
+                flags,
+                advertised_wnd,
+                seg_payload,
+            );
+
+            segments.push(segment);
+            offset = end;
+        }
 
         // Update send next sequence number
-        tcp_state.control.snd_nxt = tcp_state
-            .control
-            .snd_nxt
-            .wrapping_add(payload.len() as u32);
+        tcp_state.control.snd_nxt = base_seq.wrapping_add(payload.len() as u32);
 
         drop(guard);
-
-        // Build the TCP segment
-        let segment = build_tcp_segment(
-            local_ip,
-            remote_ip,
-            local_port,
-            remote_port,
-            seq,
-            ack,
-            flags,
-            advertised_wnd,
-            payload,
-        );
 
         // Update statistics
         sock.tx_bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
 
-        Ok(segment)
+        Ok((payload.len(), segments))
     }
 
     /// Shutdown TCP connection (half-close).
@@ -2040,7 +2393,9 @@ impl SocketTable {
     }
 
     /// Build LSM NetCtx from socket state.
-    fn ctx_from_socket(&self, sock: &SocketState) -> NetCtx {
+    ///
+    /// # R51-1: Made public for sys_accept to build context for LSM hook.
+    pub fn ctx_from_socket(&self, sock: &SocketState) -> NetCtx {
         let meta = sock.meta_snapshot();
         // Use correct protocol based on socket type
         let proto = match sock.proto {
@@ -2182,6 +2537,113 @@ impl SocketTable {
         let sock = match self.lookup_tcp_conn(dst_ip, header.dst_port, src_ip, header.src_port) {
             Some(s) => s,
             None => {
+                // R51-1: Passive open handling for inbound SYN
+                let is_syn = header.flags & TCP_FLAG_SYN != 0;
+                let is_ack = header.flags & TCP_FLAG_ACK != 0;
+
+                // Pure SYN (without ACK) indicates new connection request
+                if is_syn && !is_ack {
+                    if let Some(listener) = self.lookup_tcp_listener(header.dst_port) {
+                        let mut listen_guard = listener.listen.lock();
+                        if let Some(listen_state) = listen_guard.as_mut() {
+                            let syn_key = tcp_map_key_from_parts(
+                                dst_ip,
+                                header.dst_port,
+                                src_ip,
+                                header.src_port,
+                            );
+
+                            // Handle retransmitted SYN: resend cached SYN-ACK
+                            if let Some(existing) = listen_state.get_syn(&syn_key) {
+                                return Some(existing.syn_ack.clone());
+                            }
+
+                            // Enforce global connection limit before allocating resources
+                            {
+                                let mut conns = self.tcp_conns.lock();
+                                conns.retain(|_, weak| weak.strong_count() > 0);
+                                if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
+                                    // Connection limit reached - silently drop SYN
+                                    return None;
+                                }
+                                // Check if 4-tuple already exists (race condition guard)
+                                if conns.get(&syn_key).and_then(|w| w.upgrade()).is_some() {
+                                    return None;
+                                }
+                            }
+
+                            // Create child socket inheriting listener properties
+                            let child_id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
+                            let child = Arc::new(SocketState::new(
+                                child_id,
+                                listener.domain,
+                                listener.ty,
+                                listener.proto,
+                                listener.label,
+                            ));
+
+                            // Register in socket table
+                            self.sockets.write().insert(child_id, child.clone());
+                            self.created.fetch_add(1, Ordering::Relaxed);
+
+                            // Set local and remote addresses
+                            child.bind_local(dst_ip, header.dst_port);
+                            child.set_remote(src_ip, header.src_port);
+
+                            // Generate server ISN using the secure ISN generator
+                            let iss = generate_isn(dst_ip, header.dst_port, src_ip, header.src_port);
+
+                            // Create server-side TCB in SynReceived state
+                            let tcb = TcpControlBlock::new_server(
+                                dst_ip,
+                                header.dst_port,
+                                src_ip,
+                                header.src_port,
+                                iss,
+                                header.seq_num,
+                            );
+                            child.attach_tcp(tcb);
+
+                            // Build SYN-ACK segment
+                            // RFC 793: SYN consumes 1 sequence number
+                            let syn_ack = build_tcp_segment(
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
+                                iss,
+                                header.seq_num.wrapping_add(1), // ACK = IRS + 1
+                                TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                TCP_DEFAULT_WINDOW,
+                                &[],
+                            );
+
+                            // Register connection for demux
+                            {
+                                let mut conns = self.tcp_conns.lock();
+                                conns.insert(syn_key, Arc::downgrade(&child));
+                            }
+
+                            // Queue half-open connection in SYN queue
+                            let pending = PendingSyn {
+                                key: syn_key,
+                                sock: child.clone(),
+                                syn_ack: syn_ack.clone(),
+                                syn_sent_at: self.time_wait_now(),
+                            };
+
+                            if listen_state.queue_syn(pending) {
+                                return Some(syn_ack);
+                            }
+
+                            // SYN backlog full - clean up resources
+                            self.tcp_conns.lock().remove(&syn_key);
+                            self.sockets.write().remove(&child_id);
+                            return None;
+                        }
+                    }
+                }
+
                 // No connection found - send RST per RFC 793
                 return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
             }
@@ -2234,10 +2696,12 @@ impl SocketTable {
 
                 // Accept the remote's ISN and transition to ESTABLISHED
                 tcp_state.control.irs = header.seq_num;
-                // RFC 793: ACK the SYN (1 byte) plus any payload data
+                // R51-3 FIX: Ignore SYN-ACK payload (not buffered, breaks integrity)
+                // RFC 793: SYN consumes 1 sequence number only.
+                // TCP Fast Open (RFC 7413) would require explicit negotiation and
+                // buffering of early data before ACKing, which we don't support.
                 let syn_len = 1u32;
-                let data_len = payload.len() as u32;
-                tcp_state.control.rcv_nxt = header.seq_num.wrapping_add(syn_len).wrapping_add(data_len);
+                tcp_state.control.rcv_nxt = header.seq_num.wrapping_add(syn_len);
                 tcp_state.control.snd_una = header.ack_num;
                 // Initialize send window from SYN-ACK (RFC 793)
                 tcp_state.control.snd_wnd = header.window as u32;
@@ -3259,8 +3723,98 @@ impl SocketTable {
                 fin_ack
             }
 
+            TcpState::SynReceived => {
+                // R51-1: Handle final ACK to complete passive open handshake
+                let is_syn = header.flags & TCP_FLAG_SYN != 0;
+                let is_ack = header.flags & TCP_FLAG_ACK != 0;
+                let syn_key = tcp_map_key_from_parts(dst_ip, header.dst_port, src_ip, header.src_port);
+
+                // Handle retransmitted SYN: resend cached SYN-ACK
+                if is_syn && !is_ack {
+                    if let Some(listener) = self.lookup_tcp_listener(header.dst_port) {
+                        let listen_guard = listener.listen.lock();
+                        if let Some(listen_state) = listen_guard.as_ref() {
+                            if let Some(pending) = listen_state.get_syn(&syn_key) {
+                                drop(guard);
+                                return Some(pending.syn_ack.clone());
+                            }
+                        }
+                    }
+                    return None;
+                }
+
+                // Must have ACK to complete handshake
+                if !is_ack {
+                    return None;
+                }
+
+                // Validate ACK acknowledges our SYN (ISS + 1)
+                let ack_valid = header.ack_num == tcp_state.control.snd_nxt;
+                let recv_wnd = tcp_state.control.rcv_wnd.max(1);
+                let seq_ok = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
+
+                if !ack_valid || !seq_ok {
+                    // Invalid ACK - abort handshake, send RST
+                    tcp_state.control.state = TcpState::Closed;
+                    drop(guard);
+
+                    // R51-1 FIX: Remove stale PendingSyn from listener's SYN queue
+                    // before cleanup to prevent cached SYN-ACK responses to dead socket
+                    if let Some(listener) = self.lookup_tcp_listener(header.dst_port) {
+                        let mut listen_guard = listener.listen.lock();
+                        if let Some(listen_state) = listen_guard.as_mut() {
+                            listen_state.take_syn(&syn_key);
+                        }
+                    }
+
+                    // R51-1 FIX (Codex): Mark socket closed before cleanup to ensure
+                    // it's removed from sockets map (cleanup checks is_closed())
+                    sock.mark_closed();
+                    self.cleanup_tcp_connection(&sock);
+                    return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                }
+
+                // Handshake complete - transition to Established
+                tcp_state.control.snd_una = header.ack_num;
+                tcp_state.control.snd_wnd = header.window as u32;
+                tcp_state.control.snd_wl1 = header.seq_num;
+                tcp_state.control.snd_wl2 = header.ack_num;
+                tcp_state.control.state = TcpState::Established;
+
+                drop(guard);
+
+                // Remove from SYN queue and add to accept queue
+                if let Some(listener) = self.lookup_tcp_listener(header.dst_port) {
+                    let mut listen_guard = listener.listen.lock();
+                    if let Some(listen_state) = listen_guard.as_mut() {
+                        // Remove from SYN queue
+                        listen_state.take_syn(&syn_key);
+                    }
+                    drop(listen_guard);
+
+                    // Push to accept queue and wake accept() waiters
+                    if !listener.push_accept_ready(sock.clone()) {
+                        // Accept queue full - abort connection
+                        // R51-1 FIX (Codex): Mark socket closed before cleanup
+                        sock.mark_closed();
+                        self.cleanup_tcp_connection(&sock);
+                        return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                    }
+                }
+
+                // Wake any waiters (accept queue changed)
+                sock.wake_tcp_waiters();
+                None
+            }
+
+            TcpState::Listen => {
+                // Listen state should not receive segments here - handled above
+                // This is an internal error / unexpected state
+                None
+            }
+
             _ => {
-                // Other states not yet implemented (Listen, SynReceived)
+                // Other states not yet implemented
                 None
             }
         }
@@ -3271,9 +3825,27 @@ impl SocketTable {
     /// This returns the value set by the last `sweep_time_wait()` call.
     /// Used by the RX path when transitioning to TIME_WAIT state to record
     /// the start time without requiring access to kernel time functions.
+    ///
+    /// # R51-6 FIX (Enhanced)
+    ///
+    /// Falls back to the kernel tick counter via SocketWaitHooks if the sweep
+    /// has not yet initialized the cached clock. This provides accurate timing
+    /// instead of relying on RDTSC assumptions about CPU frequency.
+    ///
+    /// If hooks are not yet registered (very early boot), returns 1 as a minimal
+    /// non-zero value to avoid zero-timestamp issues.
     #[inline]
     fn time_wait_now(&self) -> u64 {
-        self.time_wait_clock.load(Ordering::Relaxed)
+        let cached = self.time_wait_clock.load(Ordering::Relaxed);
+        if cached != 0 {
+            return cached;
+        }
+        // Fallback to kernel tick counter via hooks when sweep hasn't run yet
+        // This is more accurate than RDTSC assumptions about CPU frequency
+        // Clamp to at least 1 to ensure non-zero timestamp even before first tick
+        socket_wait_hooks()
+            .map(|h| h.get_ticks().max(1))
+            .unwrap_or(1)
     }
 
     /// Sweep TIME_WAIT connections and clean up those that exceeded 2MSL.
@@ -3509,9 +4081,17 @@ impl SocketTable {
     fn cleanup_tcp_connection(&self, sock: &Arc<SocketState>) {
         let meta = sock.meta_snapshot();
 
-        // Remove local port binding
+        // R51-1 FIX: Only remove local port binding if this socket owns it.
+        // Child sockets from passive open share the listener's port binding,
+        // so we must not unbind the port when cleaning up a child socket.
         if let Some(port) = meta.local_port {
-            self.tcp_bindings.lock().remove(&port);
+            let mut bindings = self.tcp_bindings.lock();
+            if let Some(weak) = bindings.get(&port) {
+                // Only remove if this binding points to us (not a listener)
+                if weak.as_ptr() == Arc::as_ptr(sock) {
+                    bindings.remove(&port);
+                }
+            }
         }
 
         // Remove 4-tuple from connection map

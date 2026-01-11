@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-08
+**Last Updated:** 2026-01-10
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -10,10 +10,10 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ## Executive Summary
 
-### Current Status: Phase D.2 In Progress (IPv4/ICMP/ARP/UDP Stack)
+### Current Status: Phase D.2 In Progress (TCP Active Open Complete, Passive Open Pending)
 
 Zero-OS has completed storage foundation and is building network infrastructure:
-- **49 security audits** with 216+ issues found, ~189 fixed (87.5%) - R49 Fixes applied
+- **51 security audits** with 228 issues found, ~195 fixed (86%) - R51 issues pending
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -22,7 +22,7 @@ Zero-OS has completed storage foundation and is building network infrastructure:
 - **Phase B**: ✅ **COMPLETE** (Cap/LSM/Seccomp integrated into syscall paths)
 - **Phase C**: ✅ **COMPLETE** (virtio-blk, page cache, ext2, procfs, OOM killer, openat2, devfs read/write)
 - **Phase D.1**: ✅ **COMPLETE** (virtio crate, NetDevice trait, virtio-net driver MVP)
-- **Phase D.2**: IPv4/ICMP protocol stack with security-first design (Ethernet, IPv4, ICMP echo, UDP sockets)
+- **Phase D.2**: TCP client complete (connect/send/recv/shutdown/close), server pending (listen/accept)
 
 ### Gap Analysis vs Linux Kernel
 
@@ -30,7 +30,7 @@ Zero-OS has completed storage foundation and is building network infrastructure:
 |----------|-------|---------|-----|
 | **SMP** | 256+ CPUs | Single-core | Full implementation needed |
 | **Security Framework** | LSM/SELinux/AppArmor | LSM + Seccomp + Capabilities | ✅ Framework complete, policies needed |
-| **Network** | Full TCP/IP stack | Not started | Full implementation needed |
+| **Network** | Full TCP/IP stack | TCP client, UDP, ICMP | TCP server (listen/accept) needed |
 | **Storage** | ext4/xfs/btrfs/zfs | virtio-blk + ext2 + procfs | Extended FS support needed |
 | **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard/VirtIO | Driver framework needed |
 | **Containers** | Namespaces/Cgroups | Not started | Full implementation needed |
@@ -460,8 +460,13 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] **R50 FIXED**: Global connection limit with stale entry pruning (DoS prevention)
 - [ ] TCP retransmission with RTT estimation
 - [x] TCP FIN/close states (graceful shutdown) - sys_shutdown, all RFC 793 states
-- [ ] TCP listen/accept (passive open)
+- [ ] TCP listen/accept (passive open) - **R51-1 BLOCKED** (requires SYN/accept queues)
 - [ ] Fragment reassembly with limits
+- [ ] **R51-2 FIX**: Cap TCP sendto allocation (prevent OOM DoS)
+- [ ] **R51-3 FIX**: Ignore SYN-ACK payload (set rcv_nxt = seq+1 only)
+- [ ] **R51-4 FIX**: Rollback socket/cap on fd exhaustion
+- [ ] **R51-5 FIX**: Abort connect on TX failure
+- [ ] **R51-6 FIX**: Initialize FIN/TIME_WAIT timers immediately
 
 #### D.3 Protection Mechanisms
 
@@ -684,21 +689,25 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-05 | 43 | 5 | 5 | VirtIO used.id OOB, descriptor chain loop, double-free - **ALL FIXED** |
 | 2026-01-06 | 44-47 | 16 | 16 | ARP/UDP/Socket API, VirtIO hardening - **ALL FIXED** |
 | 2026-01-07 | 48 | 6 | 6 | Network stack security audit - **ALL R48 FIXED** |
-| **Total** | **48** | **210+** | **183 (87%)** | **27 open (SMP deferred)** |
+| 2026-01-08 | 49 | 3 | 3 | NetBuf leak, NET_BIND_SERVICE - **ALL R49 FIXED** |
+| 2026-01-09 | 50 | 6 | 6 | TCP ISN/RST/limits, FIN/close states - **ALL R50 FIXED** |
+| 2026-01-10 | 51 | 6 | 0 | TCP resource mgmt, listen/accept gap - **OPEN** |
+| **Total** | **51** | **228** | **195 (86%)** | **33 open (R51 + SMP)** |
 
 ### Current Status
 
-- **Fixed**: 183 issues (87%)
-- **Open**: 27 issues (13%)
-  - R48 issues: 6 found, **ALL FIXED**
-    - R48-1/R48-4: VirtIO used.idx rewind prevention ✅
-    - R48-5: NetBuf Drop implementation ✅
-    - R48-2: ARP gratuitous learning restriction ✅
-    - R48-3: UDP LSM check before copy ✅
-    - R48-6: Early IPv4 fragment filter ✅
+- **Fixed**: 195 issues (86%)
+- **Open**: 33 issues (14%)
+  - R51 issues: 6 found, **OPEN - priority fix needed**
+    - R51-1 (HIGH): Missing TCP listen/accept
+    - R51-2 (HIGH): Unbounded TCP send allocation
+    - R51-3 (MEDIUM): SYN-ACK payload ack error
+    - R51-4 (MEDIUM): Socket/cap leak on fd exhaustion
+    - R51-5 (MEDIUM): TCB leak on connect TX failure
+    - R51-6 (MEDIUM): FIN/TIME_WAIT timer init
   - SMP-related issues deferred to Phase E
 
-See [qa-2026-01-07.md](review/qa-2026-01-07.md) for latest audit report.
+See [qa-2026-01-10.md](review/qa-2026-01-10.md) for latest audit report.
 
 ---
 

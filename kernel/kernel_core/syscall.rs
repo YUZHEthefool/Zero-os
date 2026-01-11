@@ -758,6 +758,10 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
             SOCKET_WAITERS.lock().wake_all(queue_addr);
         });
     }
+
+    fn get_ticks(&self) -> u64 {
+        crate::get_ticks()
+    }
 }
 
 /// Static instance of KernelSocketWaitHooks for registration.
@@ -898,6 +902,7 @@ pub enum SyscallError {
     EALREADY = -114,      // 操作已经在进行
     EINPROGRESS = -115,   // 操作正在进行
     EOPNOTSUPP = -95,     // 操作不支持
+    ECONNABORTED = -103,  // R51-1: 连接被中止 (accept on closed listener)
 }
 
 impl SyscallError {
@@ -1529,9 +1534,11 @@ fn socket_error_to_syscall(err: net::SocketError) -> SyscallError {
         net::SocketError::NotBound => SyscallError::EDESTADDRREQ,
         net::SocketError::Closed | net::SocketError::NotFound => SyscallError::EBADF,
         net::SocketError::Timeout => SyscallError::ETIMEDOUT,
+        net::SocketError::MessageTooLarge => SyscallError::EMSGSIZE,
         net::SocketError::NoProcess => SyscallError::ESRCH,
         net::SocketError::AlreadyConnected => SyscallError::EISCONN,
         net::SocketError::InProgress => SyscallError::EINPROGRESS,
+        net::SocketError::WouldBlock => SyscallError::EAGAIN,
         net::SocketError::InvalidState => SyscallError::ENOTCONN,
         net::SocketError::Udp(net::UdpError::PayloadTooLarge) => SyscallError::EMSGSIZE,
         net::SocketError::Udp(_) => SyscallError::EINVAL,
@@ -1830,7 +1837,9 @@ pub fn syscall_dispatcher(
         // 套接字 (Socket syscalls - Linux x86_64 ABI)
         41 => sys_socket(arg0 as i32, arg1 as i32, arg2 as i32),
         42 => sys_connect(arg0 as i32, arg1 as *const SockAddrIn, arg2 as u32),
+        43 => sys_accept(arg0 as i32, arg1 as *mut SockAddrIn, arg2 as *mut u32),
         49 => sys_bind(arg0 as i32, arg1 as *const SockAddrIn, arg2 as u32),
+        50 => sys_listen(arg0 as i32, arg1 as i32),
         44 => sys_sendto(
             arg0 as i32,
             arg1 as *const u8,
@@ -5858,9 +5867,17 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
         let mut proc = process.lock();
         let cap_id = proc.cap_table.allocate(cap_entry).map_err(cap_error_to_syscall)?;
         let sock_file = SocketFile::new(cap_id, socket.id, nonblock);
-        let fd = proc
-            .allocate_fd(alloc::boxed::Box::new(sock_file))
-            .ok_or(SyscallError::EMFILE)?;
+        // R51-4 FIX: Roll back allocations if fd table is full
+        let fd = match proc.allocate_fd(alloc::boxed::Box::new(sock_file)) {
+            Some(fd) => fd,
+            None => {
+                // Release capability and close socket to prevent resource leak
+                let _ = proc.cap_table.revoke(cap_id);
+                drop(proc);
+                net::socket_table().close(socket.id);
+                return Err(SyscallError::EMFILE);
+            }
+        };
         if cloexec {
             proc.cloexec_fds.insert(fd);
         }
@@ -5917,18 +5934,225 @@ fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
     }
 
     // Bind via socket_table (includes LSM hook_net_bind check)
+    // R51-1: Support both UDP and TCP binding
+    let port_opt = if port == 0 { None } else { Some(port) };
+    if socket.ty == net::SocketType::Dgram && socket.proto == net::SocketProtocol::Udp {
+        net::socket_table()
+            .bind_udp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged)
+            .map_err(socket_error_to_syscall)?;
+    } else if socket.ty == net::SocketType::Stream && socket.proto == net::SocketProtocol::Tcp {
+        net::socket_table()
+            .bind_tcp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged)
+            .map_err(socket_error_to_syscall)?;
+    } else {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+
+    Ok(0)
+}
+
+/// sys_listen - Mark a TCP socket as listening (syscall 50, R51-1).
+///
+/// Transitions a bound TCP socket to LISTEN state, enabling it to accept
+/// incoming connections.
+///
+/// # Arguments
+/// * `fd` - Socket file descriptor
+/// * `backlog` - Maximum pending connections (clamped to system limits)
+///
+/// # Security
+/// - Verifies CapRights::BIND (required for listen)
+/// - Invokes LSM hook_net_listen for policy check
+/// - Auto-binds to ephemeral port if not already bound
+fn sys_listen(fd: i32, backlog: i32) -> SyscallResult {
+    if backlog < 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let (cap_id, socket_id, _nonblock) = socket_handle_from_fd(fd)?;
+    let (entry, socket) = resolve_socket(cap_id, socket_id)?;
+
+    // Only TCP sockets can listen
+    if socket.ty != net::SocketType::Stream || socket.proto != net::SocketProtocol::Tcp {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+
+    // BIND right required for listen
+    if !entry.rights.allows(cap::CapRights::BIND) {
+        return Err(SyscallError::EACCES);
+    }
+
+    let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
+
+    // Compute privileged-port permission for auto-bind
+    let has_net_bind_cap = with_current_cap_table(|table| {
+        table.has_rights(cap::CapRights::NET_BIND_SERVICE)
+    })
+    .unwrap_or(false);
+    let can_bind_privileged = ctx.euid == 0 || has_net_bind_cap;
+
     net::socket_table()
-        .bind_udp(
-            &socket,
-            &ctx,
-            cap_id,
-            ip,
-            if port == 0 { None } else { Some(port) },
-            can_bind_privileged,
-        )
+        .listen(&socket, &ctx, cap_id, backlog as u32, can_bind_privileged)
         .map_err(socket_error_to_syscall)?;
 
     Ok(0)
+}
+
+/// sys_accept - Accept a pending TCP connection (syscall 43, R51-1).
+///
+/// Extracts the first connection from the listen queue, creates a new
+/// socket for it, and returns its file descriptor.
+///
+/// # Arguments
+/// * `fd` - Listening socket file descriptor
+/// * `addr` - Optional pointer to receive peer address
+/// * `addrlen` - Optional pointer to address length
+///
+/// # Security
+/// - Verifies CapRights::READ (required for accept)
+/// - Invokes LSM hook_net_accept for policy check
+/// - Returns EAGAIN for non-blocking if no connections pending
+fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResult {
+    let (cap_id, socket_id, nonblock) = socket_handle_from_fd(fd)?;
+    let (entry, socket) = resolve_socket(cap_id, socket_id)?;
+
+    // Only TCP sockets can accept
+    if socket.ty != net::SocketType::Stream || socket.proto != net::SocketProtocol::Tcp {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+
+    // READ right required for accept
+    if !entry.rights.allows(cap::CapRights::READ) {
+        return Err(SyscallError::EACCES);
+    }
+
+    // Must be in LISTEN state
+    if !socket.is_listening() {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let current = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
+
+    // Blocking loop until a connection is ready
+    let child = loop {
+        match net::socket_table().poll_accept_ready(&socket) {
+            Ok(Some(conn)) => break conn,
+            Ok(None) => {
+                if nonblock {
+                    return Err(SyscallError::EAGAIN);
+                }
+                // Block on accept wait queue
+                if let Some(waiters) = socket.listen_waiters() {
+                    match waiters.wait_with_timeout(None) {
+                        net::WaitOutcome::Woken => continue,
+                        net::WaitOutcome::Closed => return Err(SyscallError::ECONNABORTED),
+                        net::WaitOutcome::NoProcess => return Err(SyscallError::ESRCH),
+                        net::WaitOutcome::TimedOut => continue,
+                    }
+                } else {
+                    return Err(SyscallError::EINVAL);
+                }
+            }
+            Err(e) => return Err(socket_error_to_syscall(e)),
+        }
+    };
+
+    // Helper to clean up child socket on error after it's been popped from accept queue
+    let cleanup_child = |c: &alloc::sync::Arc<net::SocketState>| {
+        c.mark_closed();
+        net::socket_table().close(c.id);
+    };
+
+    // LSM accept hook (using child's context for peer info)
+    let mut ctx = net::socket_table().ctx_from_socket(&child);
+    ctx.cap = Some(cap_id);
+    if let Err(e) = lsm::hook_net_accept(&current, &ctx) {
+        cleanup_child(&child);
+        return Err(lsm_error_to_syscall(e));
+    }
+
+    // Fill optional peer address
+    if !addr.is_null() && !addrlen.is_null() {
+        if let (Some(rip), Some(rport)) = (child.remote_ip(), child.remote_port()) {
+            let mut out = SockAddrIn::default();
+            out.sin_family = AF_INET as u16;
+            out.sin_port = rport.to_be();
+            out.sin_addr = u32::from_le_bytes(rip).swap_bytes();
+
+            if let Err(e) = validate_user_ptr(addr as *const u8, core::mem::size_of::<SockAddrIn>()) {
+                cleanup_child(&child);
+                return Err(e);
+            }
+            if let Err(e) = validate_user_ptr(addrlen as *const u8, core::mem::size_of::<u32>()) {
+                cleanup_child(&child);
+                return Err(e);
+            }
+
+            // Convert struct to bytes for copy_to_user
+            let out_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &out as *const SockAddrIn as *const u8,
+                    core::mem::size_of::<SockAddrIn>(),
+                )
+            };
+            if let Err(e) = copy_to_user(addr as *mut u8, out_bytes) {
+                cleanup_child(&child);
+                return Err(e);
+            }
+
+            let len_val = core::mem::size_of::<SockAddrIn>() as u32;
+            if let Err(e) = copy_to_user(addrlen as *mut u8, &len_val.to_ne_bytes()) {
+                cleanup_child(&child);
+                return Err(e);
+            }
+        }
+    }
+
+    // Allocate capability + fd for child socket
+    let cap_entry = cap::CapEntry::with_flags(
+        cap::CapObject::Socket(alloc::sync::Arc::new(cap::Socket::new(child.id))),
+        cap::CapRights::READ | cap::CapRights::WRITE | cap::CapRights::BIND,
+        cap::CapFlags::empty(),
+    );
+
+    let pid = match current_pid() {
+        Some(p) => p,
+        None => {
+            cleanup_child(&child);
+            return Err(SyscallError::ESRCH);
+        }
+    };
+    let process = match get_process(pid) {
+        Some(p) => p,
+        None => {
+            cleanup_child(&child);
+            return Err(SyscallError::ESRCH);
+        }
+    };
+    let new_fd = {
+        let mut proc = process.lock();
+        let new_cap = match proc.cap_table.allocate(cap_entry) {
+            Ok(c) => c,
+            Err(e) => {
+                drop(proc);
+                cleanup_child(&child);
+                return Err(cap_error_to_syscall(e));
+            }
+        };
+        let sock_file = SocketFile::new(new_cap, child.id, nonblock);
+        match proc.allocate_fd(alloc::boxed::Box::new(sock_file)) {
+            Some(fd) => fd,
+            None => {
+                // Rollback capability allocation
+                let _ = proc.cap_table.revoke(new_cap);
+                drop(proc);
+                cleanup_child(&child);
+                return Err(SyscallError::EMFILE);
+            }
+        }
+    };
+
+    Ok(new_fd as usize)
 }
 
 /// sys_connect - Connect a TCP socket (syscall 42).
@@ -6000,8 +6224,11 @@ fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult 
         .map_err(socket_error_to_syscall)?;
 
     // Phase 2: Transmit the SYN segment via network device
-    net::transmit_tcp_segment(syn_result.dst_ip, &syn_result.segment)
-        .map_err(tx_error_to_syscall)?;
+    // R51-5 FIX: Abort connection if TX fails to prevent TCB/binding leak
+    if let Err(e) = net::transmit_tcp_segment(syn_result.dst_ip, &syn_result.segment) {
+        net::socket_table().abort_tcp_connect(&socket);
+        return Err(tx_error_to_syscall(e));
+    }
 
     // Non-blocking connect returns EINPROGRESS after sending SYN
     if nonblock {
@@ -6100,6 +6327,12 @@ fn sys_sendto(
             return Err(SyscallError::EDESTADDRREQ);
         }
 
+        // R51-2 FIX: Cap TCP send size pre-copy to avoid large allocations.
+        // tcp_send() also enforces this limit as the canonical check point.
+        if len > net::tcp::TCP_MAX_SEND_SIZE {
+            return Err(SyscallError::EMSGSIZE);
+        }
+
         // Copy payload from user space
         validate_user_ptr(buf, len)?;
         let mut data = vec![0u8; len];
@@ -6111,16 +6344,18 @@ fn sys_sendto(
             .map(net::Ipv4Addr)
             .ok_or(SyscallError::ENOTCONN)?;
 
-        // Send via TCP
-        let segment = net::socket_table()
+        // Send via TCP (segments split at MSS boundary)
+        let (bytes_sent, segments) = net::socket_table()
             .tcp_send(&socket, &ctx, cap_id, &data)
             .map_err(socket_error_to_syscall)?;
 
-        // Transmit the TCP segment via network device
-        net::transmit_tcp_segment(remote_ip, &segment)
-            .map_err(tx_error_to_syscall)?;
+        // Transmit all TCP segments via network device
+        for segment in segments {
+            net::transmit_tcp_segment(remote_ip, &segment)
+                .map_err(tx_error_to_syscall)?;
+        }
 
-        return Ok(len);
+        return Ok(bytes_sent);
     }
 
     // Non-TCP with dest_addr: must be UDP

@@ -133,6 +133,11 @@ pub const TCP_MAX_ACCEPT_BACKLOG: usize = 128;
 /// R50-5 FIX: Maximum active TCP connections (all states) to prevent resource exhaustion
 pub const TCP_MAX_ACTIVE_CONNECTIONS: usize = 4096;
 
+/// R51-2 FIX: Maximum TCP send size (bounds kernel allocations).
+/// Limits per-send payload to 64KB to align with default receive window.
+/// Enforced in tcp_send() to protect all send paths from OOM DoS.
+pub const TCP_MAX_SEND_SIZE: usize = 64 * 1024;
+
 // ============================================================================
 // TCP Flags
 // ============================================================================
@@ -537,6 +542,15 @@ impl TcpControlBlock {
         tcb.irs = irs;
         tcb.rcv_nxt = irs.wrapping_add(1);
         tcb.state = TcpState::SynReceived;
+        tcb
+    }
+
+    /// Create a TCB for a listening socket without a peer.
+    ///
+    /// R51-1: Used for TCP passive open (listen/accept).
+    pub fn new_listen(local_ip: Ipv4Addr, local_port: u16) -> Self {
+        let mut tcb = Self::new_client(local_ip, local_port, Ipv4Addr([0, 0, 0, 0]), 0, 0);
+        tcb.state = TcpState::Listen;
         tcb
     }
 
