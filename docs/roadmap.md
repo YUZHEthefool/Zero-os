@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-10
+**Last Updated:** 2026-01-11
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -10,10 +10,10 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ## Executive Summary
 
-### Current Status: Phase D.2 In Progress (TCP Active Open Complete, Passive Open Pending)
+### Current Status: Phase D.2 In Progress (TCP Reliable Transport Complete)
 
 Zero-OS has completed storage foundation and is building network infrastructure:
-- **51 security audits** with 228 issues found, ~195 fixed (86%) - R51 issues pending
+- **53 security audits** with 233 issues found, ~198 fixed (85%)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -22,7 +22,7 @@ Zero-OS has completed storage foundation and is building network infrastructure:
 - **Phase B**: ✅ **COMPLETE** (Cap/LSM/Seccomp integrated into syscall paths)
 - **Phase C**: ✅ **COMPLETE** (virtio-blk, page cache, ext2, procfs, OOM killer, openat2, devfs read/write)
 - **Phase D.1**: ✅ **COMPLETE** (virtio crate, NetDevice trait, virtio-net driver MVP)
-- **Phase D.2**: TCP client complete (connect/send/recv/shutdown/close), server pending (listen/accept)
+- **Phase D.2**: TCP client/server complete (connect/listen/accept/send/recv/shutdown/close), retransmission with RFC 6298 RTT
 
 ### Gap Analysis vs Linux Kernel
 
@@ -30,7 +30,7 @@ Zero-OS has completed storage foundation and is building network infrastructure:
 |----------|-------|---------|-----|
 | **SMP** | 256+ CPUs | Single-core | Full implementation needed |
 | **Security Framework** | LSM/SELinux/AppArmor | LSM + Seccomp + Capabilities | ✅ Framework complete, policies needed |
-| **Network** | Full TCP/IP stack | TCP client, UDP, ICMP | TCP server (listen/accept) needed |
+| **Network** | Full TCP/IP stack | TCP (w/retransmission), UDP, ICMP | Congestion control, Window Scaling |
 | **Storage** | ext4/xfs/btrfs/zfs | virtio-blk + ext2 + procfs | Extended FS support needed |
 | **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard/VirtIO | Driver framework needed |
 | **Containers** | Namespaces/Cgroups | Not started | Full implementation needed |
@@ -458,15 +458,18 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] **R50 FIXED**: Sequence window validation (RFC 793/5961)
 - [x] **R50 FIXED**: RST validation + challenge ACK (RFC 5961 Section 3.2)
 - [x] **R50 FIXED**: Global connection limit with stale entry pruning (DoS prevention)
-- [ ] TCP retransmission with RTT estimation
+- [x] **R53 IMPLEMENTED**: TCP retransmission (RFC 6298 RTT/RTO, Karn's algorithm, exponential backoff)
+- [x] **R53-3 FIXED**: Dual timer system (200ms retransmission, 1s TIME_WAIT cleanup)
 - [x] TCP FIN/close states (graceful shutdown) - sys_shutdown, all RFC 793 states
-- [ ] TCP listen/accept (passive open) - **R51-1 BLOCKED** (requires SYN/accept queues)
+- [x] **R51-1 FIXED**: TCP listen/accept (passive open) - SYN/accept queues implemented
 - [ ] Fragment reassembly with limits
-- [ ] **R51-2 FIX**: Cap TCP sendto allocation (prevent OOM DoS)
-- [ ] **R51-3 FIX**: Ignore SYN-ACK payload (set rcv_nxt = seq+1 only)
-- [ ] **R51-4 FIX**: Rollback socket/cap on fd exhaustion
-- [ ] **R51-5 FIX**: Abort connect on TX failure
-- [ ] **R51-6 FIX**: Initialize FIN/TIME_WAIT timers immediately
+- [x] **R51-2 FIXED**: Cap TCP sendto allocation (prevent OOM DoS)
+- [x] **R51-3 FIXED**: Ignore SYN-ACK payload (set rcv_nxt = seq+1 only)
+- [x] **R51-4 FIXED**: Rollback socket/cap on fd exhaustion
+- [x] **R51-5 FIXED**: Abort connect on TX failure
+- [x] **R51-6 FIXED**: Initialize FIN/TIME_WAIT timers immediately
+- [x] **R52-1 FIXED**: SYN queue timeout (30s) for half-open connection cleanup
+- [x] **R52-2 FIXED**: Listener close cleanup (SYN/accept queue resource release)
 
 #### D.3 Protection Mechanisms
 
@@ -691,23 +694,18 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-07 | 48 | 6 | 6 | Network stack security audit - **ALL R48 FIXED** |
 | 2026-01-08 | 49 | 3 | 3 | NetBuf leak, NET_BIND_SERVICE - **ALL R49 FIXED** |
 | 2026-01-09 | 50 | 6 | 6 | TCP ISN/RST/limits, FIN/close states - **ALL R50 FIXED** |
-| 2026-01-10 | 51 | 6 | 0 | TCP resource mgmt, listen/accept gap - **OPEN** |
-| **Total** | **51** | **228** | **195 (86%)** | **33 open (R51 + SMP)** |
+| 2026-01-10 | 51 | 6 | 6 | TCP resource mgmt, listen/accept - **ALL R51 FIXED** |
+| 2026-01-11 | 52-53 | 6 | 6 | SYN queue timeout, listener cleanup, RTT/RTO, timer granularity - **ALL FIXED** |
+| **Total** | **53** | **240** | **207 (86%)** | **33 open (SMP-related)** |
 
 ### Current Status
 
-- **Fixed**: 195 issues (86%)
+- **Fixed**: 207 issues (86%)
 - **Open**: 33 issues (14%)
-  - R51 issues: 6 found, **OPEN - priority fix needed**
-    - R51-1 (HIGH): Missing TCP listen/accept
-    - R51-2 (HIGH): Unbounded TCP send allocation
-    - R51-3 (MEDIUM): SYN-ACK payload ack error
-    - R51-4 (MEDIUM): Socket/cap leak on fd exhaustion
-    - R51-5 (MEDIUM): TCB leak on connect TX failure
-    - R51-6 (MEDIUM): FIN/TIME_WAIT timer init
   - SMP-related issues deferred to Phase E
+  - No open TCP issues
 
-See [qa-2026-01-10.md](review/qa-2026-01-10.md) for latest audit report.
+See [qa-2026-01-11-v2.md](review/qa-2026-01-11-v2.md) for latest audit report.
 
 ---
 

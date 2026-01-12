@@ -85,11 +85,12 @@ pub use udp::{
 pub use tcp::{
     parse_tcp_header, parse_tcp_options, build_tcp_segment, compute_tcp_checksum,
     verify_tcp_checksum, generate_isn, seq_lt, seq_le, seq_gt, seq_ge, seq_in_window,
-    TcpHeader, TcpOptions, TcpState, TcpControlBlock, TcpConnKey, TcpSegment,
-    TcpError, TcpResult, TcpStats,
+    update_rtt, handle_ack, update_congestion_control, handle_retransmission_timeout, initial_cwnd,
+    TcpHeader, TcpOptions, TcpState, TcpCongestionState, TcpControlBlock, TcpConnKey, TcpSegment,
+    AckUpdate, CongestionAction, TcpError, TcpResult, TcpStats,
     TCP_HEADER_MIN_LEN, TCP_PROTO, TCP_DEFAULT_MSS, TCP_ETHERNET_MSS, TCP_TIME_WAIT_MS,
-    TCP_FIN_TIMEOUT_MS, TCP_MAX_FIN_RETRIES, TCP_MAX_SEND_SIZE,
-    TCP_MAX_SYN_BACKLOG, TCP_MAX_ACCEPT_BACKLOG,
+    TCP_FIN_TIMEOUT_MS, TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES, TCP_MAX_RTO_MS, TCP_MAX_SEND_SIZE,
+    TCP_MAX_SYN_BACKLOG, TCP_MAX_ACCEPT_BACKLOG, TCP_INITIAL_SSTHRESH,
     TCP_FLAG_FIN, TCP_FLAG_SYN, TCP_FLAG_RST, TCP_FLAG_PSH, TCP_FLAG_ACK, TCP_FLAG_URG,
 };
 pub use socket::{

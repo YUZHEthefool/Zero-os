@@ -110,13 +110,32 @@ pub const TCP_MAX_RETRIES: u8 = 15;
 pub const TCP_INITIAL_RTO_MS: u64 = 1000;
 
 /// Minimum retransmission timeout in milliseconds
-pub const TCP_MIN_RTO_MS: u64 = 200;
+///
+/// RFC 6298 Section 2.4 recommends a minimum RTO of 1 second to avoid
+/// spurious retransmissions due to delayed ACKs. While some implementations
+/// use lower values (Linux uses 200ms with tcp_rto_min), we follow the RFC
+/// for correctness and to account for our coarser timer granularity.
+pub const TCP_MIN_RTO_MS: u64 = 1000;
 
 /// Maximum retransmission timeout in milliseconds
 pub const TCP_MAX_RTO_MS: u64 = 120_000;
 
 /// TIME-WAIT duration (2*MSL = 2*60 seconds per RFC 793)
 pub const TCP_TIME_WAIT_MS: u64 = 120_000;
+
+/// R52-1 FIX: SYN timeout for half-open connections in SYN queue.
+///
+/// Half-open connections (SYN received, SYN-ACK sent, awaiting final ACK) are
+/// evicted from the SYN queue after this timeout to prevent SYN flood attacks
+/// from exhausting listener resources.
+///
+/// 30 seconds is a reasonable balance:
+/// - Long enough for legitimate slow connections (high-latency, packet loss)
+/// - Short enough to recover from SYN flood attacks within minutes
+///
+/// Reference: Linux uses tcp_synack_retries (default 5) * exponential backoff,
+/// resulting in ~63 seconds total. We use a simpler fixed timeout.
+pub const TCP_SYN_TIMEOUT_MS: u64 = 30_000;
 
 /// FIN retransmission timeout floor (RFC 6298 style, reuse RTO baseline)
 pub const TCP_FIN_TIMEOUT_MS: u64 = TCP_INITIAL_RTO_MS;
@@ -137,6 +156,32 @@ pub const TCP_MAX_ACTIVE_CONNECTIONS: usize = 4096;
 /// Limits per-send payload to 64KB to align with default receive window.
 /// Enforced in tcp_send() to protect all send paths from OOM DoS.
 pub const TCP_MAX_SEND_SIZE: usize = 64 * 1024;
+
+// ============================================================================
+// Congestion Control Constants (RFC 5681)
+// ============================================================================
+
+/// Initial slow-start threshold.
+///
+/// Set to a large value initially; will be reduced on congestion events.
+/// 64KB aligns with the default receive window.
+pub const TCP_INITIAL_SSTHRESH: u32 = 64 * 1024;
+
+/// Compute the initial congestion window per RFC 5681 Section 3.1.
+///
+/// IW = min(4*SMSS, max(2*SMSS, 4380 bytes))
+///
+/// This formula allows:
+/// - At least 2 segments for small MSS
+/// - Up to 4 segments for larger MSS
+/// - Maximum of ~3 full-size Ethernet segments
+#[inline]
+pub fn initial_cwnd(smss: u16) -> u32 {
+    let smss = smss as u32;
+    let four_smss = smss.saturating_mul(4);
+    let two_smss = smss.saturating_mul(2);
+    core::cmp::min(four_smss, core::cmp::max(two_smss, 4380))
+}
 
 // ============================================================================
 // TCP Flags
@@ -223,6 +268,60 @@ impl TcpState {
             TcpState::Closed | TcpState::Listen | TcpState::SynSent | TcpState::SynReceived
         )
     }
+}
+
+// ============================================================================
+// Congestion Control State Machine (RFC 5681)
+// ============================================================================
+
+/// Congestion control state per RFC 5681.
+///
+/// TCP congestion control operates in one of three phases:
+/// - Slow Start: Exponential growth of cwnd until ssthresh is reached
+/// - Congestion Avoidance: Linear growth after ssthresh
+/// - Fast Recovery: Entered after triple duplicate ACK
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpCongestionState {
+    /// Exponential cwnd growth (cwnd < ssthresh).
+    ///
+    /// On each ACK: cwnd += min(N, SMSS) where N is newly acked bytes.
+    SlowStart,
+
+    /// Linear cwnd growth (cwnd >= ssthresh).
+    ///
+    /// On each ACK: cwnd += SMSS * SMSS / cwnd (approximately 1 MSS per RTT).
+    CongestionAvoidance,
+
+    /// Fast recovery after triple duplicate ACK (RFC 5681 Section 3.2).
+    ///
+    /// ssthresh = max(FlightSize/2, 2*SMSS)
+    /// cwnd = ssthresh + 3*SMSS (inflate for segments in flight)
+    /// Retransmit the first unacked segment.
+    FastRecovery,
+}
+
+impl Default for TcpCongestionState {
+    fn default() -> Self {
+        Self::SlowStart
+    }
+}
+
+/// Result of ACK processing for congestion control decisions.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AckUpdate {
+    /// Number of newly acknowledged bytes (0 for duplicate ACK).
+    pub newly_acked: u32,
+    /// True if this ACK did not advance snd_una (duplicate ACK).
+    pub duplicate: bool,
+}
+
+/// Actions that congestion control may request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CongestionAction {
+    /// No immediate transmission change needed.
+    None,
+    /// Trigger fast retransmit of the first unacknowledged segment.
+    FastRetransmit,
 }
 
 // ============================================================================
@@ -422,6 +521,25 @@ pub struct TcpControlBlock {
     /// Segment acknowledgment number used for last window update
     pub snd_wl2: u32,
 
+    // === Congestion Control (RFC 5681) ===
+    /// Congestion window in bytes.
+    ///
+    /// Limits the amount of data that can be in flight (unacknowledged).
+    /// Initialized to IW = min(4*MSS, max(2*MSS, 4380)).
+    pub cwnd: u32,
+    /// Slow-start threshold in bytes.
+    ///
+    /// When cwnd < ssthresh: slow start (exponential growth).
+    /// When cwnd >= ssthresh: congestion avoidance (linear growth).
+    pub ssthresh: u32,
+    /// Duplicate ACK counter for fast retransmit detection.
+    ///
+    /// Incremented on each duplicate ACK; reset on new data ACK.
+    /// Fast retransmit triggered when dup_ack_count reaches 3.
+    pub dup_ack_count: u8,
+    /// Current congestion control state.
+    pub congestion_state: TcpCongestionState,
+
     // === Receive Sequence Space ===
     /// Initial Receive Sequence Number
     pub irs: u32,
@@ -506,6 +624,10 @@ impl TcpControlBlock {
             snd_wnd: 0,
             snd_wl1: 0,
             snd_wl2: 0,
+            cwnd: initial_cwnd(TCP_DEFAULT_MSS),
+            ssthresh: TCP_INITIAL_SSTHRESH,
+            dup_ack_count: 0,
+            congestion_state: TcpCongestionState::SlowStart,
             irs: 0,
             rcv_nxt: 0,
             rcv_wnd: TCP_DEFAULT_WINDOW as u32,
@@ -559,16 +681,307 @@ impl TcpControlBlock {
         !self.send_buffer.is_empty() || self.snd_una != self.snd_nxt
     }
 
+    /// Bytes currently in flight (unacknowledged data).
+    ///
+    /// FlightSize = snd_nxt - snd_una
+    #[inline]
+    pub fn bytes_in_flight(&self) -> u32 {
+        self.snd_nxt.wrapping_sub(self.snd_una)
+    }
+
     /// Get the amount of data available to read
     pub fn available_data(&self) -> usize {
         self.recv_buffer.len()
     }
 
-    /// Calculate available send window
+    /// Calculate available send window respecting both peer window and cwnd.
+    ///
+    /// The effective send window is min(snd_wnd, cwnd) - bytes_in_flight.
+    /// This ensures congestion control limits sending even when the peer
+    /// advertises a large window.
     pub fn send_window_available(&self) -> u32 {
-        let bytes_in_flight = self.snd_nxt.wrapping_sub(self.snd_una);
-        self.snd_wnd.saturating_sub(bytes_in_flight)
+        let bytes_in_flight = self.bytes_in_flight();
+        // Effective window is minimum of peer's advertised window and cwnd
+        // Ensure cwnd is at least 1 MSS to allow progress
+        let effective_wnd = core::cmp::min(self.snd_wnd, self.cwnd.max(self.snd_mss as u32));
+        effective_wnd.saturating_sub(bytes_in_flight)
     }
+}
+
+// ============================================================================
+// RTT Estimation and Retransmission (RFC 6298)
+// ============================================================================
+
+/// Clock granularity (G) in microseconds for RTO calculation.
+/// RFC 6298 recommends 100ms or finer; we use 100ms.
+const RTO_CLOCK_GRANULARITY_US: u64 = 100_000;
+
+/// Smoothing factor alpha = 1/8 for SRTT calculation.
+const RTT_ALPHA_NUM: u64 = 1;
+const RTT_ALPHA_DEN: u64 = 8;
+
+/// Variance factor beta = 1/4 for RTTVAR calculation.
+const RTT_BETA_NUM: u64 = 1;
+const RTT_BETA_DEN: u64 = 4;
+
+/// Multiplier K = 4 for RTO variance term.
+const RTT_K: u64 = 4;
+
+/// Update RTT estimates and compute RTO per RFC 6298.
+///
+/// This function implements the standard TCP RTT estimation algorithm:
+/// - First sample: SRTT = R, RTTVAR = R/2
+/// - Subsequent:   RTTVAR = (1-β)×RTTVAR + β×|SRTT - R|
+///                 SRTT = (1-α)×SRTT + α×R
+/// - RTO = SRTT + max(G, K×RTTVAR)
+///
+/// Where α = 1/8, β = 1/4, K = 4, G = 100ms
+///
+/// # Arguments
+///
+/// * `tcb` - TCP control block to update
+/// * `sample_us` - RTT sample in microseconds
+///
+/// # Security
+///
+/// - RTO is clamped to [TCP_MIN_RTO_MS, TCP_MAX_RTO_MS] to prevent
+///   both too-aggressive retransmission and unbounded delays.
+pub fn update_rtt(tcb: &mut TcpControlBlock, sample_us: u64) {
+    // Reject zero or unreasonably large samples (> 10 minutes)
+    if sample_us == 0 || sample_us > 600_000_000 {
+        return;
+    }
+
+    if tcb.srtt_us == 0 {
+        // First RTT measurement (RFC 6298 Section 2.2)
+        tcb.srtt_us = sample_us;
+        tcb.rttvar_us = sample_us / 2;
+    } else {
+        // Subsequent measurements (RFC 6298 Section 2.3)
+        let srtt = tcb.srtt_us;
+        let rttvar = tcb.rttvar_us;
+
+        // Compute absolute RTT error: |SRTT - R|
+        let rtt_err = if srtt > sample_us {
+            srtt - sample_us
+        } else {
+            sample_us - srtt
+        };
+
+        // RTTVAR = (1 - β)×RTTVAR + β×|SRTT - R|
+        // Using integer arithmetic: (3×RTTVAR + error) / 4
+        tcb.rttvar_us = ((RTT_BETA_DEN - RTT_BETA_NUM) * rttvar + RTT_BETA_NUM * rtt_err)
+            / RTT_BETA_DEN;
+
+        // SRTT = (1 - α)×SRTT + α×R
+        // Using integer arithmetic: (7×SRTT + sample) / 8
+        tcb.srtt_us = ((RTT_ALPHA_DEN - RTT_ALPHA_NUM) * srtt + RTT_ALPHA_NUM * sample_us)
+            / RTT_ALPHA_DEN;
+    }
+
+    // RTO = SRTT + max(G, K×RTTVAR)
+    let variance_term = RTT_K.saturating_mul(tcb.rttvar_us);
+    let rto_us = tcb
+        .srtt_us
+        .saturating_add(core::cmp::max(RTO_CLOCK_GRANULARITY_US, variance_term));
+
+    // Convert to milliseconds and clamp to valid range
+    let rto_ms = (rto_us / 1000).clamp(TCP_MIN_RTO_MS, TCP_MAX_RTO_MS);
+    tcb.rto_ms = rto_ms;
+}
+
+/// Process incoming ACK: advance snd_una, clean send buffer, sample RTT.
+///
+/// This function implements ACK processing per RFC 793 with RFC 6298
+/// RTT sampling (Karn's algorithm - don't sample retransmitted segments).
+///
+/// Returns `AckUpdate` for congestion control decisions.
+///
+/// # Arguments
+///
+/// * `tcb` - TCP control block to update
+/// * `ack_num` - ACK number from incoming segment
+/// * `now_ms` - Current monotonic time in milliseconds
+///
+/// # Effects
+///
+/// - Removes fully acknowledged segments from send_buffer
+/// - Samples RTT from first non-retransmitted acknowledged segment
+/// - Updates snd_una to new acknowledgment point
+/// - Resets retries counter on progress (new ACK)
+///
+/// # Security
+///
+/// - Uses seq_gt() for wraparound-safe sequence comparison
+/// - Karn's algorithm prevents RTT corruption from retransmissions
+pub fn handle_ack(tcb: &mut TcpControlBlock, ack_num: u32, now_ms: u64) -> AckUpdate {
+    let mut update = AckUpdate::default();
+
+    if seq_gt(ack_num, tcb.snd_una) {
+        // New ACK - advances the acknowledgment point
+        update.newly_acked = ack_num.wrapping_sub(tcb.snd_una);
+
+        let mut rtt_sampled = false;
+
+        // Remove fully acknowledged segments from send buffer
+        while let Some(seg) = tcb.send_buffer.front() {
+            // Segment end sequence = seq + data.len()
+            let end_seq = seg.seq.wrapping_add(seg.data.len() as u32);
+
+            // Check if entire segment is acknowledged (ack_num >= end_seq)
+            if !seq_ge(ack_num, end_seq) {
+                // This segment is not fully acknowledged yet
+                break;
+            }
+
+            // Pop the acknowledged segment
+            let seg = tcb.send_buffer.pop_front().unwrap();
+
+            // Karn's algorithm: only sample RTT from non-retransmitted segments
+            // This prevents RTT estimate corruption from ambiguous RTT samples
+            if !rtt_sampled && seg.retrans_count == 0 {
+                let rtt_ms = now_ms.saturating_sub(seg.sent_at);
+                // Convert to microseconds (cap to prevent overflow)
+                let rtt_us = rtt_ms.saturating_mul(1000);
+                update_rtt(tcb, rtt_us);
+                rtt_sampled = true;
+            }
+        }
+
+        // Update send unacknowledged pointer
+        tcb.snd_una = ack_num;
+
+        // Reset consecutive retransmission counter on progress
+        tcb.retries = 0;
+    } else if ack_num == tcb.snd_una {
+        // Duplicate ACK - same ACK number as before
+        update.duplicate = true;
+    }
+
+    update
+}
+
+// ============================================================================
+// Congestion Control (RFC 5681)
+// ============================================================================
+
+/// Update congestion control state per RFC 5681.
+///
+/// Called after ACK processing to adjust cwnd and detect fast retransmit.
+///
+/// # Arguments
+///
+/// * `tcb` - TCP control block to update
+/// * `acked_bytes` - Number of newly acknowledged bytes (0 for duplicate ACK)
+/// * `duplicate_ack` - True if this was a duplicate ACK
+///
+/// # Returns
+///
+/// `CongestionAction::FastRetransmit` if 3 duplicate ACKs detected,
+/// otherwise `CongestionAction::None`.
+///
+/// # Algorithm
+///
+/// **Slow Start** (cwnd < ssthresh):
+/// - cwnd += min(N, SMSS) where N is newly acked bytes
+///
+/// **Congestion Avoidance** (cwnd >= ssthresh):
+/// - cwnd += SMSS * SMSS / cwnd (approximately 1 MSS per RTT)
+///
+/// **Fast Recovery** (RFC 5681 Section 3.2):
+/// - On 3rd duplicate ACK: ssthresh = max(FlightSize/2, 2*SMSS)
+/// - cwnd = ssthresh + 3*SMSS, trigger fast retransmit
+/// - On each additional duplicate ACK: cwnd += SMSS
+/// - On new ACK: exit fast recovery, cwnd = ssthresh
+pub fn update_congestion_control(
+    tcb: &mut TcpControlBlock,
+    acked_bytes: u32,
+    duplicate_ack: bool,
+) -> CongestionAction {
+    if acked_bytes > 0 {
+        // New data acknowledged - reset duplicate ACK counter
+        tcb.dup_ack_count = 0;
+
+        let mss = tcb.snd_mss as u32;
+
+        match tcb.congestion_state {
+            TcpCongestionState::SlowStart => {
+                // Slow start: exponential growth
+                // cwnd += min(N, SMSS) for each ACK
+                let growth = core::cmp::min(acked_bytes, mss).max(1);
+                tcb.cwnd = tcb.cwnd.saturating_add(growth);
+
+                // Transition to congestion avoidance when cwnd >= ssthresh
+                if tcb.cwnd >= tcb.ssthresh {
+                    tcb.congestion_state = TcpCongestionState::CongestionAvoidance;
+                }
+            }
+            TcpCongestionState::CongestionAvoidance => {
+                // RFC 5681: Congestion avoidance - linear growth
+                // cwnd += SMSS * SMSS / cwnd (approximately 1 MSS per RTT)
+                //
+                // This formula ensures cwnd grows by ~1 MSS per RTT regardless
+                // of how many ACKs are received. Each ACK adds a fraction of MSS
+                // such that after cwnd/MSS ACKs (one RTT), cwnd grows by 1 MSS.
+                //
+                // NOTE: We do NOT scale by acked_bytes to prevent unbounded ABC
+                // (Appropriate Byte Counting) which requires negotiation per RFC 3465.
+                let increment = mss.saturating_mul(mss).saturating_div(tcb.cwnd.max(1));
+                tcb.cwnd = tcb.cwnd.saturating_add(increment.max(1));
+            }
+            TcpCongestionState::FastRecovery => {
+                // Exit fast recovery on new ACK
+                // "Deflate" the window back to ssthresh
+                tcb.cwnd = tcb.ssthresh.max(mss);
+                tcb.congestion_state = TcpCongestionState::CongestionAvoidance;
+            }
+        }
+
+        return CongestionAction::None;
+    }
+
+    // Handle duplicate ACKs
+    if duplicate_ack {
+        tcb.dup_ack_count = tcb.dup_ack_count.saturating_add(1);
+
+        if tcb.dup_ack_count == 3 {
+            // Triple duplicate ACK - enter fast retransmit/recovery
+            // RFC 5681 Section 3.2: ssthresh = max(FlightSize/2, 2*SMSS)
+            let flight = tcb.bytes_in_flight().max(tcb.snd_mss as u32);
+            tcb.ssthresh = core::cmp::max(flight / 2, 2 * tcb.snd_mss as u32);
+
+            // cwnd = ssthresh + 3*SMSS (account for segments that triggered dup ACKs)
+            tcb.cwnd = tcb.ssthresh.saturating_add(3 * tcb.snd_mss as u32);
+            tcb.congestion_state = TcpCongestionState::FastRecovery;
+
+            return CongestionAction::FastRetransmit;
+        }
+
+        // Additional duplicate ACKs during fast recovery inflate cwnd
+        if tcb.congestion_state == TcpCongestionState::FastRecovery && tcb.dup_ack_count > 3 {
+            tcb.cwnd = tcb.cwnd.saturating_add(tcb.snd_mss as u32);
+        }
+    }
+
+    CongestionAction::None
+}
+
+/// Handle retransmission timeout - enter loss recovery (RFC 5681 Section 3.1).
+///
+/// Called when RTO expires and a segment is retransmitted.
+///
+/// # Effects
+///
+/// - ssthresh = max(FlightSize/2, 2*SMSS)
+/// - cwnd = 1*SMSS (back to slow start)
+/// - congestion_state = SlowStart
+/// - dup_ack_count = 0
+pub fn handle_retransmission_timeout(tcb: &mut TcpControlBlock) {
+    let flight = tcb.bytes_in_flight().max(tcb.snd_mss as u32);
+    tcb.ssthresh = core::cmp::max(flight / 2, 2 * tcb.snd_mss as u32);
+    tcb.cwnd = tcb.snd_mss as u32; // Back to 1 SMSS
+    tcb.congestion_state = TcpCongestionState::SlowStart;
+    tcb.dup_ack_count = 0;
 }
 
 // ============================================================================

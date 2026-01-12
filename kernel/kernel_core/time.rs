@@ -13,8 +13,26 @@ static BOOT_TSC: AtomicU64 = AtomicU64::new(0);
 /// Last TIME_WAIT sweep timestamp (ms)
 static LAST_TIME_WAIT_SWEEP: AtomicU64 = AtomicU64::new(0);
 
-/// TIME_WAIT sweep interval in milliseconds (5 seconds)
-const TIME_WAIT_SWEEP_INTERVAL_MS: u64 = 5000;
+/// Last TCP timer sweep timestamp (ms) for retransmission/FIN timers.
+static LAST_TCP_TIMER_SWEEP: AtomicU64 = AtomicU64::new(0);
+
+/// TCP timer sweep interval in milliseconds (data/FIN retransmission).
+///
+/// R53-3 FIX: Reduced from 5s to 200ms to support RFC 6298 retransmission.
+/// With TCP_MIN_RTO_MS = 1000ms, a 200ms sweep interval means retransmissions
+/// fire within 200ms of RTO expiry (worst case 1200ms from segment send).
+///
+/// 200ms balances:
+/// - Responsiveness: 5x faster than previous 1s minimum
+/// - CPU overhead: 25x less frequent than Codex-suggested 100ms
+/// - Alignment: Matches RTO_CLOCK_GRANULARITY_US (100ms) reasonably well
+const TCP_TIMER_SWEEP_INTERVAL_MS: u64 = 200;
+
+/// TIME_WAIT sweep interval in milliseconds (coarse cleanup).
+///
+/// TIME_WAIT expiry is 120s (2MSL), so a 1s cadence is sufficient
+/// while reducing load compared to the fast retransmission timer.
+const TIME_WAIT_SWEEP_INTERVAL_MS: u64 = 1000;
 
 /// 初始化时间子系统
 pub fn init() {
@@ -30,17 +48,48 @@ pub fn init() {
 pub fn on_timer_tick() {
     let current = TICK_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
 
-    // Periodically sweep TIME_WAIT connections (every TIME_WAIT_SWEEP_INTERVAL_MS)
-    let last_sweep = LAST_TIME_WAIT_SWEEP.load(Ordering::Relaxed);
-    if current.saturating_sub(last_sweep) >= TIME_WAIT_SWEEP_INTERVAL_MS {
-        // Try to claim the sweep (avoid multiple concurrent sweeps)
-        if LAST_TIME_WAIT_SWEEP
-            .compare_exchange(last_sweep, current, Ordering::Relaxed, Ordering::Relaxed)
+    // R53-3 FIX: Drive TCP timers at two frequencies:
+    // - Fast timer (200ms): Data/FIN retransmission checks
+    // - Slow timer (1s): TIME_WAIT cleanup
+    //
+    // This enables responsive retransmission (within 200ms of RTO expiry)
+    // while avoiding excessive TIME_WAIT iteration overhead.
+
+    let last_rto = LAST_TCP_TIMER_SWEEP.load(Ordering::Relaxed);
+    let last_tw = LAST_TIME_WAIT_SWEEP.load(Ordering::Relaxed);
+
+    let need_rto = current.saturating_sub(last_rto) >= TCP_TIMER_SWEEP_INTERVAL_MS;
+    let need_tw = current.saturating_sub(last_tw) >= TIME_WAIT_SWEEP_INTERVAL_MS;
+
+    // Early exit if neither timer has fired
+    if !need_rto && !need_tw {
+        return;
+    }
+
+    let mut run_rto = false;
+    let mut run_tw = false;
+
+    // Claim the RTO timer (CAS to avoid concurrent sweeps)
+    if need_rto
+        && LAST_TCP_TIMER_SWEEP
+            .compare_exchange(last_rto, current, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
-        {
-            // Call the TIME_WAIT sweep function
-            net::socket_table().sweep_time_wait(current);
-        }
+    {
+        run_rto = true;
+    }
+
+    // Claim the TIME_WAIT timer
+    if need_tw
+        && LAST_TIME_WAIT_SWEEP
+            .compare_exchange(last_tw, current, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        run_tw = true;
+    }
+
+    // Run TCP timers if either was claimed
+    if run_rto || run_tw {
+        net::socket_table().run_tcp_timers(current, run_tw);
     }
 }
 

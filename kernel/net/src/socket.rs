@@ -52,17 +52,19 @@ use spin::{Mutex, Once, RwLock};
 
 use cap::CapId;
 use lsm::{
-    hook_net_accept, hook_net_bind, hook_net_connect, hook_net_listen, hook_net_recv,
+    hook_net_bind, hook_net_connect, hook_net_listen, hook_net_recv,
     hook_net_send, hook_net_shutdown, hook_net_socket, LsmError, NetCtx, ProcessCtx,
 };
 
 use crate::ipv4::Ipv4Addr;
 use crate::tcp::{
-    build_tcp_segment, generate_isn, seq_ge, seq_gt, seq_in_window, TcpControlBlock, TcpConnKey,
-    TcpHeader, TcpState, TCP_DEFAULT_WINDOW, TCP_ETHERNET_MSS, TCP_FLAG_ACK, TCP_FLAG_FIN,
-    TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_FIN_TIMEOUT_MS, TCP_MAX_ACTIVE_CONNECTIONS,
-    TCP_MAX_FIN_RETRIES, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_ACCEPT_BACKLOG,
-    TCP_PROTO, TCP_TIME_WAIT_MS,
+    build_tcp_segment, generate_isn, handle_ack, handle_retransmission_timeout,
+    seq_ge, seq_gt, seq_in_window, update_congestion_control, CongestionAction,
+    TcpConnKey, TcpControlBlock, TcpHeader, TcpSegment, TcpState, TCP_DEFAULT_WINDOW,
+    TCP_ETHERNET_MSS, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN,
+    TCP_FIN_TIMEOUT_MS, TCP_MAX_ACCEPT_BACKLOG, TCP_MAX_ACTIVE_CONNECTIONS, TCP_MAX_FIN_RETRIES,
+    TCP_MAX_RETRIES, TCP_MAX_RTO_MS, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_PROTO,
+    TCP_SYN_TIMEOUT_MS, TCP_TIME_WAIT_MS,
 };
 use crate::stack::transmit_tcp_segment;
 use crate::udp::{
@@ -1825,9 +1827,13 @@ impl SocketTable {
         let mut segments = Vec::with_capacity((payload.len() + mss - 1) / mss.max(1));
         let mut offset = 0usize;
 
+        // Get current timestamp for retransmission tracking
+        let now_ms = self.time_wait_now();
+
         while offset < payload.len() {
             let end = core::cmp::min(offset + mss, payload.len());
             let seg_payload = &payload[offset..end];
+            let seq = base_seq.wrapping_add(offset as u32);
 
             // PSH flag on non-empty data (typically set on last segment)
             let is_last = end == payload.len();
@@ -1838,12 +1844,21 @@ impl SocketTable {
                 remote_ip,
                 local_port,
                 remote_port,
-                base_seq.wrapping_add(offset as u32),
+                seq,
                 ack,
                 flags,
                 advertised_wnd,
                 seg_payload,
             );
+
+            // Buffer segment for potential retransmission
+            // This enables reliable delivery: segments are kept until ACKed
+            tcp_state.control.send_buffer.push_back(TcpSegment {
+                seq,
+                data: seg_payload.to_vec(),
+                sent_at: now_ms,
+                retrans_count: 0,
+            });
 
             segments.push(segment);
             offset = end;
@@ -2291,6 +2306,40 @@ impl SocketTable {
             sock.wake_tcp_waiters();
             self.closed_count.fetch_add(1, Ordering::Relaxed);
         } else if let Some(sock) = self.sockets.write().remove(&socket_id) {
+            // R52-2 FIX: Clean up pending SYN/accept queues for listening sockets
+            //
+            // When a listening socket is closed, we must tear down all pending
+            // connections to prevent resource leaks. This includes:
+            // - Half-open connections in the SYN queue (awaiting final ACK)
+            // - Fully established connections in the accept queue (awaiting accept())
+            //
+            // DEADLOCK FIX (Codex review): Collect children first while holding
+            // listen lock, then release it before calling cleanup_tcp_connection,
+            // which may acquire sockets.write() lock internally.
+            let mut children_to_cleanup: Vec<Arc<SocketState>> = Vec::new();
+            if sock.is_listening() {
+                let mut listen_guard = sock.listen.lock();
+                if let Some(mut listen_state) = listen_guard.take() {
+                    // Collect half-open SYN queue children
+                    let syn_keys: Vec<TcpLookupKey> = listen_state.syn_queue.keys().cloned().collect();
+                    for key in syn_keys {
+                        if let Some(pending) = listen_state.syn_queue.remove(&key) {
+                            pending.sock.mark_closed();
+                            children_to_cleanup.push(pending.sock);
+                        }
+                    }
+                    // Collect established-but-not-accepted queue children
+                    while let Some(child) = listen_state.accept_queue.pop_front() {
+                        child.mark_closed();
+                        children_to_cleanup.push(child);
+                    }
+                    // Wake any blocked accept() to return ECONNABORTED
+                    listen_state.accept_waiters.close();
+                    listen_state.accept_waiters.wake_all();
+                }
+                // listen_guard is dropped here, releasing the listen lock
+            }
+
             let meta = sock.meta_snapshot();
 
             // Remove port bindings based on protocol
@@ -2326,6 +2375,13 @@ impl SocketTable {
             // Mark closed and wake waiters
             sock.mark_closed();
             self.closed_count.fetch_add(1, Ordering::Relaxed);
+
+            // R52-2 FIX: Cleanup children AFTER releasing all locks above
+            // This prevents deadlock with cleanup_tcp_connection() which may
+            // acquire sockets.write() lock.
+            for child in children_to_cleanup {
+                self.cleanup_tcp_connection(&child);
+            }
         }
 
         // Transmit FIN after releasing locks to avoid blocking critical sections.
@@ -2702,7 +2758,8 @@ impl SocketTable {
                 // buffering of early data before ACKing, which we don't support.
                 let syn_len = 1u32;
                 tcp_state.control.rcv_nxt = header.seq_num.wrapping_add(syn_len);
-                tcp_state.control.snd_una = header.ack_num;
+                // Update snd_una and refresh RTT estimates from ACK
+                handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
                 // Initialize send window from SYN-ACK (RFC 793)
                 tcp_state.control.snd_wnd = header.window as u32;
                 tcp_state.control.snd_wl1 = header.seq_num;
@@ -2771,9 +2828,49 @@ impl SocketTable {
                     return Some(win_ack);
                 }
 
+                // Track whether fast retransmit was triggered
+                let mut fast_retransmit_seg: Option<Vec<u8>> = None;
+
                 if ack_in_range {
-                    // Update snd_una to acknowledge sent data
-                    tcp_state.control.snd_una = header.ack_num;
+                    // Update snd_una to acknowledge sent data and refresh RTT/RTO
+                    let ack_update = handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
+
+                    // RFC 5681 §3.2: Duplicate ACK definition
+                    // A duplicate ACK must:
+                    // - Have the same acknowledgment number as a previous ACK
+                    // - Carry no data (payload empty)
+                    // - NOT be a pure window update (window must be same as before)
+                    // Segments with data or window changes are NOT duplicate ACKs
+                    let is_window_update = header.window as u32 != tcp_state.control.snd_wnd;
+                    let is_pure_dup_ack = ack_update.duplicate && payload.is_empty() && !is_window_update;
+
+                    // RFC 5681: Update congestion control and check for fast retransmit
+                    let action = update_congestion_control(
+                        &mut tcp_state.control,
+                        ack_update.newly_acked,
+                        is_pure_dup_ack,
+                    );
+
+                    // Fast retransmit: resend first unacked segment on triple dup ACK
+                    if action == CongestionAction::FastRetransmit {
+                        if let Some(seg) = tcp_state.control.send_buffer.front_mut() {
+                            let flags = TCP_FLAG_ACK | if !seg.data.is_empty() { TCP_FLAG_PSH } else { 0 };
+                            seg.retrans_count = seg.retrans_count.saturating_add(1);
+                            seg.sent_at = self.time_wait_now();
+
+                            fast_retransmit_seg = Some(build_tcp_segment(
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
+                                seg.seq,
+                                tcp_state.control.rcv_nxt,
+                                flags,
+                                advertised_wnd as u16,
+                                &seg.data,
+                            ));
+                        }
+                    }
 
                     // R50-2 FIX: Use seq_gt/seq_ge for wraparound-safe window update (RFC 793)
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
@@ -2941,7 +3038,28 @@ impl SocketTable {
                         sock.wake_tcp_data_waiters();
                     }
 
+                    // RFC 5681: If fast retransmit was triggered, transmit it now
+                    // Priority: data ACK first (we already have one), fast retransmit happens via timer
+                    // However, if the peer's ACK was a dup ACK, the data_ack response handles it
+                    if let Some(fr_seg) = fast_retransmit_seg {
+                        // Transmit fast retransmit segment asynchronously
+                        let meta = sock.meta_snapshot();
+                        if let Some(remote_ip) = meta.remote_ip.map(Ipv4Addr) {
+                            let _ = transmit_tcp_segment(remote_ip, &fr_seg);
+                        }
+                    }
+
                     return Some(data_ack);
+                }
+
+                // RFC 5681: Handle fast retransmit even for pure ACK (no data response)
+                if let Some(fr_seg) = fast_retransmit_seg {
+                    drop(guard);
+                    let meta = sock.meta_snapshot();
+                    if let Some(remote_ip) = meta.remote_ip.map(Ipv4Addr) {
+                        let _ = transmit_tcp_segment(remote_ip, &fr_seg);
+                    }
+                    return None; // Fast retransmit sent via transmit_tcp_segment
                 }
 
                 // Pure ACK with no data - nothing more to do
@@ -2986,7 +3104,7 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    tcp_state.control.snd_una = header.ack_num;
+                    handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -3212,7 +3330,7 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    tcp_state.control.snd_una = header.ack_num;
+                    handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -3408,7 +3526,7 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    tcp_state.control.snd_una = header.ack_num;
+                    handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -3497,7 +3615,7 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    tcp_state.control.snd_una = header.ack_num;
+                    handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -3605,7 +3723,7 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    tcp_state.control.snd_una = header.ack_num;
+                    handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -3775,7 +3893,7 @@ impl SocketTable {
                 }
 
                 // Handshake complete - transition to Established
-                tcp_state.control.snd_una = header.ack_num;
+                handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
                 tcp_state.control.snd_wnd = header.window as u32;
                 tcp_state.control.snd_wl1 = header.seq_num;
                 tcp_state.control.snd_wl2 = header.ack_num;
@@ -3820,50 +3938,138 @@ impl SocketTable {
         }
     }
 
-    /// Get the most recent timestamp used for TIME_WAIT timers.
+    /// Get the current timestamp for TCP timing operations.
     ///
-    /// This returns the value set by the last `sweep_time_wait()` call.
-    /// Used by the RX path when transitioning to TIME_WAIT state to record
-    /// the start time without requiring access to kernel time functions.
+    /// # R53-2 FIX (Timestamp Precision)
     ///
-    /// # R51-6 FIX (Enhanced)
+    /// This function now ALWAYS fetches the real-time kernel tick counter
+    /// instead of using the cached sweep timestamp. This is critical for:
     ///
-    /// Falls back to the kernel tick counter via SocketWaitHooks if the sweep
-    /// has not yet initialized the cached clock. This provides accurate timing
-    /// instead of relying on RDTSC assumptions about CPU frequency.
+    /// 1. **RTT Sampling**: Accurate RTT measurements require precise
+    ///    timestamps when segments are sent and when ACKs arrive. Using a
+    ///    5-second cached timestamp would produce RTT samples of either 0
+    ///    (if both occur in same sweep period) or ~5s (if they span periods),
+    ///    completely corrupting SRTT/RTTVAR/RTO calculations.
     ///
-    /// If hooks are not yet registered (very early boot), returns 1 as a minimal
-    /// non-zero value to avoid zero-timestamp issues.
+    /// 2. **Retransmission Timing**: Segments sent just after a sweep would
+    ///    have `sent_at` equal to the sweep time, making them appear older
+    ///    than they are and triggering immediate spurious retransmissions.
+    ///
+    /// The cached `time_wait_clock` is still used as a fallback only when:
+    /// - SocketWaitHooks are not yet registered (very early boot)
+    /// - As a fallback for TIME_WAIT timer initialization
+    ///
+    /// Performance: get_ticks() is a simple atomic load from kernel_core's
+    /// TICKS counter, not an expensive RDTSC or syscall.
     #[inline]
     fn time_wait_now(&self) -> u64 {
+        // Always prefer real-time ticks for accurate RTT/retransmission timing
+        if let Some(hooks) = socket_wait_hooks() {
+            return hooks.get_ticks().max(1);
+        }
+        // Fallback to cached time or minimal non-zero value during early boot
         let cached = self.time_wait_clock.load(Ordering::Relaxed);
         if cached != 0 {
             return cached;
         }
-        // Fallback to kernel tick counter via hooks when sweep hasn't run yet
-        // This is more accurate than RDTSC assumptions about CPU frequency
-        // Clamp to at least 1 to ensure non-zero timestamp even before first tick
-        socket_wait_hooks()
-            .map(|h| h.get_ticks().max(1))
-            .unwrap_or(1)
+        1 // Minimal non-zero value before any time source is available
+    }
+
+    /// Apply ACK processing with RFC 5681 congestion control.
+    ///
+    /// Combines `handle_ack()` and `update_congestion_control()` and returns
+    /// a fast retransmit segment if triggered by triple duplicate ACK.
+    ///
+    /// # Arguments
+    ///
+    /// * `tcb` - TCP control block to update
+    /// * `ack_num` - ACK number from incoming segment
+    /// * `advertised_wnd` - Our current advertised window for response
+    /// * `local_ip`, `remote_ip` - IP addresses for segment construction
+    /// * `local_port`, `remote_port` - Ports for segment construction
+    /// * `now_ms` - Current timestamp in milliseconds
+    ///
+    /// # Returns
+    ///
+    /// `Some(segment)` if fast retransmit was triggered, `None` otherwise.
+    fn apply_ack_and_cc(
+        &self,
+        tcb: &mut TcpControlBlock,
+        ack_num: u32,
+        advertised_wnd: u16,
+        local_ip: Ipv4Addr,
+        remote_ip: Ipv4Addr,
+        local_port: u16,
+        remote_port: u16,
+        now_ms: u64,
+    ) -> Option<Vec<u8>> {
+        // Process ACK and get update info
+        let ack_update = handle_ack(tcb, ack_num, now_ms);
+
+        // Update congestion control and check for fast retransmit
+        let action = update_congestion_control(tcb, ack_update.newly_acked, ack_update.duplicate);
+
+        if action != CongestionAction::FastRetransmit {
+            return None;
+        }
+
+        // Fast retransmit: resend first unacked segment
+        if let Some(seg) = tcb.send_buffer.front_mut() {
+            let flags = TCP_FLAG_ACK | if !seg.data.is_empty() { TCP_FLAG_PSH } else { 0 };
+            seg.retrans_count = seg.retrans_count.saturating_add(1);
+            seg.sent_at = now_ms;
+
+            return Some(build_tcp_segment(
+                local_ip,
+                remote_ip,
+                local_port,
+                remote_port,
+                seg.seq,
+                tcb.rcv_nxt,
+                flags,
+                advertised_wnd,
+                &seg.data,
+            ));
+        }
+
+        None
     }
 
     /// Sweep TIME_WAIT connections and clean up those that exceeded 2MSL.
     ///
-    /// This function should be called periodically from kernel_core's timer
-    /// interrupt handler (e.g., every 1-10 seconds) to expire TIME_WAIT
-    /// connections after TCP_TIME_WAIT_MS (120 seconds).
+    /// This is a backward-compatible wrapper for `run_tcp_timers` that always
+    /// performs TIME_WAIT cleanup. Use `run_tcp_timers` directly when you need
+    /// to control whether TIME_WAIT cleanup runs.
     ///
     /// # Arguments
     ///
     /// * `current_time_ms` - Monotonic timestamp in milliseconds
+    pub fn sweep_time_wait(&self, current_time_ms: u64) {
+        self.run_tcp_timers(current_time_ms, true);
+    }
+
+    /// Run TCP timers for retransmission and optional TIME_WAIT cleanup.
+    ///
+    /// R53-3 FIX: Split TCP timer processing into two frequencies:
+    /// - Fast timer (every 200ms): Data/FIN retransmission checks
+    /// - Slow timer (every 1s): TIME_WAIT and SYN queue cleanup
+    ///
+    /// This enables responsive retransmission (within 200ms of RTO expiry)
+    /// while avoiding excessive TIME_WAIT iteration overhead.
+    ///
+    /// # Arguments
+    ///
+    /// * `current_time_ms` - Monotonic timestamp in milliseconds
+    /// * `sweep_time_wait` - If true, also check TIME_WAIT expiry and SYN queue timeouts
     ///
     /// # Design
     ///
-    /// The sweep function performs two roles:
+    /// The function performs:
     /// 1. Updates the cached time_wait_clock for new TIME_WAIT transitions
-    /// 2. Iterates through all sockets to find and clean up expired TIME_WAIT
-    /// 3. Handles FIN retransmissions for connections waiting for FIN ACK
+    /// 2. Data segment retransmission (always, for responsive RTO)
+    /// 3. FIN retransmission (always, needed for graceful close)
+    /// 4. TIME_WAIT expiry cleanup (only when sweep_time_wait=true)
+    /// 5. SYN queue timeout cleanup (only when sweep_time_wait=true)
     ///
     /// The two-phase approach (collect then cleanup) avoids holding locks
     /// across cleanup operations which may wake blocked processes.
@@ -3873,13 +4079,17 @@ impl SocketTable {
     /// This function uses try_lock to avoid deadlock when called from timer
     /// interrupt context. If the sockets lock is held, the sweep is skipped
     /// and will be retried on the next timer tick.
-    pub fn sweep_time_wait(&self, current_time_ms: u64) {
+    pub fn run_tcp_timers(&self, current_time_ms: u64, sweep_time_wait: bool) {
         // Update cached time so RX path can stamp new TIME_WAIT transitions
         self.time_wait_clock.store(current_time_ms, Ordering::Relaxed);
 
         // Collect sockets for cleanup and FIN retransmissions
         let mut to_cleanup: Vec<Arc<SocketState>> = Vec::new();
         let mut fin_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
+        // Data segment retransmissions (TCP retransmission RFC 6298)
+        let mut data_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
+        // R52-1 FIX: Collect expired SYN queue entries for cleanup
+        let mut syn_timeouts: Vec<(Arc<SocketState>, Ipv4Addr, Option<Vec<u8>>)> = Vec::new();
 
         // Use try_read to avoid blocking in interrupt context
         // If the lock is held (e.g., by TCP RX/TX), skip this sweep cycle
@@ -3902,7 +4112,7 @@ impl SocketTable {
             };
 
             // Use try_lock to avoid blocking on per-socket lock
-            let tcp_guard = match sock.tcp.try_lock() {
+            let mut tcp_guard = match sock.tcp.try_lock() {
                 Some(guard) => guard,
                 None => continue, // Skip this socket, try next
             };
@@ -3911,14 +4121,19 @@ impl SocketTable {
             let mut need_init_timestamp = false;
             let mut need_init_fin_time = false;
             let mut need_fin_retransmit = false;
+            let mut mark_timeout_close = false;
 
-            if let Some(tcp_state) = tcp_guard.as_ref() {
+            if let Some(tcp_state) = tcp_guard.as_mut() {
                 // TIME_WAIT handling
+                // R53-3: TIME_WAIT expiry check only runs on slow timer (1s cadence)
+                // to reduce iteration overhead. Timestamp init always runs.
                 if tcp_state.control.state == TcpState::TimeWait {
                     let start = tcp_state.control.time_wait_start;
                     if start == 0 {
                         need_init_timestamp = true;
-                    } else if current_time_ms.saturating_sub(start) >= TCP_TIME_WAIT_MS {
+                    } else if sweep_time_wait
+                        && current_time_ms.saturating_sub(start) >= TCP_TIME_WAIT_MS
+                    {
                         should_cleanup = true;
                     }
                 }
@@ -3948,8 +4163,96 @@ impl SocketTable {
                         }
                     }
                 }
+
+                // Data retransmission: check send_buffer for segments past RTO
+                // This handles reliable delivery for established connections
+                if let Some((local_ip, local_port, remote_ip, remote_port)) = key_parts {
+                    if !tcp_state.control.send_buffer.is_empty()
+                        && matches!(
+                            tcp_state.control.state,
+                            TcpState::Established
+                                | TcpState::CloseWait
+                                | TcpState::FinWait1
+                                | TcpState::FinWait2
+                                | TcpState::Closing
+                                | TcpState::LastAck
+                        )
+                    {
+                        let rto = tcp_state.control.rto_ms;
+                        let ack = tcp_state.control.rcv_nxt;
+                        let advertised_wnd = tcp_state
+                            .control
+                            .rcv_wnd
+                            .saturating_sub(tcp_state.control.recv_buffer.len() as u32) as u16;
+
+                        // RFC 5681 §3.1: On RTO, check if FIRST unacked segment has timed out
+                        // If so, enter loss recovery FIRST (cwnd = 1*SMSS), then retransmit
+                        // only the first segment. Do NOT retransmit entire send buffer.
+                        //
+                        // Use two-phase approach to avoid borrow conflict:
+                        // 1. Check timeout with immutable borrow
+                        // 2. Enter loss recovery
+                        // 3. Build retransmit segment with mutable borrow
+                        let needs_retransmit = tcp_state
+                            .control
+                            .send_buffer
+                            .front()
+                            .map(|seg| current_time_ms.saturating_sub(seg.sent_at) >= rto)
+                            .unwrap_or(false);
+
+                        if needs_retransmit {
+                            // RFC 5681: Enter loss recovery BEFORE retransmitting
+                            // This sets ssthresh = max(FlightSize/2, 2*SMSS) and cwnd = 1*SMSS
+                            handle_retransmission_timeout(&mut tcp_state.control);
+
+                            // RFC 5681 §3.1: Retransmit ONLY the first unacked segment
+                            if let Some(first_seg) = tcp_state.control.send_buffer.front_mut() {
+                                let flags = TCP_FLAG_ACK
+                                    | if !first_seg.data.is_empty() { TCP_FLAG_PSH } else { 0 };
+                                let seg_bytes = build_tcp_segment(
+                                    local_ip,
+                                    remote_ip,
+                                    local_port,
+                                    remote_port,
+                                    first_seg.seq,
+                                    ack,
+                                    flags,
+                                    advertised_wnd,
+                                    &first_seg.data,
+                                );
+
+                                // Update segment tracking
+                                first_seg.retrans_count = first_seg.retrans_count.saturating_add(1);
+                                first_seg.sent_at = current_time_ms;
+
+                                data_retransmit.push((remote_ip, seg_bytes));
+                            }
+
+                            // Exponential backoff: double RTO on each retransmission
+                            tcp_state.control.retries =
+                                tcp_state.control.retries.saturating_add(1);
+                            tcp_state.control.rto_ms = tcp_state
+                                .control
+                                .rto_ms
+                                .saturating_mul(2)
+                                .min(TCP_MAX_RTO_MS);
+
+                            // Connection timeout: too many retries
+                            if tcp_state.control.retries >= TCP_MAX_RETRIES {
+                                tcp_state.control.state = TcpState::Closed;
+                                should_cleanup = true;
+                                mark_timeout_close = true;
+                            }
+                        }
+                    }
+                }
             }
             drop(tcp_guard);
+
+            // Mark socket closed if connection timed out
+            if mark_timeout_close {
+                sock.mark_closed();
+            }
 
             // Initialize TIME_WAIT timestamp if needed
             if need_init_timestamp {
@@ -4024,8 +4327,17 @@ impl SocketTable {
             }
 
             // Handle cleanup
+            //
+            // R53-1 FIX: Cleanup must handle both graceful shutdown states
+            // (TimeWait, FinWait1, Closing, LastAck) AND connections closed
+            // due to retransmission timeout (already in Closed state with
+            // mark_timeout_close flag set).
             if should_cleanup {
-                if let Some(mut guard) = sock.tcp.try_lock() {
+                // Retransmission timeout case: socket already marked closed and
+                // state set to Closed in the retransmission loop above
+                if mark_timeout_close {
+                    to_cleanup.push(sock.clone());
+                } else if let Some(mut guard) = sock.tcp.try_lock() {
                     if let Some(tcp_state) = guard.as_mut() {
                         if tcp_state.control.state == TcpState::TimeWait
                             || matches!(
@@ -4035,6 +4347,71 @@ impl SocketTable {
                         {
                             tcp_state.control.state = TcpState::Closed;
                             to_cleanup.push(sock.clone());
+                        }
+                    }
+                }
+            }
+
+            // R52-1 FIX: Sweep half-open SYN queue for listening sockets
+            //
+            // Half-open connections (SYN received, SYN-ACK sent) that exceed
+            // TCP_SYN_TIMEOUT_MS are cleaned up to prevent SYN flood resource
+            // exhaustion. This ensures listeners can accept new connections
+            // even under attack.
+            //
+            // R53-3: SYN queue cleanup only runs on slow timer (1s cadence)
+            // to reduce iteration overhead for listening sockets.
+            if sweep_time_wait {
+                if let Some(mut listen_guard) = sock.listen.try_lock() {
+                    if let Some(listen_state) = listen_guard.as_mut() {
+                        // Collect expired keys first to avoid borrow issues
+                        let mut expired_keys: Vec<TcpLookupKey> = Vec::new();
+                        for (key, pending) in listen_state.syn_queue.iter() {
+                            if current_time_ms.saturating_sub(pending.syn_sent_at)
+                                >= TCP_SYN_TIMEOUT_MS
+                            {
+                                expired_keys.push(*key);
+                            }
+                        }
+
+                        // Remove expired entries and queue for cleanup
+                        for key in expired_keys {
+                            if let Some(pending) = listen_state.take_syn(&key) {
+                                // Build best-effort RST+ACK for the peer
+                                let rst_seg =
+                                    if let Some(mut tcb_guard) = pending.sock.tcp.try_lock() {
+                                        if let Some(tcb) = tcb_guard.as_mut() {
+                                            // Extract IP addresses from the key
+                                            let local_ip = Ipv4Addr(key.0.to_be_bytes());
+                                            let remote_ip = Ipv4Addr(key.2.to_be_bytes());
+                                            let seq = tcb.control.snd_nxt;
+                                            let ack = tcb.control.rcv_nxt;
+
+                                            Some(build_tcp_segment(
+                                                local_ip,
+                                                remote_ip,
+                                                key.1, // local_port
+                                                key.3, // remote_port
+                                                seq,
+                                                ack,
+                                                TCP_FLAG_RST | TCP_FLAG_ACK,
+                                                0,
+                                                &[],
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                // Queue for cleanup outside locks
+                                syn_timeouts.push((
+                                    pending.sock.clone(),
+                                    Ipv4Addr(key.2.to_be_bytes()),
+                                    rst_seg,
+                                ));
+                            }
                         }
                     }
                 }
@@ -4056,6 +4433,20 @@ impl SocketTable {
             }
         }
 
+        // R52-1 FIX: Cleanup expired SYN queue entries and send best-effort RSTs
+        //
+        // These child sockets were in SYN_RECEIVED state awaiting the final ACK
+        // but timed out. We clean up their resources and optionally send RST to
+        // notify the peer that the connection attempt failed.
+        for (child, dst_ip, rst_seg) in syn_timeouts {
+            child.mark_closed();
+            self.cleanup_tcp_connection(&child);
+            if let Some(seg) = rst_seg {
+                let _ = transmit_tcp_segment(dst_ip, &seg);
+            }
+            ids_to_remove.push(child.id);
+        }
+
         // Remove closed sockets from the sockets map
         if !ids_to_remove.is_empty() {
             let mut sockets = self.sockets.write();
@@ -4066,6 +4457,11 @@ impl SocketTable {
 
         // Transmit any pending FIN retransmissions (best-effort)
         for (dst_ip, seg) in fin_retransmit {
+            let _ = transmit_tcp_segment(dst_ip, &seg);
+        }
+
+        // Transmit data segment retransmissions (RFC 6298 TCP retransmission)
+        for (dst_ip, seg) in data_retransmit {
             let _ = transmit_tcp_segment(dst_ip, &seg);
         }
     }
