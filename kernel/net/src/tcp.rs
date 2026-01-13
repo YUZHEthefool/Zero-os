@@ -75,9 +75,10 @@
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use spin::{Mutex, Once, RwLock};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use spin::{Mutex, RwLock};
 
 use crate::ipv4::{compute_checksum, Ipv4Addr};
 
@@ -100,8 +101,25 @@ pub const TCP_DEFAULT_MSS: u16 = 536;
 /// Maximum Segment Size for Ethernet (1500 - 20 IP - 20 TCP)
 pub const TCP_ETHERNET_MSS: u16 = 1460;
 
-/// Default receive window size
+/// Default receive window size (unscaled, for compatibility)
 pub const TCP_DEFAULT_WINDOW: u16 = 65535;
+
+// ============================================================================
+// Window Scaling Constants (RFC 7323)
+// ============================================================================
+
+/// Maximum window scale shift factor per RFC 7323.
+/// Scale factor of 14 allows windows up to 1GB (65535 << 14).
+pub const TCP_MAX_WINDOW_SCALE: u8 = 14;
+
+/// Maximum scaled window size in bytes.
+/// This is the largest receive window we can advertise (65535 << 14).
+pub const TCP_MAX_SCALED_WINDOW: u32 = (u16::MAX as u32) << TCP_MAX_WINDOW_SCALE;
+
+/// Default receive buffer size in bytes (256 KB).
+/// This is larger than 64KB to make window scaling worthwhile.
+/// Provides good throughput on typical networks.
+pub const TCP_DEFAULT_RCV_WINDOW_BYTES: u32 = 256 * 1024;
 
 /// Maximum retransmission attempts before giving up
 pub const TCP_MAX_RETRIES: u8 = 15;
@@ -322,6 +340,17 @@ pub enum CongestionAction {
     None,
     /// Trigger fast retransmit of the first unacknowledged segment.
     FastRetransmit,
+    /// R56-1: RFC 3042 Limited Transmit - request sending new data on early dup ACKs.
+    ///
+    /// On the first or second duplicate ACK (before fast retransmit threshold),
+    /// if FlightSize + SMSS <= cwnd + 2*SMSS, send one new segment to help
+    /// drive fast retransmit on small-window connections.
+    LimitedTransmit,
+    /// Retransmit next unacknowledged segment after partial ACK (NewReno).
+    ///
+    /// R55-1: NewReno partial ACK handling - stay in fast recovery and
+    /// retransmit the next unacked segment instead of exiting FR.
+    RetransmitNext,
 }
 
 // ============================================================================
@@ -461,6 +490,84 @@ pub struct TcpOptions {
 }
 
 // ============================================================================
+// TCP Option Serialization
+// ============================================================================
+
+/// Serialize a single TCP option to bytes.
+///
+/// Returns the raw bytes for the option, including kind and length fields
+/// where applicable. Single-byte options (End, NOP) return just the kind byte.
+pub fn serialize_tcp_option(option: &TcpOptionKind) -> Vec<u8> {
+    match *option {
+        TcpOptionKind::EndOfList => vec![0],
+        TcpOptionKind::Nop => vec![1],
+        TcpOptionKind::Mss(mss) => {
+            let mut bytes = Vec::with_capacity(4);
+            bytes.extend_from_slice(&[2, 4]); // kind=2, len=4
+            bytes.extend_from_slice(&mss.to_be_bytes());
+            bytes
+        }
+        TcpOptionKind::WindowScale(scale) => vec![3, 3, scale], // kind=3, len=3, shift
+        TcpOptionKind::SackPermitted => vec![4, 2], // kind=4, len=2
+        TcpOptionKind::Timestamps { ts_val, ts_ecr } => {
+            let mut bytes = Vec::with_capacity(10);
+            bytes.extend_from_slice(&[8, 10]); // kind=8, len=10
+            bytes.extend_from_slice(&ts_val.to_be_bytes());
+            bytes.extend_from_slice(&ts_ecr.to_be_bytes());
+            bytes
+        }
+        TcpOptionKind::Unknown { kind, len } => {
+            // Ensure minimum length of 2 (kind + length bytes)
+            let effective_len = len.max(2);
+            let mut bytes = Vec::with_capacity(effective_len as usize);
+            bytes.push(kind);
+            bytes.push(effective_len);
+            bytes.resize(effective_len as usize, 0);
+            bytes
+        }
+    }
+}
+
+/// Serialize a slice of TCP options with padding to 32-bit boundary.
+///
+/// This function:
+/// 1. Serializes each option in order
+/// 2. Appends End-of-List marker if not already present
+/// 3. Pads with NOP (0x00) bytes to ensure 32-bit alignment
+///
+/// Returns empty Vec if no options provided (no padding needed for minimal header).
+pub fn serialize_tcp_options(options: &[TcpOptionKind]) -> Vec<u8> {
+    if options.is_empty() {
+        return Vec::new();
+    }
+
+    let mut bytes = Vec::new();
+    let mut has_end = false;
+
+    for opt in options {
+        let opt_bytes = serialize_tcp_option(opt);
+        bytes.extend_from_slice(&opt_bytes);
+
+        if matches!(opt, TcpOptionKind::EndOfList) {
+            has_end = true;
+            break;
+        }
+    }
+
+    // Append End-of-List if not present
+    if !has_end {
+        bytes.push(0);
+    }
+
+    // Pad to 32-bit boundary with zeroes (same as NOP bytes after End)
+    while bytes.len() % 4 != 0 {
+        bytes.push(0);
+    }
+
+    bytes
+}
+
+// ============================================================================
 // TCP Control Block (TCB)
 // ============================================================================
 
@@ -539,6 +646,12 @@ pub struct TcpControlBlock {
     pub dup_ack_count: u8,
     /// Current congestion control state.
     pub congestion_state: TcpCongestionState,
+    /// R55-1: Recovery point for NewReno partial ACK handling.
+    ///
+    /// Set to snd_nxt when entering fast recovery. A full ACK (ack >= recover)
+    /// exits fast recovery; a partial ACK (ack < recover) triggers retransmit
+    /// of the next unacked segment while staying in fast recovery.
+    pub recover: u32,
 
     // === Receive Sequence Space ===
     /// Initial Receive Sequence Number
@@ -553,6 +666,18 @@ pub struct TcpControlBlock {
     pub snd_mss: u16,
     /// Maximum Segment Size for receiving
     pub rcv_mss: u16,
+
+    // === Window Scaling (RFC 7323) ===
+    /// Send window scale factor (shift count for peer's advertised window).
+    /// Applied when decoding peer's window advertisements.
+    pub snd_wscale: u8,
+    /// Receive window scale factor (shift count for our advertised window).
+    /// Applied when encoding our window advertisements.
+    pub rcv_wscale: u8,
+    /// True if we sent Window Scale option in our SYN/SYN-ACK.
+    pub wscale_requested: bool,
+    /// True if peer sent Window Scale option in their SYN/SYN-ACK.
+    pub wscale_received: bool,
 
     // === Retransmission State ===
     /// Current retransmission timeout in milliseconds
@@ -628,11 +753,16 @@ impl TcpControlBlock {
             ssthresh: TCP_INITIAL_SSTHRESH,
             dup_ack_count: 0,
             congestion_state: TcpCongestionState::SlowStart,
+            recover: 0,
             irs: 0,
             rcv_nxt: 0,
-            rcv_wnd: TCP_DEFAULT_WINDOW as u32,
+            rcv_wnd: TCP_DEFAULT_RCV_WINDOW_BYTES,
             snd_mss: TCP_DEFAULT_MSS,
             rcv_mss: TCP_ETHERNET_MSS,
+            snd_wscale: 0,
+            rcv_wscale: 0,
+            wscale_requested: false,
+            wscale_received: false,
             rto_ms: TCP_INITIAL_RTO_MS,
             srtt_us: 0,
             rttvar_us: 0,
@@ -706,6 +836,105 @@ impl TcpControlBlock {
         let effective_wnd = core::cmp::min(self.snd_wnd, self.cwnd.max(self.snd_mss as u32));
         effective_wnd.saturating_sub(bytes_in_flight)
     }
+
+    /// Check if window scaling is enabled for this connection.
+    ///
+    /// Window scaling is only active if both sides exchanged WSopt during handshake.
+    #[inline]
+    pub fn wscale_enabled(&self) -> bool {
+        self.wscale_requested && self.wscale_received
+    }
+
+    /// Get effective send window scale (0 if scaling not enabled).
+    #[inline]
+    pub fn effective_snd_wscale(&self) -> u8 {
+        if self.wscale_enabled() { self.snd_wscale } else { 0 }
+    }
+
+    /// Get effective receive window scale (0 if scaling not enabled).
+    #[inline]
+    pub fn effective_rcv_wscale(&self) -> u8 {
+        if self.wscale_enabled() { self.rcv_wscale } else { 0 }
+    }
+}
+
+// ============================================================================
+// Window Scaling Functions (RFC 7323)
+// ============================================================================
+
+/// Calculate the window scale factor needed for a desired window size.
+///
+/// Returns the minimum shift count (0-14) that allows advertising the desired
+/// window within the 16-bit window field.
+///
+/// # Arguments
+///
+/// * `desired_wnd` - Desired receive window size in bytes
+///
+/// # Returns
+///
+/// Window scale shift count (0-14)
+pub fn calc_wscale(desired_wnd: u32) -> u8 {
+    if desired_wnd <= u16::MAX as u32 {
+        return 0;
+    }
+    // Find minimum shift to fit desired_wnd in 16 bits
+    // desired_wnd >> shift <= 65535
+    for shift in 1..=TCP_MAX_WINDOW_SCALE {
+        if desired_wnd >> shift <= u16::MAX as u32 {
+            return shift;
+        }
+    }
+    TCP_MAX_WINDOW_SCALE
+}
+
+/// Decode a received window value using the peer's window scale.
+///
+/// Applies the scale factor and caps at TCP_MAX_SCALED_WINDOW to prevent
+/// overflow and unreasonable window sizes.
+///
+/// # Arguments
+///
+/// * `raw` - Raw window value from TCP header (16-bit)
+/// * `scale` - Window scale shift count (0-14)
+///
+/// # Returns
+///
+/// Scaled window size in bytes
+#[inline]
+pub fn decode_window(raw: u16, scale: u8) -> u32 {
+    let shift = scale.min(TCP_MAX_WINDOW_SCALE);
+    // Shift is clamped to 14, raw is 16-bit, so max result is 65535 << 14 = ~1GB
+    // which fits in u32 without overflow
+    let scaled = (raw as u32) << shift;
+    scaled.min(TCP_MAX_SCALED_WINDOW)
+}
+
+/// Encode a window value for transmission using our window scale.
+///
+/// Divides the available window by the scale factor for transmission in
+/// the 16-bit window field. If avoid_zero is true and the result would be
+/// zero but we have some window available, returns 1 to avoid advertising
+/// a zero window incorrectly.
+///
+/// # Arguments
+///
+/// * `avail` - Available receive window in bytes
+/// * `scale` - Window scale shift count (0-14)
+/// * `avoid_zero` - If true, return at least 1 when avail > 0
+///
+/// # Returns
+///
+/// Encoded window value for TCP header (16-bit)
+#[inline]
+pub fn encode_window(avail: u32, scale: u8, avoid_zero: bool) -> u16 {
+    let shift = scale.min(TCP_MAX_WINDOW_SCALE);
+    let mut w = avail >> shift;
+    // Avoid advertising zero window when we have some space
+    if avoid_zero && w == 0 && avail > 0 {
+        w = 1;
+    }
+    w.min(u16::MAX as u32) as u16
 }
 
 // ============================================================================
@@ -888,15 +1117,17 @@ pub fn handle_ack(tcb: &mut TcpControlBlock, ack_num: u32, now_ms: u64) -> AckUp
 /// **Congestion Avoidance** (cwnd >= ssthresh):
 /// - cwnd += SMSS * SMSS / cwnd (approximately 1 MSS per RTT)
 ///
-/// **Fast Recovery** (RFC 5681 Section 3.2):
+/// **Fast Recovery** (RFC 5681 Section 3.2 + NewReno):
 /// - On 3rd duplicate ACK: ssthresh = max(FlightSize/2, 2*SMSS)
 /// - cwnd = ssthresh + 3*SMSS, trigger fast retransmit
 /// - On each additional duplicate ACK: cwnd += SMSS
-/// - On new ACK: exit fast recovery, cwnd = ssthresh
+/// - R55-1: On partial ACK (ack < recover): stay in FR, retransmit next
+/// - On full ACK (ack >= recover): exit fast recovery, cwnd = ssthresh
 pub fn update_congestion_control(
     tcb: &mut TcpControlBlock,
     acked_bytes: u32,
     duplicate_ack: bool,
+    ack_num: u32,
 ) -> CongestionAction {
     if acked_bytes > 0 {
         // New data acknowledged - reset duplicate ACK counter
@@ -919,21 +1150,27 @@ pub fn update_congestion_control(
             TcpCongestionState::CongestionAvoidance => {
                 // RFC 5681: Congestion avoidance - linear growth
                 // cwnd += SMSS * SMSS / cwnd (approximately 1 MSS per RTT)
-                //
-                // This formula ensures cwnd grows by ~1 MSS per RTT regardless
-                // of how many ACKs are received. Each ACK adds a fraction of MSS
-                // such that after cwnd/MSS ACKs (one RTT), cwnd grows by 1 MSS.
-                //
-                // NOTE: We do NOT scale by acked_bytes to prevent unbounded ABC
-                // (Appropriate Byte Counting) which requires negotiation per RFC 3465.
                 let increment = mss.saturating_mul(mss).saturating_div(tcb.cwnd.max(1));
                 tcb.cwnd = tcb.cwnd.saturating_add(increment.max(1));
             }
             TcpCongestionState::FastRecovery => {
-                // Exit fast recovery on new ACK
-                // "Deflate" the window back to ssthresh
-                tcb.cwnd = tcb.ssthresh.max(mss);
-                tcb.congestion_state = TcpCongestionState::CongestionAvoidance;
+                // R55-1: NewReno partial ACK handling
+                if seq_ge(ack_num, tcb.recover) {
+                    // Full ACK: all data sent before entering FR is acknowledged
+                    // Exit fast recovery and deflate cwnd
+                    tcb.cwnd = tcb.ssthresh.max(mss);
+                    tcb.congestion_state = TcpCongestionState::CongestionAvoidance;
+                    return CongestionAction::None;
+                } else {
+                    // Partial ACK: some but not all FR data acknowledged
+                    // Stay in fast recovery, deflate cwnd, retransmit next
+                    // cwnd = ssthresh + 3*MSS - acked_bytes (deflate for acked data)
+                    tcb.cwnd = tcb.ssthresh
+                        .saturating_add(3 * mss)
+                        .saturating_sub(acked_bytes)
+                        .max(mss);
+                    return CongestionAction::RetransmitNext;
+                }
             }
         }
 
@@ -943,23 +1180,50 @@ pub fn update_congestion_control(
     // Handle duplicate ACKs
     if duplicate_ack {
         tcb.dup_ack_count = tcb.dup_ack_count.saturating_add(1);
+        let mss = tcb.snd_mss as u32;
 
-        if tcb.dup_ack_count == 3 {
-            // Triple duplicate ACK - enter fast retransmit/recovery
-            // RFC 5681 Section 3.2: ssthresh = max(FlightSize/2, 2*SMSS)
-            let flight = tcb.bytes_in_flight().max(tcb.snd_mss as u32);
-            tcb.ssthresh = core::cmp::max(flight / 2, 2 * tcb.snd_mss as u32);
+        // R55-2 FIX: Only enter fast recovery if not already in it (RFC 6582).
+        // After a partial ACK, dup_ack_count resets to 0, so subsequent dup ACKs
+        // would hit this branch again. The state check prevents re-cutting ssthresh.
+        if tcb.congestion_state != TcpCongestionState::FastRecovery {
+            // R56-1: RFC 3042 Limited Transmit on first/second duplicate ACK.
+            //
+            // For small-window connections that may never accumulate 3 dup ACKs,
+            // send new data on the first two dup ACKs if:
+            //   FlightSize + SMSS <= cwnd + 2*SMSS
+            //
+            // This helps generate additional ACKs to reach the fast retransmit
+            // threshold without waiting for RTO.
+            if tcb.dup_ack_count <= 2 {
+                let flight = tcb.bytes_in_flight();
+                // Check: can we send one more MSS under RFC 3042 allowance?
+                if flight.saturating_add(mss) <= tcb.cwnd.saturating_add(2 * mss) {
+                    return CongestionAction::LimitedTransmit;
+                }
+            }
 
-            // cwnd = ssthresh + 3*SMSS (account for segments that triggered dup ACKs)
-            tcb.cwnd = tcb.ssthresh.saturating_add(3 * tcb.snd_mss as u32);
-            tcb.congestion_state = TcpCongestionState::FastRecovery;
+            if tcb.dup_ack_count == 3 {
+                // Triple duplicate ACK - enter fast retransmit/recovery
+                // RFC 5681 Section 3.2: ssthresh = max(FlightSize/2, 2*SMSS)
+                let flight = tcb.bytes_in_flight().max(mss);
+                tcb.ssthresh = core::cmp::max(flight / 2, 2 * mss);
 
-            return CongestionAction::FastRetransmit;
+                // cwnd = ssthresh + 3*SMSS (account for segments that triggered dup ACKs)
+                tcb.cwnd = tcb.ssthresh.saturating_add(3 * mss);
+                tcb.congestion_state = TcpCongestionState::FastRecovery;
+
+                // R55-1: Set recovery point for NewReno partial ACK detection
+                tcb.recover = tcb.snd_nxt;
+
+                return CongestionAction::FastRetransmit;
+            }
         }
 
-        // Additional duplicate ACKs during fast recovery inflate cwnd
-        if tcb.congestion_state == TcpCongestionState::FastRecovery && tcb.dup_ack_count > 3 {
-            tcb.cwnd = tcb.cwnd.saturating_add(tcb.snd_mss as u32);
+        // R55-3 FIX: Window inflation on any dup ACK during fast recovery (RFC 6582).
+        // Changed from dup_ack_count > 3 to > 0 so dup ACKs after partial ACK
+        // (when dup_ack_count restarts from 0) still inflate cwnd to keep pipe full.
+        if tcb.congestion_state == TcpCongestionState::FastRecovery && tcb.dup_ack_count > 0 {
+            tcb.cwnd = tcb.cwnd.saturating_add(mss);
         }
     }
 
@@ -976,12 +1240,82 @@ pub fn update_congestion_control(
 /// - cwnd = 1*SMSS (back to slow start)
 /// - congestion_state = SlowStart
 /// - dup_ack_count = 0
+/// - recover = snd_nxt (R55-1: reset recovery point)
 pub fn handle_retransmission_timeout(tcb: &mut TcpControlBlock) {
     let flight = tcb.bytes_in_flight().max(tcb.snd_mss as u32);
     tcb.ssthresh = core::cmp::max(flight / 2, 2 * tcb.snd_mss as u32);
     tcb.cwnd = tcb.snd_mss as u32; // Back to 1 SMSS
     tcb.congestion_state = TcpCongestionState::SlowStart;
+    tcb.recover = tcb.snd_nxt; // R55-1: Reset recovery point
     tcb.dup_ack_count = 0;
+}
+
+/// R57-1: RFC 2861 idle cwnd validation to prevent stale bursts.
+///
+/// A TCP connection is considered "idle" when no data is in flight and no
+/// data has been sent for at least one RTO period. After idle periods, cwnd
+/// may no longer reflect current network conditions, so we reduce it to avoid
+/// congestion bursts.
+///
+/// # Algorithm
+///
+/// - After first idle RTO: cap cwnd at initial window (IW)
+/// - For each additional idle RTO: halve cwnd until ssthresh floor
+/// - If cwnd falls to or below ssthresh, re-enter slow start
+///
+/// # Arguments
+///
+/// * `tcb` - TCP control block to validate
+/// * `now_ms` - Current monotonic time in milliseconds
+///
+/// # Security
+///
+/// Prevents connections from bursting with a stale (potentially large) cwnd
+/// after being idle, which could cause network congestion or self-induced
+/// packet loss.
+#[inline]
+pub fn validate_cwnd_after_idle(tcb: &mut TcpControlBlock, now_ms: u64) {
+    // Skip if no activity recorded yet or invalid RTO
+    if tcb.last_activity == 0 || tcb.rto_ms == 0 {
+        return;
+    }
+
+    // RFC 2861: Not idle if there is still outstanding data in flight
+    if tcb.bytes_in_flight() > 0 {
+        return;
+    }
+
+    let idle_ms = now_ms.saturating_sub(tcb.last_activity);
+    if idle_ms < tcb.rto_ms {
+        // Not idle yet - no adjustment needed
+        return;
+    }
+
+    let iw = initial_cwnd(tcb.snd_mss);
+    let idle_rtos = idle_ms / tcb.rto_ms;
+
+    // First idle RTO: collapse inflated cwnd to initial window
+    let mut new_cwnd = core::cmp::min(tcb.cwnd, iw);
+
+    // Additional RTOs: exponential decay toward ssthresh floor
+    if idle_rtos > 1 && new_cwnd > tcb.ssthresh {
+        let floor = core::cmp::max(tcb.ssthresh, tcb.snd_mss as u32).max(1);
+        for _ in 1..idle_rtos {
+            if new_cwnd <= floor {
+                break;
+            }
+            new_cwnd = new_cwnd.saturating_div(2).max(floor);
+        }
+    }
+
+    // Apply reduction if cwnd decreased
+    if new_cwnd < tcb.cwnd {
+        tcb.cwnd = new_cwnd;
+        // Re-enter slow start if cwnd fell to or below ssthresh
+        if tcb.cwnd <= tcb.ssthresh {
+            tcb.congestion_state = TcpCongestionState::SlowStart;
+        }
+    }
 }
 
 // ============================================================================
@@ -1324,6 +1658,72 @@ pub fn build_tcp_segment(
     segment
 }
 
+/// Build a TCP segment with options and correct data offset.
+///
+/// This function serializes TCP options, pads them to 32-bit boundary,
+/// and includes them in the header. The data_offset field is set correctly
+/// to reflect the actual header length (base header + options).
+///
+/// # Arguments
+///
+/// * `src_ip` - Source IPv4 address
+/// * `dst_ip` - Destination IPv4 address
+/// * `src_port` - Source port
+/// * `dst_port` - Destination port
+/// * `seq_num` - Sequence number
+/// * `ack_num` - Acknowledgment number
+/// * `flags` - TCP flags
+/// * `window` - Window size (already scaled by caller if applicable)
+/// * `options` - TCP options to include (e.g., MSS, Window Scale)
+/// * `payload` - Segment payload
+///
+/// # Returns
+///
+/// Complete TCP segment with options and checksum
+///
+/// # Panics
+///
+/// Debug-asserts if options exceed maximum header length (40 bytes of options).
+pub fn build_tcp_segment_with_options(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq_num: u32,
+    ack_num: u32,
+    flags: u8,
+    window: u16,
+    options: &[TcpOptionKind],
+    payload: &[u8],
+) -> Vec<u8> {
+    let options_bytes = serialize_tcp_options(options);
+    let header_len = TCP_HEADER_MIN_LEN + options_bytes.len();
+
+    // Validate header length doesn't exceed maximum (60 bytes = 15 * 4)
+    debug_assert!(
+        header_len <= TCP_HEADER_MAX_LEN,
+        "TCP options exceed maximum header length: {} > {}",
+        header_len,
+        TCP_HEADER_MAX_LEN
+    );
+
+    // Create header with correct data offset
+    let mut header = TcpHeader::new(src_port, dst_port, seq_num, ack_num, flags, window);
+    header.data_offset = (header_len / 4) as u8;
+
+    // Build segment: header + options + payload
+    let mut segment = Vec::with_capacity(header_len + payload.len());
+    segment.extend_from_slice(&header.to_bytes());
+    segment.extend_from_slice(&options_bytes);
+    segment.extend_from_slice(payload);
+
+    // Compute and set checksum
+    let checksum = compute_tcp_checksum(src_ip, dst_ip, &segment);
+    segment[16..18].copy_from_slice(&checksum.to_be_bytes());
+
+    segment
+}
+
 // ============================================================================
 // ISN Generation (RFC 6528)
 // ============================================================================
@@ -1331,40 +1731,93 @@ pub fn build_tcp_segment(
 /// Global ISN generator state
 static ISN_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// R50-1 FIX: Boot-time secret key for ISN generation (RFC 6528 compliance)
-/// Initialized once from CSPRNG to prevent ISN prediction attacks.
-static ISN_SECRET: Once<u64> = Once::new();
-
-/// Get or initialize the ISN secret key from CSPRNG
+/// R54-1 FIX: ISN secret key with auto-upgrade capability.
 ///
-/// R50-1 IMPROVEMENT: Now uses kernel CSPRNG (ChaCha20 + RDRAND/RDSEED)
-/// with RDTSC fallback only when CSPRNG is not yet initialized.
+/// Initially may use a weak RDTSC-based fallback during early boot before
+/// CSPRNG is seeded. Once CSPRNG is ready, the secret is transparently
+/// upgraded to strong entropy on next use.
+///
+/// Uses AtomicU64 instead of Once<u64> to enable runtime upgrade.
+static ISN_SECRET: AtomicU64 = AtomicU64::new(0);
+
+/// R54-1 FIX: Tracks whether current ISN_SECRET is from weak entropy source.
+///
+/// When true, subsequent calls to isn_secret() will attempt to upgrade
+/// to strong entropy from CSPRNG.
+static ISN_SECRET_WEAK: AtomicBool = AtomicBool::new(true);
+
+/// Get or initialize the ISN secret key from CSPRNG.
+///
+/// R54-1 IMPROVEMENT: Auto-upgrades weak secret to strong once CSPRNG is ready.
+///
+/// # Security Design
+///
+/// 1. **Fast path**: If strong secret is already installed, return immediately
+/// 2. **Upgrade path**: If CSPRNG is now available and current secret is weak,
+///    atomically upgrade to strong entropy
+/// 3. **Fallback path**: For early boot, use RDTSC-based weak secret that
+///    will be upgraded later
+///
+/// The upgrade is transparent to callers and maintains ISN monotonicity
+/// (the counter is never reset, only the secret key changes).
 #[inline]
 fn isn_secret() -> u64 {
-    *ISN_SECRET.call_once(|| {
-        // Try to get entropy from kernel CSPRNG first (security::rng)
-        if let Ok(secret) = security::rng::random_u64() {
-            return secret;
+    // Fast path: strong secret already installed
+    let current = ISN_SECRET.load(Ordering::Acquire);
+    if current != 0 && !ISN_SECRET_WEAK.load(Ordering::Relaxed) {
+        return current;
+    }
+
+    // Try to install or upgrade to strong entropy from CSPRNG
+    if let Ok(strong) = security::rng::random_u64() {
+        let prev = ISN_SECRET.load(Ordering::Acquire);
+        let is_weak = ISN_SECRET_WEAK.load(Ordering::Relaxed);
+
+        // Upgrade if: no secret yet OR current secret is weak
+        if prev == 0 || is_weak {
+            if ISN_SECRET
+                .compare_exchange(prev, strong, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // Successfully installed strong secret
+                ISN_SECRET_WEAK.store(false, Ordering::Release);
+                return strong;
+            }
         }
 
-        // Fallback: CSPRNG not yet initialized (early boot)
-        // Use RDTSC with mixing for basic unpredictability
-        #[cfg(target_arch = "x86_64")]
-        let fallback = {
-            let lo: u64;
-            let hi: u64;
-            unsafe {
-                core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nostack, nomem));
-            }
-            // Mix with a prime constant for better distribution
-            let tsc = (hi << 32) | lo;
-            tsc.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17)
-        };
-        #[cfg(not(target_arch = "x86_64"))]
-        let fallback = 0xa5a5_5a5a_d3e4_c7d2_u64;
+        // Another thread may have upgraded - check if strong now
+        let upgraded = ISN_SECRET.load(Ordering::Acquire);
+        if upgraded != 0 && !ISN_SECRET_WEAK.load(Ordering::Relaxed) {
+            return upgraded;
+        }
+    }
 
-        fallback
-    })
+    // Fallback: weak secret for early boot (will be upgraded later)
+    #[cfg(target_arch = "x86_64")]
+    let weak = {
+        let lo: u64;
+        let hi: u64;
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nostack, nomem));
+        }
+        // Mix with prime constant for better distribution of weak entropy
+        let tsc = (hi << 32) | lo;
+        tsc.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let weak = 0xa5a5_5a5a_d3e4_c7d2_u64;
+
+    // Install weak secret only if none exists; keep marked as upgradeable
+    if ISN_SECRET
+        .compare_exchange(0, weak, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        ISN_SECRET_WEAK.store(true, Ordering::Release);
+        return weak;
+    }
+
+    // Another thread installed something - use that
+    ISN_SECRET.load(Ordering::Acquire)
 }
 
 /// Generate an Initial Sequence Number (ISN) per RFC 6528

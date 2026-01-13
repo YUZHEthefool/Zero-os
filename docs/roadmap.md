@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-11
+**Last Updated:** 2026-01-12
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -13,7 +13,7 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 ### Current Status: Phase D.2 In Progress (TCP Reliable Transport Complete)
 
 Zero-OS has completed storage foundation and is building network infrastructure:
-- **53 security audits** with 233 issues found, ~198 fixed (85%)
+- **58 security audits** with 252 issues found, ~219 fixed (87%)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -23,6 +23,11 @@ Zero-OS has completed storage foundation and is building network infrastructure:
 - **Phase C**: ✅ **COMPLETE** (virtio-blk, page cache, ext2, procfs, OOM killer, openat2, devfs read/write)
 - **Phase D.1**: ✅ **COMPLETE** (virtio crate, NetDevice trait, virtio-net driver MVP)
 - **Phase D.2**: TCP client/server complete (connect/listen/accept/send/recv/shutdown/close), retransmission with RFC 6298 RTT
+- **R54**: ISN secret auto-upgrade ✅, Challenge ACK rate limiting ✅
+- **R55**: NewReno congestion control ✅ (RFC 6582 partial ACK handling)
+- **R56**: Limited Transmit ✅ (RFC 3042 adapted for immediate-send architecture)
+- **R57**: Idle cwnd validation ✅ (RFC 2861 stale burst prevention)
+- **R58**: Window Scaling ✅ (RFC 7323 WSopt negotiation, up to 256KB windows)
 
 ### Gap Analysis vs Linux Kernel
 
@@ -30,7 +35,7 @@ Zero-OS has completed storage foundation and is building network infrastructure:
 |----------|-------|---------|-----|
 | **SMP** | 256+ CPUs | Single-core | Full implementation needed |
 | **Security Framework** | LSM/SELinux/AppArmor | LSM + Seccomp + Capabilities | ✅ Framework complete, policies needed |
-| **Network** | Full TCP/IP stack | TCP (w/retransmission), UDP, ICMP | Congestion control, Window Scaling |
+| **Network** | Full TCP/IP stack | TCP (w/retransmission + NewReno CC + Window Scaling), UDP, ICMP | SACK, Timestamps |
 | **Storage** | ext4/xfs/btrfs/zfs | virtio-blk + ext2 + procfs | Extended FS support needed |
 | **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard/VirtIO | Driver framework needed |
 | **Containers** | Namespaces/Cgroups | Not started | Full implementation needed |
@@ -460,6 +465,10 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] **R50 FIXED**: Global connection limit with stale entry pruning (DoS prevention)
 - [x] **R53 IMPLEMENTED**: TCP retransmission (RFC 6298 RTT/RTO, Karn's algorithm, exponential backoff)
 - [x] **R53-3 FIXED**: Dual timer system (200ms retransmission, 1s TIME_WAIT cleanup)
+- [x] **R55 IMPLEMENTED**: NewReno congestion control (RFC 6582) with partial ACK handling
+- [x] **R56 IMPLEMENTED**: Limited Transmit (RFC 3042) for small-window recovery
+- [x] **R57 IMPLEMENTED**: Idle cwnd validation (RFC 2861) for stale burst prevention
+- [x] **R58 IMPLEMENTED**: Window Scaling (RFC 7323) - WSopt negotiation, 256KB default window
 - [x] TCP FIN/close states (graceful shutdown) - sys_shutdown, all RFC 793 states
 - [x] **R51-1 FIXED**: TCP listen/accept (passive open) - SYN/accept queues implemented
 - [ ] Fragment reassembly with limits
@@ -478,6 +487,8 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] MAC filtering (process only frames addressed to us)
 - [x] ARP rate limiting (RX 50pps, TX 20pps) and cache anti-spoofing
 - [x] ISN randomization (RFC 6528) - R50-1 keyed hash
+- [x] **R54-1 FIXED**: ISN secret auto-upgrade (weak→strong once CSPRNG ready)
+- [x] **R54-2 FIXED**: Challenge ACK rate limiting (100/sec token bucket)
 - [ ] Conntrack state machine
 - [ ] SYN cookies
 - [ ] Basic firewall (match + action table)
@@ -696,16 +707,18 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-09 | 50 | 6 | 6 | TCP ISN/RST/limits, FIN/close states - **ALL R50 FIXED** |
 | 2026-01-10 | 51 | 6 | 6 | TCP resource mgmt, listen/accept - **ALL R51 FIXED** |
 | 2026-01-11 | 52-53 | 6 | 6 | SYN queue timeout, listener cleanup, RTT/RTO, timer granularity - **ALL FIXED** |
-| **Total** | **53** | **240** | **207 (86%)** | **33 open (SMP-related)** |
+| 2026-01-12 | 54-58 | 12 | 10 | ISN upgrade, Challenge ACK, NewReno, Limited Transmit, Idle cwnd, Window Scaling - **2 DEFERRED** |
+| **Total** | **58** | **252** | **219 (87%)** | **33 open (SMP-related, SYN cookies)** |
 
 ### Current Status
 
-- **Fixed**: 207 issues (86%)
-- **Open**: 33 issues (14%)
+- **Fixed**: 219 issues (87%)
+- **Open**: 33 issues (13%)
   - SMP-related issues deferred to Phase E
-  - No open TCP issues
+  - SYN cookies deferred to Phase D.3
+  - No open TCP issues blocking current phase
 
-See [qa-2026-01-11-v2.md](review/qa-2026-01-11-v2.md) for latest audit report.
+See [qa-2026-01-12.md](review/qa-2026-01-12.md) for latest audit report.
 
 ---
 

@@ -51,7 +51,7 @@ use crate::ipv4::{
     IPV4_HEADER_MIN_LEN,
 };
 use crate::socket::socket_table;
-use crate::tcp::{parse_tcp_header, verify_tcp_checksum, TcpError, TCP_HEADER_MIN_LEN};
+use crate::tcp::{parse_tcp_header, parse_tcp_options, verify_tcp_checksum, TcpError, TCP_HEADER_MIN_LEN};
 use crate::udp::{parse_udp, UdpError, UdpResult, UdpStats};
 use crate::DEFAULT_MTU;
 
@@ -521,12 +521,17 @@ fn process_tcp(
     // Extract payload (data after TCP header)
     let tcp_payload = &payload[hdr_len..];
 
+    // R58: Parse TCP options for window scaling support
+    // Use the full segment so parse_tcp_options can validate header_len
+    let tcp_options = parse_tcp_options(payload, &tcp_hdr);
+
     // Delegate to socket layer for stateful TCP processing
     if let Some(resp_seg) = socket_table().process_tcp_segment(
         ip_hdr.src,
         ip_hdr.dst,
         &tcp_hdr,
         tcp_payload,
+        &tcp_options,
     ) {
         // Build IPv4 header (swap src/dst)
         let ip_reply = build_ipv4_header(

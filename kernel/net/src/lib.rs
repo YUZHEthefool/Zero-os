@@ -83,14 +83,17 @@ pub use udp::{
     UdpError, UdpHeader, UdpResult, UdpStats, UDP_HEADER_LEN, UDP_PROTO,
 };
 pub use tcp::{
-    parse_tcp_header, parse_tcp_options, build_tcp_segment, compute_tcp_checksum,
+    parse_tcp_header, parse_tcp_options, build_tcp_segment, build_tcp_segment_with_options,
+    serialize_tcp_option, serialize_tcp_options, compute_tcp_checksum,
     verify_tcp_checksum, generate_isn, seq_lt, seq_le, seq_gt, seq_ge, seq_in_window,
-    update_rtt, handle_ack, update_congestion_control, handle_retransmission_timeout, initial_cwnd,
-    TcpHeader, TcpOptions, TcpState, TcpCongestionState, TcpControlBlock, TcpConnKey, TcpSegment,
-    AckUpdate, CongestionAction, TcpError, TcpResult, TcpStats,
-    TCP_HEADER_MIN_LEN, TCP_PROTO, TCP_DEFAULT_MSS, TCP_ETHERNET_MSS, TCP_TIME_WAIT_MS,
-    TCP_FIN_TIMEOUT_MS, TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES, TCP_MAX_RTO_MS, TCP_MAX_SEND_SIZE,
-    TCP_MAX_SYN_BACKLOG, TCP_MAX_ACCEPT_BACKLOG, TCP_INITIAL_SSTHRESH,
+    update_rtt, handle_ack, update_congestion_control, handle_retransmission_timeout,
+    validate_cwnd_after_idle, initial_cwnd, calc_wscale, decode_window, encode_window,
+    TcpHeader, TcpOptions, TcpOptionKind, TcpState, TcpCongestionState, TcpControlBlock,
+    TcpConnKey, TcpSegment, AckUpdate, CongestionAction, TcpError, TcpResult, TcpStats,
+    TCP_HEADER_MIN_LEN, TCP_HEADER_MAX_LEN, TCP_PROTO, TCP_DEFAULT_MSS, TCP_ETHERNET_MSS,
+    TCP_TIME_WAIT_MS, TCP_FIN_TIMEOUT_MS, TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES, TCP_MAX_RTO_MS,
+    TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_ACCEPT_BACKLOG, TCP_INITIAL_SSTHRESH,
+    TCP_MAX_WINDOW_SCALE, TCP_MAX_SCALED_WINDOW, TCP_DEFAULT_RCV_WINDOW_BYTES, TCP_DEFAULT_WINDOW,
     TCP_FLAG_FIN, TCP_FLAG_SYN, TCP_FLAG_RST, TCP_FLAG_PSH, TCP_FLAG_ACK, TCP_FLAG_URG,
 };
 pub use socket::{

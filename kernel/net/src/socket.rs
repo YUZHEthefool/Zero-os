@@ -47,7 +47,7 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use spin::{Mutex, Once, RwLock};
 
 use cap::CapId;
@@ -58,13 +58,14 @@ use lsm::{
 
 use crate::ipv4::Ipv4Addr;
 use crate::tcp::{
-    build_tcp_segment, generate_isn, handle_ack, handle_retransmission_timeout,
-    seq_ge, seq_gt, seq_in_window, update_congestion_control, CongestionAction,
-    TcpConnKey, TcpControlBlock, TcpHeader, TcpSegment, TcpState, TCP_DEFAULT_WINDOW,
-    TCP_ETHERNET_MSS, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN,
-    TCP_FIN_TIMEOUT_MS, TCP_MAX_ACCEPT_BACKLOG, TCP_MAX_ACTIVE_CONNECTIONS, TCP_MAX_FIN_RETRIES,
-    TCP_MAX_RETRIES, TCP_MAX_RTO_MS, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_PROTO,
-    TCP_SYN_TIMEOUT_MS, TCP_TIME_WAIT_MS,
+    build_tcp_segment, build_tcp_segment_with_options, calc_wscale, decode_window, encode_window,
+    generate_isn, handle_ack, handle_retransmission_timeout, seq_ge, seq_gt, seq_in_window,
+    update_congestion_control, validate_cwnd_after_idle, CongestionAction, TcpConnKey,
+    TcpControlBlock, TcpHeader, TcpOptionKind, TcpOptions, TcpSegment, TcpState,
+    TCP_DEFAULT_WINDOW, TCP_ETHERNET_MSS, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST,
+    TCP_FLAG_SYN, TCP_FIN_TIMEOUT_MS, TCP_MAX_ACCEPT_BACKLOG, TCP_MAX_ACTIVE_CONNECTIONS,
+    TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES, TCP_MAX_RTO_MS, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG,
+    TCP_MAX_WINDOW_SCALE, TCP_PROTO, TCP_SYN_TIMEOUT_MS, TCP_TIME_WAIT_MS,
 };
 use crate::stack::transmit_tcp_segment;
 use crate::udp::{
@@ -303,6 +304,71 @@ const MAX_RX_QUEUE: usize = 64;
 
 /// Privileged port boundary (ports below this require special permissions).
 const PRIVILEGED_PORT_LIMIT: u16 = 1024;
+
+// ============================================================================
+// Challenge ACK Rate Limiting (R54-2 FIX)
+// ============================================================================
+
+/// Maximum challenge ACKs per window period (RFC 5961 rate limiting).
+///
+/// R54-2 FIX: Prevents amplification attacks via spoofed RST packets.
+/// Linux default: 100/sec (tcp_challenge_ack_limit sysctl).
+const CHALLENGE_ACK_LIMIT: u32 = 100;
+
+/// Challenge ACK rate limiting window in milliseconds.
+const CHALLENGE_ACK_WINDOW_MS: u64 = 1000;
+
+/// Token bucket for challenge ACK rate limiting.
+static CHALLENGE_ACK_TOKENS: AtomicU32 = AtomicU32::new(CHALLENGE_ACK_LIMIT);
+
+/// Window start time for challenge ACK rate limiter.
+static CHALLENGE_ACK_WINDOW_START: AtomicU64 = AtomicU64::new(0);
+
+/// Check if a challenge ACK can be sent (rate limiter).
+///
+/// R54-2 FIX: Implements token bucket rate limiting for challenge ACKs
+/// to prevent amplification attacks via spoofed RST packets.
+///
+/// # Arguments
+///
+/// * `now_ms` - Current timestamp in milliseconds
+///
+/// # Returns
+///
+/// `true` if a challenge ACK can be sent, `false` if rate limit exceeded.
+///
+/// # Security
+///
+/// Without this check, an attacker could send high-rate spoofed RST packets
+/// with invalid sequence numbers, causing the victim to generate unlimited
+/// challenge ACKs. This consumes CPU and bandwidth, and can be used as a
+/// reflection/amplification attack vector.
+fn allow_challenge_ack(now_ms: u64) -> bool {
+    // Check if we need to reset the window
+    let window_start = CHALLENGE_ACK_WINDOW_START.load(Ordering::Relaxed);
+    if window_start == 0 || now_ms.saturating_sub(window_start) >= CHALLENGE_ACK_WINDOW_MS {
+        // New window - reset tokens and update start time
+        CHALLENGE_ACK_WINDOW_START.store(now_ms, Ordering::Relaxed);
+        CHALLENGE_ACK_TOKENS.store(CHALLENGE_ACK_LIMIT, Ordering::Relaxed);
+    }
+
+    // Try to consume a token using CAS loop
+    let mut tokens = CHALLENGE_ACK_TOKENS.load(Ordering::Relaxed);
+    while tokens > 0 {
+        match CHALLENGE_ACK_TOKENS.compare_exchange_weak(
+            tokens,
+            tokens - 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(current) => tokens = current,
+        }
+    }
+
+    // Rate limit exceeded - drop the challenge ACK
+    false
+}
 
 // ============================================================================
 // Socket Types
@@ -1022,6 +1088,28 @@ pub struct SocketTable {
 }
 
 impl SocketTable {
+    /// Encode advertised receive window for TCP header using window scaling.
+    ///
+    /// RFC 7323: If window scaling is enabled, the advertised window in the
+    /// TCP header is the actual available window divided by 2^scale.
+    /// Uses `avoid_zero=true` to prevent advertising zero window when space exists.
+    #[inline]
+    fn encode_adv_window(tcb: &TcpControlBlock, available: u32) -> u16 {
+        encode_window(available, tcb.effective_rcv_wscale(), true)
+    }
+
+    /// Compute current advertised receive window (scaled if negotiated).
+    ///
+    /// This is a convenience method for computing the window advertisement
+    /// when buffer state is already available in the TCB.
+    #[inline]
+    fn current_adv_window(tcb: &TcpControlBlock) -> u16 {
+        let available = tcb
+            .rcv_wnd
+            .saturating_sub(tcb.recv_buffer.len() as u32);
+        Self::encode_adv_window(tcb, available)
+    }
+
     /// Create a new socket table.
     pub const fn new() -> Self {
         SocketTable {
@@ -1590,10 +1678,21 @@ impl SocketTable {
         tcb.snd_una = iss;
         tcb.snd_nxt = iss.wrapping_add(1); // SYN consumes one sequence number
         tcb.snd_wnd = TCP_DEFAULT_WINDOW as u32;
+
+        // R58: RFC 7323 Window Scaling - calculate and set our scale factor
+        // WSopt MUST only appear in SYN segments
+        tcb.rcv_wscale = calc_wscale(tcb.rcv_wnd);
+        tcb.wscale_requested = true;
+
+        // Calculate scaled window for SYN
+        let syn_wnd = Self::encode_adv_window(&tcb, tcb.rcv_wnd);
         sock.attach_tcp(tcb);
 
-        // Build the SYN segment
-        let segment = build_tcp_segment(
+        // Build the SYN segment with Window Scale option
+        let syn_options = [TcpOptionKind::WindowScale(
+            sock.tcp.lock().as_ref().unwrap().control.rcv_wscale,
+        )];
+        let segment = build_tcp_segment_with_options(
             local_ip,
             dst_ip,
             local_port,
@@ -1601,7 +1700,8 @@ impl SocketTable {
             iss,
             0,
             TCP_FLAG_SYN,
-            TCP_DEFAULT_WINDOW,
+            syn_wnd,
+            &syn_options,
             &[],
         );
 
@@ -1805,6 +1905,13 @@ impl SocketTable {
             return Err(SocketError::InvalidState);
         }
 
+        // Get current timestamp for idle validation and retransmission tracking
+        let now_ms = self.time_wait_now();
+
+        // R57-1: RFC 2861 idle cwnd validation - reduce cwnd if connection was idle
+        // This prevents bursting with a stale (potentially large) cwnd after idle periods
+        crate::tcp::validate_cwnd_after_idle(&mut tcp_state.control, now_ms);
+
         // Respect the peer-advertised send window; refuse to emit data that would overflow it
         let window_avail = tcp_state.control.send_window_available() as usize;
         if !payload.is_empty() && payload.len() > window_avail {
@@ -1816,19 +1923,13 @@ impl SocketTable {
         let base_seq = tcp_state.control.snd_nxt;
         let ack = tcp_state.control.rcv_nxt;
 
-        // Advertise our actual receive window (rcv_wnd minus buffered data)
-        let advertised_wnd = tcp_state
-            .control
-            .rcv_wnd
-            .saturating_sub(tcp_state.control.recv_buffer.len() as u32) as u16;
+        // R58: Advertise our scaled receive window
+        let advertised_wnd = Self::current_adv_window(&tcp_state.control);
 
         // TCP segmentation: split payload into MSS-sized chunks
         let mss = TCP_ETHERNET_MSS as usize;
         let mut segments = Vec::with_capacity((payload.len() + mss - 1) / mss.max(1));
         let mut offset = 0usize;
-
-        // Get current timestamp for retransmission tracking
-        let now_ms = self.time_wait_now();
 
         while offset < payload.len() {
             let end = core::cmp::min(offset + mss, payload.len());
@@ -1866,6 +1967,9 @@ impl SocketTable {
 
         // Update send next sequence number
         tcp_state.control.snd_nxt = base_seq.wrapping_add(payload.len() as u32);
+
+        // R57-1: Record activity timestamp for idle detection (RFC 2861)
+        tcp_state.control.last_activity = now_ms;
 
         drop(guard);
 
@@ -1965,10 +2069,8 @@ impl SocketTable {
         // Build FIN segment
         let seq = tcp_state.control.snd_nxt;
         let ack = tcp_state.control.rcv_nxt;
-        let advertised_wnd = tcp_state
-            .control
-            .rcv_wnd
-            .saturating_sub(tcp_state.control.recv_buffer.len() as u32) as u16;
+        // R58: Use scaled window advertisement
+        let advertised_wnd = Self::current_adv_window(&tcp_state.control);
 
         // FIN consumes 1 sequence number
         tcp_state.control.snd_nxt = tcp_state.control.snd_nxt.wrapping_add(1);
@@ -2223,11 +2325,8 @@ impl SocketTable {
                             if !tcp_state.control.fin_sent {
                                 let seq = tcp_state.control.snd_nxt;
                                 let ack = tcp_state.control.rcv_nxt;
-                                let advertised_wnd = tcp_state
-                                    .control
-                                    .rcv_wnd
-                                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32)
-                                    as u16;
+                                // R58: Use scaled window
+                                let advertised_wnd = Self::current_adv_window(&tcp_state.control);
 
                                 // FIN consumes one sequence number
                                 tcp_state.control.snd_nxt =
@@ -2257,11 +2356,8 @@ impl SocketTable {
                             if !tcp_state.control.fin_sent {
                                 let seq = tcp_state.control.snd_nxt;
                                 let ack = tcp_state.control.rcv_nxt;
-                                let advertised_wnd = tcp_state
-                                    .control
-                                    .rcv_wnd
-                                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32)
-                                    as u16;
+                                // R58: Use scaled window
+                                let advertised_wnd = Self::current_adv_window(&tcp_state.control);
 
                                 tcp_state.control.snd_nxt =
                                     tcp_state.control.snd_nxt.wrapping_add(1);
@@ -2518,6 +2614,7 @@ impl SocketTable {
     /// * `dst_ip` - Destination IP (our IP)
     /// * `header` - Parsed TCP header
     /// * `payload` - TCP payload (after header)
+    /// * `options` - Parsed TCP options (for window scaling, etc.)
     ///
     /// # Returns
     /// TCP segment to transmit (ACK or RST) if a response is required.
@@ -2527,6 +2624,7 @@ impl SocketTable {
         dst_ip: Ipv4Addr,
         header: &TcpHeader,
         payload: &[u8],
+        options: &TcpOptions,
     ) -> Option<Vec<u8>> {
         // RFC 793/5961: Handle RST segments with sequence validation
         if header.flags & TCP_FLAG_RST != 0 {
@@ -2553,13 +2651,19 @@ impl SocketTable {
                     };
 
                     if !accept_rst {
+                        // R54-2 FIX: Rate limit challenge ACKs to prevent amplification attacks
+                        // An attacker could send spoofed RST packets at high rate to exhaust
+                        // CPU and bandwidth via unlimited challenge ACK responses.
+                        if !allow_challenge_ack(self.time_wait_now()) {
+                            drop(guard);
+                            return None;
+                        }
+
                         // R50-4 IMPROVEMENT: Send challenge ACK per RFC 5961 Section 3.2
                         // This allows legitimate endpoints to prove their connection state
                         // while preventing blind RST injection attacks
-                        let advertised_wnd = tcp_state
-                            .control
-                            .rcv_wnd
-                            .saturating_sub(tcp_state.control.recv_buffer.len() as u32) as u16;
+                        // R58: Use scaled window advertisement
+                        let advertised_wnd = Self::current_adv_window(&tcp_state.control);
 
                         let challenge_ack = build_tcp_segment(
                             dst_ip,                          // Our IP
@@ -2650,7 +2754,7 @@ impl SocketTable {
                             let iss = generate_isn(dst_ip, header.dst_port, src_ip, header.src_port);
 
                             // Create server-side TCB in SynReceived state
-                            let tcb = TcpControlBlock::new_server(
+                            let mut tcb = TcpControlBlock::new_server(
                                 dst_ip,
                                 header.dst_port,
                                 src_ip,
@@ -2658,21 +2762,67 @@ impl SocketTable {
                                 iss,
                                 header.seq_num,
                             );
+
+                            // R58: RFC 7323 Window Scaling - process WSopt from incoming SYN
+                            // If client sent WSopt, we should respond with our own WSopt
+                            if let Some(peer_scale) = options.window_scale {
+                                tcb.snd_wscale = peer_scale.min(TCP_MAX_WINDOW_SCALE);
+                                tcb.wscale_received = true;
+                                // Calculate our scale factor for outgoing window advertisements
+                                tcb.rcv_wscale = calc_wscale(tcb.rcv_wnd);
+                                tcb.wscale_requested = true;
+                            }
+
                             child.attach_tcp(tcb);
 
-                            // Build SYN-ACK segment
+                            // R58: Calculate window for SYN-ACK (unscaled per RFC 7323)
+                            // RFC 7323 Section 2.2: The window field in SYN and SYN-ACK
+                            // segments is never scaled; scaling takes effect only after
+                            // the SYN exchange is complete.
+                            let syn_ack_wnd = {
+                                let guard = child.tcp.lock();
+                                if let Some(ts) = guard.as_ref() {
+                                    encode_window(ts.control.rcv_wnd, 0, true)
+                                } else {
+                                    TCP_DEFAULT_WINDOW
+                                }
+                            };
+
+                            // Build SYN-ACK segment with WSopt if client sent one
                             // RFC 793: SYN consumes 1 sequence number
-                            let syn_ack = build_tcp_segment(
-                                dst_ip,
-                                src_ip,
-                                header.dst_port,
-                                header.src_port,
-                                iss,
-                                header.seq_num.wrapping_add(1), // ACK = IRS + 1
-                                TCP_FLAG_SYN | TCP_FLAG_ACK,
-                                TCP_DEFAULT_WINDOW,
-                                &[],
-                            );
+                            let syn_ack = if options.window_scale.is_some() {
+                                // Include our WSopt in response
+                                let our_scale = {
+                                    let guard = child.tcp.lock();
+                                    guard.as_ref().map(|ts| ts.control.rcv_wscale).unwrap_or(0)
+                                };
+                                let syn_ack_options = [TcpOptionKind::WindowScale(our_scale)];
+                                build_tcp_segment_with_options(
+                                    dst_ip,
+                                    src_ip,
+                                    header.dst_port,
+                                    header.src_port,
+                                    iss,
+                                    header.seq_num.wrapping_add(1), // ACK = IRS + 1
+                                    TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                    syn_ack_wnd,
+                                    &syn_ack_options,
+                                    &[],
+                                )
+                            } else {
+                                // No WSopt from client, don't include one
+                                build_tcp_segment(
+                                    dst_ip,
+                                    src_ip,
+                                    header.dst_port,
+                                    header.src_port,
+                                    iss,
+                                    header.seq_num.wrapping_add(1), // ACK = IRS + 1
+                                    TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                    syn_ack_wnd,
+                                    &[],
+                                )
+                            };
 
                             // Register connection for demux
                             {
@@ -2760,11 +2910,40 @@ impl SocketTable {
                 tcp_state.control.rcv_nxt = header.seq_num.wrapping_add(syn_len);
                 // Update snd_una and refresh RTT estimates from ACK
                 handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
-                // Initialize send window from SYN-ACK (RFC 793)
-                tcp_state.control.snd_wnd = header.window as u32;
+
+                // R58: RFC 7323 Window Scaling - process WSopt from SYN-ACK
+                // Window scaling is ONLY negotiated if we sent WSopt in our SYN
+                // AND the peer includes WSopt in their SYN-ACK.
+                if tcp_state.control.wscale_requested {
+                    if let Some(peer_scale) = options.window_scale {
+                        // Clamp to maximum allowed scale factor
+                        tcp_state.control.snd_wscale = peer_scale.min(TCP_MAX_WINDOW_SCALE);
+                        tcp_state.control.wscale_received = true;
+                    }
+                    // If peer didn't send WSopt, window scaling is disabled
+                    // (snd_wscale remains 0, wscale_received remains false)
+                }
+
+                // Initialize send window from SYN-ACK (window field is never scaled on SYNs)
+                // RFC 7323 Section 2.2: Scaling takes effect only after SYN exchange completes
+                tcp_state.control.snd_wnd = decode_window(
+                    header.window,
+                    0, // RFC 7323: SYN/SYN-ACK window is unscaled
+                );
                 tcp_state.control.snd_wl1 = header.seq_num;
                 tcp_state.control.snd_wl2 = header.ack_num;
                 tcp_state.control.state = TcpState::Established;
+
+                // R58 FIX: RFC 793 semantics - if window scaling was not negotiated,
+                // cap receive window to 16 bits to avoid accepting more data than
+                // we can advertise without scaling. This ensures sequence/window
+                // checks remain consistent with advertised window.
+                if !tcp_state.control.wscale_enabled() && tcp_state.control.rcv_wnd > u16::MAX as u32 {
+                    tcp_state.control.rcv_wnd = u16::MAX as u32;
+                }
+
+                // R58: Compute scaled window for final handshake ACK
+                let handshake_adv_wnd = Self::current_adv_window(&tcp_state.control);
 
                 // Build ACK segment to complete 3-way handshake
                 let ack_segment = build_tcp_segment(
@@ -2775,7 +2954,7 @@ impl SocketTable {
                     tcp_state.control.snd_nxt,       // seq = our next seq
                     tcp_state.control.rcv_nxt,       // ack = their ISN + 1 + data
                     TCP_FLAG_ACK,
-                    TCP_DEFAULT_WINDOW,
+                    handshake_adv_wnd,
                     &[],
                 );
 
@@ -2795,11 +2974,8 @@ impl SocketTable {
                     return None;
                 }
 
-                // Calculate current advertised receive window
-                let advertised_wnd = tcp_state
-                    .control
-                    .rcv_wnd
-                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                // R58: Calculate scaled advertised receive window
+                let advertised_wnd = Self::current_adv_window(&tcp_state.control);
 
                 // R50-2 FIX: Validate ACK with wraparound-safe sequence comparisons
                 // ACK must be: snd_una <= ack_num <= snd_nxt
@@ -2821,7 +2997,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        advertised_wnd as u16,
+                        advertised_wnd,
                         &[],
                     );
                     drop(guard);
@@ -2835,41 +3011,64 @@ impl SocketTable {
                     // Update snd_una to acknowledge sent data and refresh RTT/RTO
                     let ack_update = handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
 
+                    // R58: Decode peer's advertised window once for both dup-ACK check and update
+                    let peer_adv_wnd = decode_window(
+                        header.window,
+                        tcp_state.control.effective_snd_wscale(),
+                    );
+
                     // RFC 5681 §3.2: Duplicate ACK definition
                     // A duplicate ACK must:
                     // - Have the same acknowledgment number as a previous ACK
                     // - Carry no data (payload empty)
                     // - NOT be a pure window update (window must be same as before)
                     // Segments with data or window changes are NOT duplicate ACKs
-                    let is_window_update = header.window as u32 != tcp_state.control.snd_wnd;
+                    let is_window_update = peer_adv_wnd != tcp_state.control.snd_wnd;
                     let is_pure_dup_ack = ack_update.duplicate && payload.is_empty() && !is_window_update;
 
                     // RFC 5681: Update congestion control and check for fast retransmit
+                    // R55-1: Pass ack_num for NewReno partial ACK detection
                     let action = update_congestion_control(
                         &mut tcp_state.control,
                         ack_update.newly_acked,
                         is_pure_dup_ack,
+                        header.ack_num,
                     );
 
-                    // Fast retransmit: resend first unacked segment on triple dup ACK
-                    if action == CongestionAction::FastRetransmit {
-                        if let Some(seg) = tcp_state.control.send_buffer.front_mut() {
-                            let flags = TCP_FLAG_ACK | if !seg.data.is_empty() { TCP_FLAG_PSH } else { 0 };
-                            seg.retrans_count = seg.retrans_count.saturating_add(1);
-                            seg.sent_at = self.time_wait_now();
+                    // Handle congestion control actions
+                    match action {
+                        // Fast retransmit or partial ACK retransmit: resend first unacked segment
+                        // R55-1: RetransmitNext handles NewReno partial ACK in fast recovery
+                        CongestionAction::FastRetransmit | CongestionAction::RetransmitNext => {
+                            if let Some(seg) = tcp_state.control.send_buffer.front_mut() {
+                                let flags = TCP_FLAG_ACK | if !seg.data.is_empty() { TCP_FLAG_PSH } else { 0 };
+                                seg.retrans_count = seg.retrans_count.saturating_add(1);
+                                let now = self.time_wait_now();
+                                seg.sent_at = now;
+                                tcp_state.control.last_activity = now;
 
-                            fast_retransmit_seg = Some(build_tcp_segment(
-                                dst_ip,
-                                src_ip,
-                                header.dst_port,
-                                header.src_port,
-                                seg.seq,
-                                tcp_state.control.rcv_nxt,
-                                flags,
-                                advertised_wnd as u16,
-                                &seg.data,
-                            ));
+                                fast_retransmit_seg = Some(build_tcp_segment(
+                                    dst_ip,
+                                    src_ip,
+                                    header.dst_port,
+                                    header.src_port,
+                                    seg.seq,
+                                    tcp_state.control.rcv_nxt,
+                                    flags,
+                                    advertised_wnd,
+                                    &seg.data,
+                                ));
+                            }
                         }
+                        // R56-1: RFC 3042 Limited Transmit - signal that new data can be sent.
+                        // The congestion control has determined conditions permit sending new data
+                        // beyond the normal cwnd limit. Wake any blocked senders to utilize this.
+                        CongestionAction::LimitedTransmit => {
+                            // Wake blocked tcp_send() callers to send more data if available.
+                            // Uses state_waiters as send window opening is similar to state change.
+                            sock.wake_tcp_waiters();
+                        }
+                        CongestionAction::None => {}
                     }
 
                     // R50-2 FIX: Use seq_gt/seq_ge for wraparound-safe window update (RFC 793)
@@ -2877,7 +3076,8 @@ impl SocketTable {
                         || (header.seq_num == tcp_state.control.snd_wl1
                             && seq_ge(header.ack_num, tcp_state.control.snd_wl2))
                     {
-                        tcp_state.control.snd_wnd = header.window as u32;
+                        // R58: Use pre-decoded peer window for update
+                        tcp_state.control.snd_wnd = peer_adv_wnd;
                         tcp_state.control.snd_wl1 = header.seq_num;
                         tcp_state.control.snd_wl2 = header.ack_num;
                     }
@@ -2891,7 +3091,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        advertised_wnd as u16,
+                        advertised_wnd,
                         &[],
                     );
                     drop(guard);
@@ -2920,7 +3120,7 @@ impl SocketTable {
                             tcp_state.control.snd_nxt,
                             tcp_state.control.rcv_nxt,
                             TCP_FLAG_ACK,
-                            window_after_ack as u16,
+                            Self::encode_adv_window(&tcp_state.control, window_after_ack),
                             &[],
                         );
                         return Some(dup_ack);
@@ -2936,7 +3136,7 @@ impl SocketTable {
                             tcp_state.control.snd_nxt,
                             tcp_state.control.rcv_nxt,
                             TCP_FLAG_ACK,
-                            window_after_ack as u16,
+                            Self::encode_adv_window(&tcp_state.control, window_after_ack),
                             &[],
                         );
                         return Some(win_ack);
@@ -2975,7 +3175,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        window_after as u16,
+                        Self::encode_adv_window(&tcp_state.control, window_after),
                         &[],
                     ));
                     data_received = true;
@@ -2993,7 +3193,7 @@ impl SocketTable {
                             tcp_state.control.snd_nxt,
                             tcp_state.control.rcv_nxt,
                             TCP_FLAG_ACK,
-                            advertised_wnd as u16,
+                            advertised_wnd,
                             &[],
                         );
                         return Some(dup_ack);
@@ -3016,7 +3216,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        window_after as u16,
+                        Self::encode_adv_window(&tcp_state.control, window_after),
                         &[],
                     );
 
@@ -3077,10 +3277,8 @@ impl SocketTable {
                     return None;
                 }
 
-                let advertised_wnd = tcp_state
-                    .control
-                    .rcv_wnd
-                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                // R58: Use scaled window advertisement
+                let advertised_wnd = Self::current_adv_window(&tcp_state.control);
                 let recv_wnd = tcp_state.control.rcv_wnd.max(1);
                 let seq_in_recv_window = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
 
@@ -3093,7 +3291,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        advertised_wnd as u16,
+                        advertised_wnd,
                         &[],
                     );
                     drop(guard);
@@ -3110,7 +3308,11 @@ impl SocketTable {
                         || (header.seq_num == tcp_state.control.snd_wl1
                             && seq_ge(header.ack_num, tcp_state.control.snd_wl2))
                     {
-                        tcp_state.control.snd_wnd = header.window as u32;
+                        // R58: Apply window scaling when updating send window
+                        tcp_state.control.snd_wnd = decode_window(
+                            header.window,
+                            tcp_state.control.effective_snd_wscale(),
+                        );
                         tcp_state.control.snd_wl1 = header.seq_num;
                         tcp_state.control.snd_wl2 = header.ack_num;
                     }
@@ -3123,7 +3325,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        advertised_wnd as u16,
+                        advertised_wnd,
                         &[],
                     );
                     drop(guard);
@@ -3158,7 +3360,7 @@ impl SocketTable {
                             tcp_state.control.snd_nxt,
                             tcp_state.control.rcv_nxt,
                             TCP_FLAG_ACK,
-                            window_after_ack as u16,
+                            Self::encode_adv_window(&tcp_state.control, window_after_ack),
                             &[],
                         );
                         return Some(dup_ack);
@@ -3173,7 +3375,7 @@ impl SocketTable {
                             tcp_state.control.snd_nxt,
                             tcp_state.control.rcv_nxt,
                             TCP_FLAG_ACK,
-                            window_after_ack as u16,
+                            Self::encode_adv_window(&tcp_state.control, window_after_ack),
                             &[],
                         );
                         return Some(win_ack);
@@ -3205,7 +3407,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        window_after as u16,
+                        Self::encode_adv_window(&tcp_state.control, window_after),
                         &[],
                     ));
                     data_received = true;
@@ -3223,7 +3425,7 @@ impl SocketTable {
                             tcp_state.control.snd_nxt,
                             tcp_state.control.rcv_nxt,
                             TCP_FLAG_ACK,
-                            advertised_wnd as u16,
+                            advertised_wnd,
                             &[],
                         );
                         return Some(dup_ack);
@@ -3260,7 +3462,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        window_after as u16,
+                        Self::encode_adv_window(&tcp_state.control, window_after),
                         &[],
                     );
 
@@ -3303,10 +3505,8 @@ impl SocketTable {
                     return None;
                 }
 
-                let advertised_wnd = tcp_state
-                    .control
-                    .rcv_wnd
-                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                // R58: Use scaled window advertisement
+                let advertised_wnd = Self::current_adv_window(&tcp_state.control);
                 let recv_wnd = tcp_state.control.rcv_wnd.max(1);
                 let seq_in_recv_window = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
 
@@ -3319,7 +3519,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        advertised_wnd as u16,
+                        advertised_wnd,
                         &[],
                     );
                     drop(guard);
@@ -3336,7 +3536,11 @@ impl SocketTable {
                         || (header.seq_num == tcp_state.control.snd_wl1
                             && seq_ge(header.ack_num, tcp_state.control.snd_wl2))
                     {
-                        tcp_state.control.snd_wnd = header.window as u32;
+                        // R58: Apply window scaling when updating send window
+                        tcp_state.control.snd_wnd = decode_window(
+                            header.window,
+                            tcp_state.control.effective_snd_wscale(),
+                        );
                         tcp_state.control.snd_wl1 = header.seq_num;
                         tcp_state.control.snd_wl2 = header.ack_num;
                     }
@@ -3349,7 +3553,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        advertised_wnd as u16,
+                        advertised_wnd,
                         &[],
                     );
                     drop(guard);
@@ -3375,7 +3579,7 @@ impl SocketTable {
                             tcp_state.control.snd_nxt,
                             tcp_state.control.rcv_nxt,
                             TCP_FLAG_ACK,
-                            window_after_ack as u16,
+                            Self::encode_adv_window(&tcp_state.control, window_after_ack),
                             &[],
                         );
                         return Some(dup_ack);
@@ -3390,7 +3594,7 @@ impl SocketTable {
                             tcp_state.control.snd_nxt,
                             tcp_state.control.rcv_nxt,
                             TCP_FLAG_ACK,
-                            window_after_ack as u16,
+                            Self::encode_adv_window(&tcp_state.control, window_after_ack),
                             &[],
                         );
                         return Some(win_ack);
@@ -3422,7 +3626,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        window_after as u16,
+                        Self::encode_adv_window(&tcp_state.control, window_after),
                         &[],
                     ));
                     data_received = true;
@@ -3440,7 +3644,7 @@ impl SocketTable {
                             tcp_state.control.snd_nxt,
                             tcp_state.control.rcv_nxt,
                             TCP_FLAG_ACK,
-                            advertised_wnd as u16,
+                            advertised_wnd,
                             &[],
                         );
                         return Some(dup_ack);
@@ -3462,7 +3666,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        window_after as u16,
+                        Self::encode_adv_window(&tcp_state.control, window_after),
                         &[],
                     );
 
@@ -3499,10 +3703,8 @@ impl SocketTable {
                     return None;
                 }
 
-                let advertised_wnd = tcp_state
-                    .control
-                    .rcv_wnd
-                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                // R58: Use scaled window advertisement
+                let advertised_wnd = Self::current_adv_window(&tcp_state.control);
                 let recv_wnd = tcp_state.control.rcv_wnd.max(1);
                 let seq_in_recv_window = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
 
@@ -3515,7 +3717,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        advertised_wnd as u16,
+                        advertised_wnd,
                         &[],
                     );
                     drop(guard);
@@ -3532,7 +3734,11 @@ impl SocketTable {
                         || (header.seq_num == tcp_state.control.snd_wl1
                             && seq_ge(header.ack_num, tcp_state.control.snd_wl2))
                     {
-                        tcp_state.control.snd_wnd = header.window as u32;
+                        // R58: Apply window scaling when updating send window
+                        tcp_state.control.snd_wnd = decode_window(
+                            header.window,
+                            tcp_state.control.effective_snd_wscale(),
+                        );
                         tcp_state.control.snd_wl1 = header.seq_num;
                         tcp_state.control.snd_wl2 = header.ack_num;
                     }
@@ -3545,7 +3751,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        advertised_wnd as u16,
+                        advertised_wnd,
                         &[],
                     );
                     drop(guard);
@@ -3567,7 +3773,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        window_after as u16,
+                        Self::encode_adv_window(&tcp_state.control, window_after),
                         &[],
                     );
 
@@ -3588,10 +3794,8 @@ impl SocketTable {
                     return None;
                 }
 
-                let advertised_wnd = tcp_state
-                    .control
-                    .rcv_wnd
-                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                // R58: Use scaled window advertisement
+                let advertised_wnd = Self::current_adv_window(&tcp_state.control);
                 let recv_wnd = tcp_state.control.rcv_wnd.max(1);
                 let seq_in_recv_window = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
 
@@ -3604,7 +3808,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        advertised_wnd as u16,
+                        advertised_wnd,
                         &[],
                     );
                     drop(guard);
@@ -3621,7 +3825,11 @@ impl SocketTable {
                         || (header.seq_num == tcp_state.control.snd_wl1
                             && seq_ge(header.ack_num, tcp_state.control.snd_wl2))
                     {
-                        tcp_state.control.snd_wnd = header.window as u32;
+                        // R58: Apply window scaling when updating send window
+                        tcp_state.control.snd_wnd = decode_window(
+                            header.window,
+                            tcp_state.control.effective_snd_wscale(),
+                        );
                         tcp_state.control.snd_wl1 = header.seq_num;
                         tcp_state.control.snd_wl2 = header.ack_num;
                     }
@@ -3634,7 +3842,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        advertised_wnd as u16,
+                        advertised_wnd,
                         &[],
                     );
                     drop(guard);
@@ -3658,7 +3866,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        window_after as u16,
+                        Self::encode_adv_window(&tcp_state.control, window_after),
                         &[],
                     ));
                 }
@@ -3696,10 +3904,8 @@ impl SocketTable {
                     return None;
                 }
 
-                let advertised_wnd = tcp_state
-                    .control
-                    .rcv_wnd
-                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                // R58: Use scaled window advertisement
+                let advertised_wnd = Self::current_adv_window(&tcp_state.control);
                 let recv_wnd = tcp_state.control.rcv_wnd.max(1);
                 let seq_in_recv_window = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
 
@@ -3712,7 +3918,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        advertised_wnd as u16,
+                        advertised_wnd,
                         &[],
                     );
                     drop(guard);
@@ -3729,7 +3935,11 @@ impl SocketTable {
                         || (header.seq_num == tcp_state.control.snd_wl1
                             && seq_ge(header.ack_num, tcp_state.control.snd_wl2))
                     {
-                        tcp_state.control.snd_wnd = header.window as u32;
+                        // R58: Apply window scaling when updating send window
+                        tcp_state.control.snd_wnd = decode_window(
+                            header.window,
+                            tcp_state.control.effective_snd_wscale(),
+                        );
                         tcp_state.control.snd_wl1 = header.seq_num;
                         tcp_state.control.snd_wl2 = header.ack_num;
                     }
@@ -3742,7 +3952,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        advertised_wnd as u16,
+                        advertised_wnd,
                         &[],
                     );
                     drop(guard);
@@ -3776,7 +3986,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        window_after as u16,
+                        Self::encode_adv_window(&tcp_state.control, window_after),
                         &[],
                     );
 
@@ -3791,10 +4001,8 @@ impl SocketTable {
             // TIME-WAIT: Wait for 2MSL before final cleanup
             // ================================================================
             TcpState::TimeWait => {
-                let advertised_wnd = tcp_state
-                    .control
-                    .rcv_wnd
-                    .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                // R58: Use scaled window advertisement
+                let advertised_wnd = Self::current_adv_window(&tcp_state.control);
                 let recv_wnd = tcp_state.control.rcv_wnd.max(1);
                 let seq_in_recv_window = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
 
@@ -3822,7 +4030,7 @@ impl SocketTable {
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
-                        window_after as u16,
+                        Self::encode_adv_window(&tcp_state.control, window_after),
                         &[],
                     ));
 
@@ -3894,10 +4102,22 @@ impl SocketTable {
 
                 // Handshake complete - transition to Established
                 handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
-                tcp_state.control.snd_wnd = header.window as u32;
+                // R58: Apply window scaling when updating send window
+                tcp_state.control.snd_wnd = decode_window(
+                    header.window,
+                    tcp_state.control.effective_snd_wscale(),
+                );
                 tcp_state.control.snd_wl1 = header.seq_num;
                 tcp_state.control.snd_wl2 = header.ack_num;
                 tcp_state.control.state = TcpState::Established;
+
+                // R58 FIX: RFC 793 semantics - if window scaling was not negotiated,
+                // cap receive window to 16 bits to avoid accepting more data than
+                // we can advertise without scaling. This ensures sequence/window
+                // checks remain consistent with advertised window.
+                if !tcp_state.control.wscale_enabled() && tcp_state.control.rcv_wnd > u16::MAX as u32 {
+                    tcp_state.control.rcv_wnd = u16::MAX as u32;
+                }
 
                 drop(guard);
 
@@ -4007,29 +4227,35 @@ impl SocketTable {
         let ack_update = handle_ack(tcb, ack_num, now_ms);
 
         // Update congestion control and check for fast retransmit
-        let action = update_congestion_control(tcb, ack_update.newly_acked, ack_update.duplicate);
+        // R55-1: Pass ack_num for NewReno partial ACK detection
+        let action = update_congestion_control(tcb, ack_update.newly_acked, ack_update.duplicate, ack_num);
 
-        if action != CongestionAction::FastRetransmit {
-            return None;
-        }
+        // Handle congestion control actions
+        match action {
+            // R55-1: Both FastRetransmit and RetransmitNext trigger segment retransmission
+            CongestionAction::FastRetransmit | CongestionAction::RetransmitNext => {
+                // Fast retransmit: resend first unacked segment
+                if let Some(seg) = tcb.send_buffer.front_mut() {
+                    let flags = TCP_FLAG_ACK | if !seg.data.is_empty() { TCP_FLAG_PSH } else { 0 };
+                    seg.retrans_count = seg.retrans_count.saturating_add(1);
+                    seg.sent_at = now_ms;
+                    tcb.last_activity = now_ms;
 
-        // Fast retransmit: resend first unacked segment
-        if let Some(seg) = tcb.send_buffer.front_mut() {
-            let flags = TCP_FLAG_ACK | if !seg.data.is_empty() { TCP_FLAG_PSH } else { 0 };
-            seg.retrans_count = seg.retrans_count.saturating_add(1);
-            seg.sent_at = now_ms;
-
-            return Some(build_tcp_segment(
-                local_ip,
-                remote_ip,
-                local_port,
-                remote_port,
-                seg.seq,
-                tcb.rcv_nxt,
-                flags,
-                advertised_wnd,
-                &seg.data,
-            ));
+                    return Some(build_tcp_segment(
+                        local_ip,
+                        remote_ip,
+                        local_port,
+                        remote_port,
+                        seg.seq,
+                        tcb.rcv_nxt,
+                        flags,
+                        advertised_wnd,
+                        &seg.data,
+                    ));
+                }
+            }
+            // R56-1: Limited Transmit - no segment to build here, caller handles wake
+            CongestionAction::LimitedTransmit | CongestionAction::None => {}
         }
 
         None
@@ -4180,10 +4406,8 @@ impl SocketTable {
                     {
                         let rto = tcp_state.control.rto_ms;
                         let ack = tcp_state.control.rcv_nxt;
-                        let advertised_wnd = tcp_state
-                            .control
-                            .rcv_wnd
-                            .saturating_sub(tcp_state.control.recv_buffer.len() as u32) as u16;
+                        // R58: Use scaled window advertisement
+                        let advertised_wnd = Self::current_adv_window(&tcp_state.control);
 
                         // RFC 5681 §3.1: On RTO, check if FIRST unacked segment has timed out
                         // If so, enter loss recovery FIRST (cwnd = 1*SMSS), then retransmit
@@ -4224,6 +4448,9 @@ impl SocketTable {
                                 // Update segment tracking
                                 first_seg.retrans_count = first_seg.retrans_count.saturating_add(1);
                                 first_seg.sent_at = current_time_ms;
+
+                                // R57-1: Update activity timestamp for idle detection
+                                tcp_state.control.last_activity = current_time_ms;
 
                                 data_retransmit.push((remote_ip, seg_bytes));
                             }
@@ -4310,7 +4537,7 @@ impl SocketTable {
                                     seq,
                                     ack,
                                     TCP_FLAG_FIN | TCP_FLAG_ACK,
-                                    window_after as u16,
+                                    Self::encode_adv_window(&tcp_state.control, window_after),
                                     &[],
                                 );
 
