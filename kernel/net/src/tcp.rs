@@ -78,7 +78,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use spin::{Mutex, RwLock};
+use spin::{Mutex, Once, RwLock};
 
 use crate::ipv4::{compute_checksum, Ipv4Addr};
 
@@ -103,6 +103,72 @@ pub const TCP_ETHERNET_MSS: u16 = 1460;
 
 /// Default receive window size (unscaled, for compatibility)
 pub const TCP_DEFAULT_WINDOW: u16 = 65535;
+
+// ============================================================================
+// SYN Cookie Constants (RFC 4987)
+// ============================================================================
+
+/// Supported MSS values encoded in SYN cookies (3 bits => 8 slots).
+///
+/// These are sorted in ascending order. When generating a cookie, we select
+/// the largest value that doesn't exceed the peer's offered MSS.
+///
+/// # Security Consideration
+///
+/// SYN cookies lose MSS precision (only 8 values supported). The table covers
+/// common network paths from small MTU links to Ethernet. Window scaling
+/// information is not preserved in cookies (limitation of the protocol).
+pub const TCP_SYN_COOKIE_MSS_TABLE: [u16; 8] = [
+    256,               // Minimum practical MSS
+    TCP_DEFAULT_MSS,   // 536 - RFC 879 default
+    576,               // Common older networks
+    1024,              // Intermediate networks
+    1200,              // Conservative Ethernet estimate
+    1360,              // PPPoE/VPN overhead adjustment
+    1400,              // Common datacenter setting
+    TCP_ETHERNET_MSS,  // 1460 - Full Ethernet
+];
+
+/// Time granularity for SYN cookie timestamps (milliseconds).
+///
+/// Coarser granularity (4 seconds) allows more time slots in fewer bits
+/// while still providing reasonable protection against replay attacks.
+pub const TCP_SYN_COOKIE_TIME_GRANULARITY_MS: u64 = 4_000;
+
+/// Maximum age for a valid SYN cookie (milliseconds).
+///
+/// Cookies older than this are rejected to prevent replay attacks.
+/// 120 seconds allows for slow networks with high packet loss while
+/// limiting the attack window.
+pub const TCP_SYN_COOKIE_MAX_AGE_MS: u64 = 120_000;
+
+/// Secret rotation period for SYN cookie MAC (milliseconds).
+///
+/// The secret is rotated every 5 minutes. During rotation, both the
+/// current and previous secrets are accepted to handle in-flight packets.
+const TCP_SYN_COOKIE_SECRET_ROTATE_MS: u64 = 300_000;
+
+/// Bit width for time slot in SYN cookie (6 bits = 64 slots × 4 sec = 256 sec range).
+const TCP_SYN_COOKIE_TIME_BITS: u32 = 6;
+
+/// Bit width for MSS index in SYN cookie (3 bits = 8 MSS options).
+const TCP_SYN_COOKIE_MSS_BITS: u32 = 3;
+
+/// Bit width for MAC in SYN cookie (remaining 23 bits).
+const TCP_SYN_COOKIE_MAC_BITS: u32 = 32 - TCP_SYN_COOKIE_TIME_BITS - TCP_SYN_COOKIE_MSS_BITS;
+
+/// Bitmask for time slot extraction.
+const TCP_SYN_COOKIE_TIME_MASK: u32 = (1 << TCP_SYN_COOKIE_TIME_BITS) - 1;
+
+/// Bitmask for MSS index extraction.
+const TCP_SYN_COOKIE_MSS_MASK: u32 = (1 << TCP_SYN_COOKIE_MSS_BITS) - 1;
+
+/// Bitmask for MAC extraction.
+const TCP_SYN_COOKIE_MAC_MASK: u32 = (1 << TCP_SYN_COOKIE_MAC_BITS) - 1;
+
+/// Maximum valid age in time slots for SYN cookie validation.
+const TCP_SYN_COOKIE_MAX_AGE_SLOTS: u32 =
+    (TCP_SYN_COOKIE_MAX_AGE_MS / TCP_SYN_COOKIE_TIME_GRANULARITY_MS) as u32;
 
 // ============================================================================
 // Window Scaling Constants (RFC 7323)
@@ -1882,6 +1948,368 @@ pub fn generate_isn(
 
     // Fold 64-bit result to 32-bit
     (final_mix >> 32) as u32 ^ final_mix as u32
+}
+
+// ============================================================================
+// SYN Cookies (RFC 4987)
+// ============================================================================
+//
+// SYN cookies provide SYN flood protection without allocating per-connection
+// state for half-open connections. When the SYN backlog is full, we encode
+// connection parameters into the ISN of the SYN-ACK:
+//
+// ISN Format (32 bits):
+// +------------------------+-----------+------------+
+// |     MAC (23 bits)      | Time (6b) | MSS (3b)   |
+// +------------------------+-----------+------------+
+//
+// On receiving the final ACK, we validate the cookie by recomputing the MAC
+// and checking the time slot hasn't expired.
+//
+// Limitations:
+// - Window scaling information is lost (reverts to no scaling)
+// - Only 8 MSS values supported (reduced precision)
+// - SACK/Timestamps cannot be negotiated
+//
+// Security Properties:
+// - CSPRNG-seeded secret rotated every 5 minutes
+// - 23-bit MAC provides ~8 million possible values (brute force resistant)
+// - 2-minute validity window limits replay attacks
+// - Dual-secret system handles rotation gracefully
+
+/// Decoded data from a validated SYN cookie.
+///
+/// Contains the recovered connection parameters for establishing the TCB.
+#[derive(Debug, Clone, Copy)]
+pub struct SynCookieData {
+    /// Initial Sequence Number (the cookie value)
+    pub iss: u32,
+    /// MSS table index (0-7)
+    pub mss_index: u8,
+    /// Recovered MSS value from table
+    pub mss: u16,
+}
+
+/// SYN cookie secret state with rotation support.
+///
+/// Maintains current and previous secrets for graceful rotation.
+/// In-flight SYN-ACKs using the previous secret remain valid during
+/// the transition period.
+struct SynCookieSecrets {
+    /// Current active secret for new cookies
+    current: u64,
+    /// Previous secret accepted during rotation grace period
+    previous: u64,
+    /// Timestamp of last rotation (milliseconds)
+    last_rotated_ms: u64,
+}
+
+impl SynCookieSecrets {
+    /// Create new secrets initialized from CSPRNG or fallback.
+    fn new(now_ms: u64) -> Self {
+        let key = syn_cookie_get_key();
+        Self {
+            current: key,
+            // Initialize previous as derived from current (different value)
+            previous: key.rotate_left(17) ^ 0xA5A5_A5A5_A5A5_A5A5,
+            last_rotated_ms: now_ms,
+        }
+    }
+
+    /// Get current and previous secrets, rotating if necessary.
+    ///
+    /// Rotation occurs when the secret age exceeds TCP_SYN_COOKIE_SECRET_ROTATE_MS.
+    /// Both secrets are returned to allow validation of cookies generated with
+    /// either the current or previous secret.
+    fn get_secrets(&mut self, now_ms: u64) -> (u64, u64) {
+        let elapsed = now_ms.saturating_sub(self.last_rotated_ms);
+        if elapsed > TCP_SYN_COOKIE_SECRET_ROTATE_MS {
+            // Rotate: current becomes previous, generate new current
+            self.previous = self.current;
+            self.current = syn_cookie_get_key();
+            self.last_rotated_ms = now_ms;
+        }
+        (self.current, self.previous)
+    }
+}
+
+/// Global SYN cookie secrets storage.
+static SYN_COOKIE_SECRETS: Once<Mutex<SynCookieSecrets>> = Once::new();
+
+/// Get the SYN cookie secrets state, initializing if necessary.
+#[inline]
+fn syn_cookie_state(now_ms: u64) -> &'static Mutex<SynCookieSecrets> {
+    SYN_COOKIE_SECRETS.call_once(|| Mutex::new(SynCookieSecrets::new(now_ms)));
+    SYN_COOKIE_SECRETS
+        .get()
+        .expect("SYN cookie secrets must be initialized")
+}
+
+/// Get a random key for SYN cookie generation.
+///
+/// Attempts to use CSPRNG; falls back to ISN secret if unavailable.
+#[inline]
+fn syn_cookie_get_key() -> u64 {
+    security::rng::random_u64().unwrap_or_else(|_| isn_secret())
+}
+
+/// Parameters for SYN cookie MAC computation.
+///
+/// Packs the 4-tuple and encoded values for hashing.
+#[derive(Clone, Copy)]
+struct SynCookieMacParams {
+    /// Packed local and remote IP addresses
+    tuple_ip: u64,
+    /// Packed local and remote ports
+    tuple_ports: u64,
+    /// Time slot (6 bits)
+    time_slot: u8,
+    /// MSS table index (3 bits)
+    mss_index: u8,
+}
+
+impl SynCookieMacParams {
+    /// Create MAC parameters from connection 4-tuple and encoded values.
+    fn new(
+        local_ip: Ipv4Addr,
+        local_port: u16,
+        remote_ip: Ipv4Addr,
+        remote_port: u16,
+        time_slot: u8,
+        mss_index: u8,
+    ) -> Self {
+        let tuple_ip = u64::from_be_bytes([
+            local_ip.0[0], local_ip.0[1], local_ip.0[2], local_ip.0[3],
+            remote_ip.0[0], remote_ip.0[1], remote_ip.0[2], remote_ip.0[3],
+        ]);
+        let tuple_ports = ((local_port as u64) << 48) | ((remote_port as u64) << 32);
+        Self {
+            tuple_ip,
+            tuple_ports,
+            time_slot,
+            mss_index,
+        }
+    }
+}
+
+/// Compute SYN cookie MAC using SipHash-like mixing.
+///
+/// Returns a 23-bit MAC value for cookie verification.
+///
+/// # Security
+///
+/// Uses multiple rounds of multiply-rotate-xor mixing for avalanche effect.
+/// The secret provides keying; the parameters provide domain separation.
+#[inline]
+fn syn_cookie_compute_mac(secret: u64, params: &SynCookieMacParams) -> u32 {
+    // Mix secret with parameters using SipHash-like rounds
+    let mut v0 = secret
+        .rotate_left(7)
+        ^ params.tuple_ip
+        ^ ((params.time_slot as u64) << 24);
+    let mut v1 = secret
+        .rotate_right(11)
+        ^ params.tuple_ports
+        ^ ((params.mss_index as u64) << 8);
+
+    // Round 1
+    v0 = v0
+        .wrapping_add(v1 ^ 0x9E37_79B9_7F4A_7C15)
+        .rotate_left(17);
+    v1 ^= v0.rotate_right(19);
+
+    // Round 2
+    let mix = v0.wrapping_add(v1).rotate_left(23) ^ v1;
+
+    // Fold to 23 bits
+    ((mix as u32) ^ ((mix >> 32) as u32)) & TCP_SYN_COOKIE_MAC_MASK
+}
+
+/// Select the best MSS index for SYN cookie encoding.
+///
+/// Given a peer's offered MSS (or None for default), returns the index into
+/// TCP_SYN_COOKIE_MSS_TABLE and the corresponding MSS value to advertise.
+///
+/// # Algorithm
+///
+/// Selects the largest table entry that doesn't exceed the offered MSS.
+/// This ensures we don't send segments larger than the peer can handle.
+///
+/// # Arguments
+///
+/// * `offered` - The MSS value from the peer's SYN, or None if not specified
+///
+/// # Returns
+///
+/// A tuple of (table_index, mss_value) where table_index can be encoded
+/// in 3 bits and mss_value is the actual MSS to use.
+pub fn syn_cookie_select_mss(offered: Option<u16>) -> (u8, u16) {
+    let target = offered.unwrap_or(TCP_ETHERNET_MSS);
+    let mut best_index = 0usize;
+
+    // Find the largest MSS that doesn't exceed the offered value
+    for (i, &candidate) in TCP_SYN_COOKIE_MSS_TABLE.iter().enumerate() {
+        if candidate <= target {
+            best_index = i;
+        } else {
+            // Table is sorted, no need to check further
+            break;
+        }
+    }
+
+    (best_index as u8, TCP_SYN_COOKIE_MSS_TABLE[best_index])
+}
+
+/// Generate a SYN cookie ISN for stateless SYN-ACK.
+///
+/// When the SYN backlog is full, this function generates an ISN that encodes:
+/// - 23 bits: MAC over (4-tuple, time_slot, mss_index, secret)
+/// - 6 bits: Current time slot (4-second granularity)
+/// - 3 bits: MSS index into TCP_SYN_COOKIE_MSS_TABLE
+///
+/// # Arguments
+///
+/// * `now_ms` - Current timestamp in milliseconds
+/// * `local_ip` - Local (server) IP address
+/// * `local_port` - Local (server) port
+/// * `remote_ip` - Remote (client) IP address
+/// * `remote_port` - Remote (client) port
+/// * `mss_index` - Index into MSS table (from syn_cookie_select_mss)
+///
+/// # Returns
+///
+/// The 32-bit ISN to use in the SYN-ACK segment.
+///
+/// # Security
+///
+/// The MAC provides authentication - only the server with the secret can
+/// generate valid cookies. The time slot prevents replay attacks beyond
+/// the validity window.
+pub fn generate_syn_cookie_isn(
+    now_ms: u64,
+    local_ip: Ipv4Addr,
+    local_port: u16,
+    remote_ip: Ipv4Addr,
+    remote_port: u16,
+    mss_index: u8,
+) -> u32 {
+    // Compute current time slot (wrapping within 6-bit range)
+    let time_slot = ((now_ms / TCP_SYN_COOKIE_TIME_GRANULARITY_MS) as u32)
+        & TCP_SYN_COOKIE_TIME_MASK;
+
+    // Build MAC parameters
+    let params = SynCookieMacParams::new(
+        local_ip,
+        local_port,
+        remote_ip,
+        remote_port,
+        time_slot as u8,
+        mss_index,
+    );
+
+    // Get current secret (with rotation check)
+    let (current_secret, _) = {
+        let mut guard = syn_cookie_state(now_ms).lock();
+        guard.get_secrets(now_ms)
+    };
+
+    // Compute MAC
+    let mac = syn_cookie_compute_mac(current_secret, &params);
+
+    // Pack into ISN: [MAC (23 bits)][Time (6 bits)][MSS (3 bits)]
+    let data_bits = ((time_slot & TCP_SYN_COOKIE_TIME_MASK)
+        << TCP_SYN_COOKIE_MSS_BITS)
+        | (mss_index as u32 & TCP_SYN_COOKIE_MSS_MASK);
+    (mac << (TCP_SYN_COOKIE_TIME_BITS + TCP_SYN_COOKIE_MSS_BITS)) | data_bits
+}
+
+/// Validate a SYN cookie from an incoming ACK and recover connection parameters.
+///
+/// When we receive an ACK completing the handshake but have no half-open
+/// connection state, we attempt to validate it as a SYN cookie response.
+///
+/// # Arguments
+///
+/// * `now_ms` - Current timestamp in milliseconds
+/// * `cookie_isn` - The ISN we sent in the SYN-ACK (ACK number - 1)
+/// * `local_ip` - Local (server) IP address
+/// * `local_port` - Local (server) port
+/// * `remote_ip` - Remote (client) IP address
+/// * `remote_port` - Remote (client) port
+///
+/// # Returns
+///
+/// * `Some(SynCookieData)` if the cookie is valid and not expired
+/// * `None` if the cookie is invalid, expired, or malformed
+///
+/// # Security
+///
+/// Validates the cookie against both current and previous secrets to handle
+/// rotation gracefully. The time slot is checked against the maximum age
+/// to prevent replay attacks. The MSS index is bounds-checked.
+pub fn validate_syn_cookie(
+    now_ms: u64,
+    cookie_isn: u32,
+    local_ip: Ipv4Addr,
+    local_port: u16,
+    remote_ip: Ipv4Addr,
+    remote_port: u16,
+) -> Option<SynCookieData> {
+    // Extract encoded fields from cookie
+    let mss_index = (cookie_isn & TCP_SYN_COOKIE_MSS_MASK) as usize;
+    if mss_index >= TCP_SYN_COOKIE_MSS_TABLE.len() {
+        return None;
+    }
+
+    let time_slot = (cookie_isn >> TCP_SYN_COOKIE_MSS_BITS) & TCP_SYN_COOKIE_TIME_MASK;
+    let received_mac = cookie_isn >> (TCP_SYN_COOKIE_TIME_BITS + TCP_SYN_COOKIE_MSS_BITS);
+
+    // Check age (with wraparound handling)
+    let now_slot = ((now_ms / TCP_SYN_COOKIE_TIME_GRANULARITY_MS) as u32)
+        & TCP_SYN_COOKIE_TIME_MASK;
+    let age_slots = now_slot.wrapping_sub(time_slot) & TCP_SYN_COOKIE_TIME_MASK;
+    if age_slots > TCP_SYN_COOKIE_MAX_AGE_SLOTS {
+        return None;
+    }
+
+    // Build MAC parameters
+    let params = SynCookieMacParams::new(
+        local_ip,
+        local_port,
+        remote_ip,
+        remote_port,
+        time_slot as u8,
+        mss_index as u8,
+    );
+
+    // Get both secrets for rotation grace period
+    let (current_secret, previous_secret) = {
+        let mut guard = syn_cookie_state(now_ms).lock();
+        guard.get_secrets(now_ms)
+    };
+
+    // Verify MAC against current secret
+    let expected_mac = syn_cookie_compute_mac(current_secret, &params);
+    if received_mac == expected_mac {
+        return Some(SynCookieData {
+            iss: cookie_isn,
+            mss_index: mss_index as u8,
+            mss: TCP_SYN_COOKIE_MSS_TABLE[mss_index],
+        });
+    }
+
+    // Try previous secret (for rotation grace period)
+    let expected_mac_prev = syn_cookie_compute_mac(previous_secret, &params);
+    if received_mac == expected_mac_prev {
+        return Some(SynCookieData {
+            iss: cookie_isn,
+            mss_index: mss_index as u8,
+            mss: TCP_SYN_COOKIE_MSS_TABLE[mss_index],
+        });
+    }
+
+    // Invalid cookie
+    None
 }
 
 // ============================================================================

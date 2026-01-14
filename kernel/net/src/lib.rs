@@ -30,6 +30,7 @@
 #![no_std]
 
 extern crate alloc;
+extern crate security;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -43,6 +44,7 @@ pub mod arp;
 pub mod buffer;
 pub mod device;
 pub mod ethernet;
+pub mod fragment;
 pub mod icmp;
 pub mod ipv4;
 mod pci;
@@ -69,7 +71,7 @@ pub use ethernet::{
     ETHERTYPE_IPV4, ETHERTYPE_ARP,
 };
 pub use stack::{
-    process_frame, network_config, transmit_tcp_segment, transmit_udp_datagram,
+    process_frame, network_config, transmit_tcp_segment, transmit_udp_datagram, handle_timer_tick,
     DropReason, NetConfigSnapshot, NetStats, ProcessResult,
 };
 pub use virtio_net::VirtioNetDevice;
@@ -88,6 +90,7 @@ pub use tcp::{
     verify_tcp_checksum, generate_isn, seq_lt, seq_le, seq_gt, seq_ge, seq_in_window,
     update_rtt, handle_ack, update_congestion_control, handle_retransmission_timeout,
     validate_cwnd_after_idle, initial_cwnd, calc_wscale, decode_window, encode_window,
+    generate_syn_cookie_isn, validate_syn_cookie, syn_cookie_select_mss, SynCookieData,
     TcpHeader, TcpOptions, TcpOptionKind, TcpState, TcpCongestionState, TcpControlBlock,
     TcpConnKey, TcpSegment, AckUpdate, CongestionAction, TcpError, TcpResult, TcpStats,
     TCP_HEADER_MIN_LEN, TCP_HEADER_MAX_LEN, TCP_PROTO, TCP_DEFAULT_MSS, TCP_ETHERNET_MSS,
@@ -95,11 +98,17 @@ pub use tcp::{
     TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_ACCEPT_BACKLOG, TCP_INITIAL_SSTHRESH,
     TCP_MAX_WINDOW_SCALE, TCP_MAX_SCALED_WINDOW, TCP_DEFAULT_RCV_WINDOW_BYTES, TCP_DEFAULT_WINDOW,
     TCP_FLAG_FIN, TCP_FLAG_SYN, TCP_FLAG_RST, TCP_FLAG_PSH, TCP_FLAG_ACK, TCP_FLAG_URG,
+    TCP_SYN_COOKIE_MSS_TABLE, TCP_SYN_COOKIE_MAX_AGE_MS,
 };
 pub use socket::{
     socket_table, register_socket_wait_hooks, PendingDatagram, SocketDomain, SocketError,
     SocketLabel, SocketProtocol, SocketState, SocketStats, SocketTable, SocketType,
     SocketWaitHooks, TableStats, TcpConnectResult, WaitOutcome, WaitQueue,
+};
+pub use fragment::{
+    process_fragment, cleanup_expired_fragments, fragment_cache,
+    FragmentCache, FragmentDropReason, FragmentKey, FragmentStats,
+    FRAG_TIMEOUT_MS, MAX_PACKET_SIZE, MAX_FRAGS_PER_QUEUE,
 };
 
 // ============================================================================

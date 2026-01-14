@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-12
+**Last Updated:** 2026-01-13
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -10,10 +10,10 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ## Executive Summary
 
-### Current Status: Phase D.2 In Progress (TCP Reliable Transport Complete)
+### Current Status: Phase D.3 In Progress (SYN Cookies Complete)
 
 Zero-OS has completed storage foundation and is building network infrastructure:
-- **58 security audits** with 252 issues found, ~219 fixed (87%)
+- **61 security audits** with 266 issues found, ~233 fixed (87.6%)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -22,12 +22,15 @@ Zero-OS has completed storage foundation and is building network infrastructure:
 - **Phase B**: ✅ **COMPLETE** (Cap/LSM/Seccomp integrated into syscall paths)
 - **Phase C**: ✅ **COMPLETE** (virtio-blk, page cache, ext2, procfs, OOM killer, openat2, devfs read/write)
 - **Phase D.1**: ✅ **COMPLETE** (virtio crate, NetDevice trait, virtio-net driver MVP)
-- **Phase D.2**: TCP client/server complete (connect/listen/accept/send/recv/shutdown/close), retransmission with RFC 6298 RTT
+- **Phase D.2**: ✅ **COMPLETE** (TCP client/server, retransmission with RFC 6298 RTT)
 - **R54**: ISN secret auto-upgrade ✅, Challenge ACK rate limiting ✅
 - **R55**: NewReno congestion control ✅ (RFC 6582 partial ACK handling)
 - **R56**: Limited Transmit ✅ (RFC 3042 adapted for immediate-send architecture)
 - **R57**: Idle cwnd validation ✅ (RFC 2861 stale burst prevention)
 - **R58**: Window Scaling ✅ (RFC 7323 WSopt negotiation, up to 256KB windows)
+- **R59**: Ephemeral port randomization ✅ (RFC 6056 CSPRNG)
+- **R60**: IP fragment reassembly ✅ (RFC 791/815/5722 security hardening)
+- **R61**: SYN cookies ✅ (RFC 4987 stateless SYN flood protection)
 
 ### Gap Analysis vs Linux Kernel
 
@@ -35,7 +38,7 @@ Zero-OS has completed storage foundation and is building network infrastructure:
 |----------|-------|---------|-----|
 | **SMP** | 256+ CPUs | Single-core | Full implementation needed |
 | **Security Framework** | LSM/SELinux/AppArmor | LSM + Seccomp + Capabilities | ✅ Framework complete, policies needed |
-| **Network** | Full TCP/IP stack | TCP (w/retransmission + NewReno CC + Window Scaling), UDP, ICMP | SACK, Timestamps |
+| **Network** | Full TCP/IP stack | TCP (w/retransmission + NewReno CC + Window Scaling + SYN cookies), UDP, ICMP | SACK, Timestamps, Conntrack |
 | **Storage** | ext4/xfs/btrfs/zfs | virtio-blk + ext2 + procfs | Extended FS support needed |
 | **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard/VirtIO | Driver framework needed |
 | **Containers** | Namespaces/Cgroups | Not started | Full implementation needed |
@@ -471,7 +474,7 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] **R58 IMPLEMENTED**: Window Scaling (RFC 7323) - WSopt negotiation, 256KB default window
 - [x] TCP FIN/close states (graceful shutdown) - sys_shutdown, all RFC 793 states
 - [x] **R51-1 FIXED**: TCP listen/accept (passive open) - SYN/accept queues implemented
-- [ ] Fragment reassembly with limits
+- [x] **R60 IMPLEMENTED**: Fragment reassembly with RFC 791/815/5722 security hardening
 - [x] **R51-2 FIXED**: Cap TCP sendto allocation (prevent OOM DoS)
 - [x] **R51-3 FIXED**: Ignore SYN-ACK payload (set rcv_nxt = seq+1 only)
 - [x] **R51-4 FIXED**: Rollback socket/cap on fd exhaustion
@@ -489,10 +492,12 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] ISN randomization (RFC 6528) - R50-1 keyed hash
 - [x] **R54-1 FIXED**: ISN secret auto-upgrade (weak→strong once CSPRNG ready)
 - [x] **R54-2 FIXED**: Challenge ACK rate limiting (100/sec token bucket)
+- [x] **R59-1 IMPLEMENTED**: Ephemeral port randomization (RFC 6056 style CSPRNG)
+- [x] **R59-2 FIXED**: CSPRNG fallback uses RDTSC mixing (not predictable counter)
+- [x] **R60 IMPLEMENTED**: Fragment reassembly anti-DoS (per-source limits, overlap rejection)
+- [x] **R61 IMPLEMENTED**: SYN cookies (RFC 4987) - stateless SYN-ACK on backlog full
 - [ ] Conntrack state machine
-- [ ] SYN cookies
 - [ ] Basic firewall (match + action table)
-- [ ] Ephemeral port randomization
 
 #### D.4 Socket API ✅ COMPLETE
 
@@ -708,17 +713,19 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-10 | 51 | 6 | 6 | TCP resource mgmt, listen/accept - **ALL R51 FIXED** |
 | 2026-01-11 | 52-53 | 6 | 6 | SYN queue timeout, listener cleanup, RTT/RTO, timer granularity - **ALL FIXED** |
 | 2026-01-12 | 54-58 | 12 | 10 | ISN upgrade, Challenge ACK, NewReno, Limited Transmit, Idle cwnd, Window Scaling - **2 DEFERRED** |
-| **Total** | **58** | **252** | **219 (87%)** | **33 open (SMP-related, SYN cookies)** |
+| 2026-01-13 | 59 | 2 | 2 | Ephemeral port randomization, CSPRNG fallback security - **ALL FIXED** |
+| 2026-01-13 | 60 | 10 | 10 | IP fragment reassembly (RFC 791/815/5722), security hardening - **ALL FIXED** |
+| 2026-01-13 | 61 | 2 | 2 | SYN cookies (RFC 4987), ACK validation, pure ACK enforcement - **ALL FIXED** |
+| **Total** | **61** | **266** | **233 (87.6%)** | **33 open (SMP-related)** |
 
 ### Current Status
 
-- **Fixed**: 219 issues (87%)
-- **Open**: 33 issues (13%)
+- **Fixed**: 233 issues (87.6%)
+- **Open**: 33 issues (12.4%)
   - SMP-related issues deferred to Phase E
-  - SYN cookies deferred to Phase D.3
-  - No open TCP issues blocking current phase
+  - No open TCP/network issues blocking current phase
 
-See [qa-2026-01-12.md](review/qa-2026-01-12.md) for latest audit report.
+See [qa-2026-01-13-v3.md](review/qa-2026-01-13-v3.md) for latest audit report.
 
 ---
 

@@ -44,6 +44,7 @@ use crate::arp::{process_arp, ArpCache, ArpEntryKind, ArpError, ArpResult, ArpSt
 use crate::buffer::NetBuf;
 use crate::device::TxError;
 use crate::ethernet::{parse_ethernet, build_ethernet_frame, EthAddr, EthHeader, ETHERTYPE_IPV4, ETHERTYPE_ARP};
+use crate::fragment::{process_fragment as reassemble_fragment, cleanup_expired_fragments, FragmentDropReason};
 use crate::get_device;
 use crate::icmp::{build_echo_reply, parse_icmp, IcmpError, ICMP_RATE_LIMITER, ICMP_TYPE_ECHO_REQUEST};
 use crate::ipv4::{
@@ -78,6 +79,12 @@ pub struct NetStats {
     pub rate_limited: AtomicU64,
     /// Packets dropped due to unsupported protocol
     pub unsupported_proto: AtomicU64,
+    /// IP fragments received
+    pub fragments_rx: AtomicU64,
+    /// Successfully reassembled datagrams
+    pub fragments_reassembled: AtomicU64,
+    /// Fragments dropped (security limits, overlap, etc.)
+    pub fragments_dropped: AtomicU64,
     /// ARP statistics
     pub arp_stats: ArpStats,
     /// UDP statistics
@@ -96,6 +103,9 @@ impl NetStats {
             icmp_echo_tx: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
             unsupported_proto: AtomicU64::new(0),
+            fragments_rx: AtomicU64::new(0),
+            fragments_reassembled: AtomicU64::new(0),
+            fragments_dropped: AtomicU64::new(0),
             arp_stats: ArpStats::new(),
             udp_stats: UdpStats::new(),
         }
@@ -140,6 +150,21 @@ impl NetStats {
     fn inc_unsupported_proto(&self) {
         self.unsupported_proto.fetch_add(1, Ordering::Relaxed);
     }
+
+    #[inline]
+    fn inc_fragments_rx(&self) {
+        self.fragments_rx.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn inc_fragments_reassembled(&self) {
+        self.fragments_reassembled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn inc_fragments_dropped(&self) {
+        self.fragments_dropped.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // ============================================================================
@@ -172,6 +197,8 @@ pub enum DropReason {
     UdpError(UdpError),
     /// TCP processing error
     TcpError(TcpError),
+    /// Fragment reassembly error
+    FragmentError(FragmentDropReason),
     /// Unsupported EtherType
     UnsupportedEtherType,
     /// Unsupported IP protocol
@@ -264,28 +291,7 @@ fn process_ipv4(
 ) -> ProcessResult {
     stats.inc_ipv4_rx();
 
-    // R48-6 FIX: Early fragment filter BEFORE expensive checksum/options parsing.
-    //
-    // Without this filter, an attacker can send floods of minimal-size fragmented
-    // packets that trigger full parse_ipv4() processing (checksum verification,
-    // options walk) only to be discarded later when we detect the fragment.
-    // This wastes CPU and enables a low-effort DoS attack.
-    //
-    // IPv4 header bytes 6-7 contain:
-    // - Bits 0-2: Flags (bit 1 = DF, bit 2 = MF = More Fragments)
-    // - Bits 3-15: Fragment Offset (in 8-byte units)
-    //
-    // If MF flag is set OR fragment offset is non-zero, it's a fragment.
-    // Mask 0x3FFF covers MF flag + fragment offset.
-    if packet.len() >= IPV4_HEADER_MIN_LEN {
-        let flags_fragment = u16::from_be_bytes([packet[6], packet[7]]);
-        if flags_fragment & 0x3FFF != 0 {
-            // Fragment detected - drop early without full parsing
-            return ProcessResult::Handled;
-        }
-    }
-
-    // Parse and validate IPv4 header (now guaranteed to be non-fragment)
+    // Parse and validate IPv4 header first
     let (ip_hdr, _options, payload) = match parse_ipv4(packet) {
         Ok(result) => result,
         Err(e) => {
@@ -303,24 +309,44 @@ fn process_ipv4(
         return ProcessResult::Handled;
     }
 
-    // Don't respond to fragments (we don't do reassembly yet)
-    if ip_hdr.is_fragment() {
-        return ProcessResult::Handled;
-    }
+    // Fragment handling with secure reassembly
+    // R48-6 + R60: Process fragments through reassembly cache with anti-DoS limits
+    let final_payload = if ip_hdr.is_fragment() {
+        stats.inc_fragments_rx();
+        match reassemble_fragment(&ip_hdr, payload, now_ms) {
+            Ok(Some(reassembled)) => {
+                // Reassembly complete - use the reassembled payload
+                stats.inc_fragments_reassembled();
+                reassembled
+            }
+            Ok(None) => {
+                // More fragments needed - handled, no response
+                return ProcessResult::Handled;
+            }
+            Err(reason) => {
+                // Fragment dropped due to security limit or error
+                stats.inc_fragments_dropped();
+                return ProcessResult::Dropped(DropReason::FragmentError(reason));
+            }
+        }
+    } else {
+        // Non-fragment: use payload directly
+        payload.to_vec()
+    };
 
     // Route to protocol handler
     match ip_hdr.proto() {
         Some(Ipv4Proto::Icmp) => {
             // Pass broadcast flag to ICMP handler for response suppression
-            process_icmp(payload, &ip_hdr, eth_hdr, our_mac, our_ip, stats, now_ms, is_broadcast_dst)
+            process_icmp(&final_payload, &ip_hdr, eth_hdr, our_mac, our_ip, stats, now_ms, is_broadcast_dst)
         }
         Some(Ipv4Proto::Udp) => {
             // Process UDP packet
-            process_udp(payload, &ip_hdr, stats, is_broadcast_dst, now_ms)
+            process_udp(&final_payload, &ip_hdr, stats, is_broadcast_dst, now_ms)
         }
         Some(Ipv4Proto::Tcp) => {
             // Process TCP packet
-            process_tcp(payload, &ip_hdr, eth_hdr, stats, is_broadcast_dst)
+            process_tcp(&final_payload, &ip_hdr, eth_hdr, stats, is_broadcast_dst)
         }
         None => {
             stats.inc_unsupported_proto();
@@ -761,6 +787,24 @@ pub fn transmit_tcp_segment(dst_ip: Ipv4Addr, segment: &[u8]) -> Result<(), TxEr
 /// * `Err(TxError)` on failure
 pub fn transmit_udp_datagram(dst_ip: Ipv4Addr, datagram: &[u8]) -> Result<(), TxError> {
     build_frame_and_transmit(Ipv4Proto::Udp, dst_ip, datagram)
+}
+
+// ============================================================================
+// Timer Maintenance
+// ============================================================================
+
+/// Handle periodic timer tick for network stack maintenance.
+///
+/// This should be called from the system timer interrupt handler (e.g., every 1 second).
+/// Performs cleanup of expired fragment reassembly queues.
+///
+/// # Arguments
+/// * `now_ms` - Current time in milliseconds
+///
+/// # Returns
+/// Number of expired fragment queues cleaned up
+pub fn handle_timer_tick(now_ms: u64) -> usize {
+    cleanup_expired_fragments(now_ms)
 }
 
 // ============================================================================

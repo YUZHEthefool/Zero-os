@@ -47,6 +47,7 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use spin::{Mutex, Once, RwLock};
 
@@ -59,13 +60,14 @@ use lsm::{
 use crate::ipv4::Ipv4Addr;
 use crate::tcp::{
     build_tcp_segment, build_tcp_segment_with_options, calc_wscale, decode_window, encode_window,
-    generate_isn, handle_ack, handle_retransmission_timeout, seq_ge, seq_gt, seq_in_window,
-    update_congestion_control, validate_cwnd_after_idle, CongestionAction, TcpConnKey,
-    TcpControlBlock, TcpHeader, TcpOptionKind, TcpOptions, TcpSegment, TcpState,
-    TCP_DEFAULT_WINDOW, TCP_ETHERNET_MSS, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST,
-    TCP_FLAG_SYN, TCP_FIN_TIMEOUT_MS, TCP_MAX_ACCEPT_BACKLOG, TCP_MAX_ACTIVE_CONNECTIONS,
-    TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES, TCP_MAX_RTO_MS, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG,
-    TCP_MAX_WINDOW_SCALE, TCP_PROTO, TCP_SYN_TIMEOUT_MS, TCP_TIME_WAIT_MS,
+    generate_isn, generate_syn_cookie_isn, handle_ack, handle_retransmission_timeout, initial_cwnd,
+    seq_ge, seq_gt, seq_in_window, syn_cookie_select_mss, update_congestion_control,
+    validate_cwnd_after_idle, validate_syn_cookie, CongestionAction, TcpConnKey, TcpControlBlock,
+    TcpHeader, TcpOptionKind, TcpOptions, TcpSegment, TcpState, TCP_DEFAULT_WINDOW, TCP_ETHERNET_MSS,
+    TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_FIN_TIMEOUT_MS,
+    TCP_MAX_ACCEPT_BACKLOG, TCP_MAX_ACTIVE_CONNECTIONS, TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES,
+    TCP_MAX_RTO_MS, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_WINDOW_SCALE, TCP_PROTO,
+    TCP_SYN_TIMEOUT_MS, TCP_TIME_WAIT_MS,
 };
 use crate::stack::transmit_tcp_segment;
 use crate::udp::{
@@ -170,6 +172,33 @@ static SOCKET_WAIT_HOOKS: spin::Once<&'static dyn SocketWaitHooks> = spin::Once:
 /// * `hooks` - Static reference to a SocketWaitHooks implementation
 pub fn register_socket_wait_hooks(hooks: &'static dyn SocketWaitHooks) {
     SOCKET_WAIT_HOOKS.call_once(|| hooks);
+}
+
+/// Read CPU timestamp counter for low-quality entropy fallback.
+///
+/// Used when CSPRNG is unavailable to provide unpredictable port selection.
+/// Not cryptographically secure but better than a monotonic counter.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn rdtsc() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        asm!(
+            "rdtsc",
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    ((high as u64) << 32) | (low as u64)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn rdtsc() -> u64 {
+    // Fallback for non-x86_64: use a constant that will be mixed with counter
+    0xa5a5_5a5a_d3e4_c7d2_u64
 }
 
 /// Get the registered wait hooks, if any.
@@ -2501,16 +2530,58 @@ impl SocketTable {
         }
     }
 
+    /// R59-2 FIX: Fallback seed when CSPRNG is unavailable.
+    ///
+    /// Uses RDTSC mixed with monotonic counter via multiply-rotate-xor.
+    /// Not cryptographically secure but unpredictable enough to prevent
+    /// trivial port guessing when hardware RNG is unavailable.
+    #[inline]
+    fn fallback_port_seed(&self) -> u16 {
+        let tsc = rdtsc();
+        let counter = self.next_ephemeral.fetch_add(1, Ordering::Relaxed) as u64;
+
+        // SipHash-like mixing for unpredictable output
+        let mut v0 = tsc.wrapping_add(counter);
+        let mut v1 = (tsc ^ counter).rotate_left(17);
+
+        v0 = v0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        v1 ^= v0.rotate_left(23);
+        v1 = v1.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        v0 ^= v1.rotate_left(41);
+
+        let mixed = v0 ^ v1;
+        (mixed ^ (mixed >> 32)) as u16
+    }
+
     /// Allocate an ephemeral port.
+    ///
+    /// R59-1 FIX: Use CSPRNG for port randomization to prevent off-path attacks.
+    /// Attackers who can predict ephemeral ports can more easily hijack connections.
+    ///
+    /// Algorithm:
+    /// 1. Try random ports from CSPRNG (2x range attempts for good coverage)
+    /// 2. Fall back to deterministic sweep if CSPRNG fails or all random ports taken
     fn alloc_ephemeral_port(&self) -> Result<u16, SocketError> {
         let range = (EPHEMERAL_PORT_END - EPHEMERAL_PORT_START + 1) as u16;
         let bindings = self.udp_bindings.lock();
 
-        // Try up to `range` ports
-        for _ in 0..range {
-            let seed = self.next_ephemeral.fetch_add(1, Ordering::Relaxed);
+        // Phase 1: Random selection using CSPRNG (preferred)
+        // Try 2x range to give good coverage while limiting iterations
+        for _ in 0..(range.saturating_mul(2)) {
+            // Try CSPRNG first, fall back to RDTSC-based hash if RNG unavailable
+            let seed = security::rng::random_u32()
+                .map(|r| r as u16)
+                .unwrap_or_else(|_| self.fallback_port_seed());
             let candidate = EPHEMERAL_PORT_START + (seed % range);
 
+            if !bindings.contains_key(&candidate) {
+                return Ok(candidate);
+            }
+        }
+
+        // Phase 2: Deterministic sweep fallback (guarantees finding free port if one exists)
+        for offset in 0..range {
+            let candidate = EPHEMERAL_PORT_START + offset;
             if !bindings.contains_key(&candidate) {
                 return Ok(candidate);
             }
@@ -2520,14 +2591,20 @@ impl SocketTable {
     }
 
     /// Allocate an ephemeral port for TCP (ensures no existing TCP socket uses it).
+    ///
+    /// R59-1 FIX: Use CSPRNG for port randomization to prevent off-path attacks.
+    /// Predictable ephemeral ports enable connection hijacking and blind injection.
     fn alloc_ephemeral_tcp_port(&self) -> Result<u16, SocketError> {
         let range = (EPHEMERAL_PORT_END - EPHEMERAL_PORT_START + 1) as u16;
         let tcp_bindings = self.tcp_bindings.lock();
         let tcp_conns = self.tcp_conns.lock();
 
-        // Try up to `range` ports
-        for _ in 0..range {
-            let seed = self.next_ephemeral.fetch_add(1, Ordering::Relaxed);
+        // Phase 1: Random selection using CSPRNG (preferred)
+        for _ in 0..(range.saturating_mul(2)) {
+            // R59-2 FIX: Use RDTSC-based fallback instead of predictable counter
+            let seed = security::rng::random_u32()
+                .map(|r| r as u16)
+                .unwrap_or_else(|_| self.fallback_port_seed());
             let candidate = EPHEMERAL_PORT_START + (seed % range);
 
             // Check if port is in use by TCP bindings or connections
@@ -2535,6 +2612,18 @@ impl SocketTable {
                 continue;
             }
             // Also check if any connection uses this as local port
+            let in_use = tcp_conns.keys().any(|(_, port, _, _)| *port == candidate);
+            if !in_use {
+                return Ok(candidate);
+            }
+        }
+
+        // Phase 2: Deterministic sweep fallback
+        for offset in 0..range {
+            let candidate = EPHEMERAL_PORT_START + offset;
+            if tcp_bindings.contains_key(&candidate) {
+                continue;
+            }
             let in_use = tcp_conns.keys().any(|(_, port, _, _)| *port == candidate);
             if !in_use {
                 return Ok(candidate);
@@ -2718,6 +2807,12 @@ impl SocketTable {
                                 return Some(existing.syn_ack.clone());
                             }
 
+                            // Get current timestamp for SYN cookie timing
+                            let now_ms = self.time_wait_now();
+
+                            // Select MSS for SYN cookie (used in both paths)
+                            let (mss_index, cookie_mss) = syn_cookie_select_mss(options.mss);
+
                             // Enforce global connection limit before allocating resources
                             {
                                 let mut conns = self.tcp_conns.lock();
@@ -2730,6 +2825,39 @@ impl SocketTable {
                                 if conns.get(&syn_key).and_then(|w| w.upgrade()).is_some() {
                                     return None;
                                 }
+                            }
+
+                            // SYN Cookie Path: If SYN queue is full, use stateless SYN-ACK
+                            // This prevents SYN flood attacks from exhausting resources
+                            if listen_state.syn_queue.len() >= listen_state.syn_backlog {
+                                // Generate SYN cookie ISN (encodes 4-tuple, time, MSS)
+                                let cookie_iss = generate_syn_cookie_isn(
+                                    now_ms,
+                                    dst_ip,
+                                    header.dst_port,
+                                    src_ip,
+                                    header.src_port,
+                                    mss_index,
+                                );
+
+                                // Build SYN-ACK with cookie ISN and MSS option
+                                // Note: Window scaling is NOT preserved in SYN cookies
+                                let syn_ack_options = [TcpOptionKind::Mss(cookie_mss)];
+                                let syn_ack = build_tcp_segment_with_options(
+                                    dst_ip,
+                                    src_ip,
+                                    header.dst_port,
+                                    header.src_port,
+                                    cookie_iss,
+                                    header.seq_num.wrapping_add(1), // ACK = IRS + 1
+                                    TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                    TCP_DEFAULT_WINDOW, // Unscaled window
+                                    &syn_ack_options,
+                                    &[],
+                                );
+
+                                // No state allocated - SYN cookie is stateless
+                                return Some(syn_ack);
                             }
 
                             // Create child socket inheriting listener properties
@@ -2763,6 +2891,11 @@ impl SocketTable {
                                 header.seq_num,
                             );
 
+                            // Set MSS from negotiated value
+                            tcb.snd_mss = cookie_mss;
+                            tcb.rcv_mss = cookie_mss;
+                            tcb.cwnd = initial_cwnd(cookie_mss);
+
                             // R58: RFC 7323 Window Scaling - process WSopt from incoming SYN
                             // If client sent WSopt, we should respond with our own WSopt
                             if let Some(peer_scale) = options.window_scale {
@@ -2788,15 +2921,18 @@ impl SocketTable {
                                 }
                             };
 
-                            // Build SYN-ACK segment with WSopt if client sent one
+                            // Build SYN-ACK segment with MSS and optional WSopt
                             // RFC 793: SYN consumes 1 sequence number
                             let syn_ack = if options.window_scale.is_some() {
-                                // Include our WSopt in response
+                                // Include MSS and WSopt in response
                                 let our_scale = {
                                     let guard = child.tcp.lock();
                                     guard.as_ref().map(|ts| ts.control.rcv_wscale).unwrap_or(0)
                                 };
-                                let syn_ack_options = [TcpOptionKind::WindowScale(our_scale)];
+                                let syn_ack_options = [
+                                    TcpOptionKind::Mss(cookie_mss),
+                                    TcpOptionKind::WindowScale(our_scale),
+                                ];
                                 build_tcp_segment_with_options(
                                     dst_ip,
                                     src_ip,
@@ -2810,8 +2946,9 @@ impl SocketTable {
                                     &[],
                                 )
                             } else {
-                                // No WSopt from client, don't include one
-                                build_tcp_segment(
+                                // Include MSS only
+                                let syn_ack_options = [TcpOptionKind::Mss(cookie_mss)];
+                                build_tcp_segment_with_options(
                                     dst_ip,
                                     src_ip,
                                     header.dst_port,
@@ -2820,6 +2957,7 @@ impl SocketTable {
                                     header.seq_num.wrapping_add(1), // ACK = IRS + 1
                                     TCP_FLAG_SYN | TCP_FLAG_ACK,
                                     syn_ack_wnd,
+                                    &syn_ack_options,
                                     &[],
                                 )
                             };
@@ -2835,16 +2973,163 @@ impl SocketTable {
                                 key: syn_key,
                                 sock: child.clone(),
                                 syn_ack: syn_ack.clone(),
-                                syn_sent_at: self.time_wait_now(),
+                                syn_sent_at: now_ms,
                             };
 
+                            // SYN cookie path handles the backlog-full case above,
+                            // so queue_syn should always succeed here
                             if listen_state.queue_syn(pending) {
                                 return Some(syn_ack);
                             }
 
-                            // SYN backlog full - clean up resources
+                            // Cleanup (shouldn't happen given the check above)
                             self.tcp_conns.lock().remove(&syn_key);
                             self.sockets.write().remove(&child_id);
+                            return None;
+                        }
+                    }
+                }
+
+                // SYN Cookie Validation Path: If this is an ACK with no half-open
+                // connection, it might be completing a SYN cookie handshake
+                let is_ack = header.flags & TCP_FLAG_ACK != 0;
+                let is_syn = header.flags & TCP_FLAG_SYN != 0;
+
+                if is_ack && !is_syn {
+                    if let Some(listener) = self.lookup_tcp_listener(header.dst_port) {
+                        let now_ms = self.time_wait_now();
+
+                        // The cookie ISN is (ACK number - 1) since we sent SYN-ACK with ISN,
+                        // and client ACK should acknowledge ISN+1
+                        let cookie_isn = header.ack_num.wrapping_sub(1);
+
+                        if let Some(cookie_data) = validate_syn_cookie(
+                            now_ms,
+                            cookie_isn,
+                            dst_ip,
+                            header.dst_port,
+                            src_ip,
+                            header.src_port,
+                        ) {
+                            // Security: Final ACK must exactly acknowledge our SYN (ISS + 1)
+                            // This prevents attacks with forged ACK numbers that could
+                            // corrupt send-window accounting
+                            if header.ack_num != cookie_data.iss.wrapping_add(1) {
+                                return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                            }
+
+                            // Security: SYN-cookie completion must be a pure ACK (no data)
+                            // Accepting data here would silently drop or misorder it
+                            // and increase attack surface for injection attacks
+                            if !payload.is_empty() {
+                                return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                            }
+
+                            // Valid SYN cookie - create connection
+                            let syn_key = tcp_map_key_from_parts(
+                                dst_ip,
+                                header.dst_port,
+                                src_ip,
+                                header.src_port,
+                            );
+
+                            // Check limits before creating connection
+                            {
+                                let mut conns = self.tcp_conns.lock();
+                                conns.retain(|_, weak| weak.strong_count() > 0);
+                                if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
+                                    // Connection limit reached
+                                    return None;
+                                }
+                                // Check for duplicate (race condition guard)
+                                if conns.get(&syn_key).and_then(|w| w.upgrade()).is_some() {
+                                    return None;
+                                }
+                            }
+
+                            // Check accept queue capacity
+                            {
+                                let listen_guard = listener.listen.lock();
+                                if let Some(listen_state) = listen_guard.as_ref() {
+                                    if listen_state.accept_queue.len() >= listen_state.accept_backlog {
+                                        // Accept queue full - send RST
+                                        return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                                    }
+                                }
+                            }
+
+                            // Create child socket for the connection
+                            let child_id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
+                            let child = Arc::new(SocketState::new(
+                                child_id,
+                                listener.domain,
+                                listener.ty,
+                                listener.proto,
+                                listener.label,
+                            ));
+
+                            self.sockets.write().insert(child_id, child.clone());
+                            self.created.fetch_add(1, Ordering::Relaxed);
+
+                            child.bind_local(dst_ip, header.dst_port);
+                            child.set_remote(src_ip, header.src_port);
+
+                            // Create TCB in Established state (handshake completed via cookie)
+                            // The IRS (Initial Receive Sequence) was header.seq_num in the original SYN
+                            // which is now header.seq_num - 1 (they sent +1 in their ACK)
+                            let irs = header.seq_num.wrapping_sub(1);
+                            let mut tcb = TcpControlBlock::new_server(
+                                dst_ip,
+                                header.dst_port,
+                                src_ip,
+                                header.src_port,
+                                cookie_data.iss,
+                                irs,
+                            );
+
+                            // Set MSS from cookie
+                            tcb.snd_mss = cookie_data.mss;
+                            tcb.rcv_mss = cookie_data.mss;
+                            tcb.cwnd = initial_cwnd(cookie_data.mss);
+
+                            // Update sequence numbers: our SYN consumed 1 byte
+                            tcb.snd_nxt = cookie_data.iss.wrapping_add(1);
+                            tcb.snd_una = cookie_data.iss;
+
+                            // Initialize send window from their ACK
+                            // Note: No window scaling for SYN cookie connections
+                            tcb.snd_wnd = decode_window(header.window, 0);
+                            tcb.snd_wl1 = header.seq_num;
+                            tcb.snd_wl2 = header.ack_num;
+
+                            // Transition directly to Established (cookie validated)
+                            tcb.state = TcpState::Established;
+                            tcb.established_at = now_ms;
+                            tcb.last_activity = now_ms;
+
+                            // Process the ACK to update snd_una
+                            handle_ack(&mut tcb, header.ack_num, now_ms);
+
+                            child.attach_tcp(tcb);
+
+                            // Register connection
+                            {
+                                let mut conns = self.tcp_conns.lock();
+                                conns.insert(syn_key, Arc::downgrade(&child));
+                            }
+
+                            // Add to accept queue
+                            if !listener.push_accept_ready(child.clone()) {
+                                // Accept queue became full between check and push
+                                child.mark_closed();
+                                self.cleanup_tcp_connection(&child);
+                                return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                            }
+
+                            // Wake waiting accept()
+                            child.wake_tcp_waiters();
+
+                            // No response needed - connection is established
                             return None;
                         }
                     }
