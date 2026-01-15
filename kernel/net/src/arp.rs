@@ -280,9 +280,22 @@ impl ArpCache {
             self.entries.remove(pos);
         }
 
-        // Evict oldest entry if at capacity
+        // R62-5 FIX: Evict oldest *dynamic* entry if at capacity; never evict static.
+        // Static entries represent trusted bindings (e.g., gateway) and must be protected
+        // from cache-filling attacks that could enable ARP poisoning.
         if self.entries.len() >= self.max_entries {
-            self.entries.pop_front();
+            // Find first dynamic entry to evict (oldest dynamic)
+            if let Some(pos) = self
+                .entries
+                .iter()
+                .position(|e| e.kind == ArpEntryKind::Dynamic)
+            {
+                self.entries.remove(pos);
+            } else {
+                // Cache is full of static entries; refuse new insertion
+                // This prevents attackers from forcing eviction of static entries
+                return Err(ArpError::CacheConflict);
+            }
         }
 
         // Add new entry at end (most recently used)

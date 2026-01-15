@@ -100,6 +100,19 @@ pub fn init_global() -> Result<(), RngError> {
     Ok(())
 }
 
+/// Check if the global CSPRNG is initialized and ready for use.
+///
+/// R62-3 FIX: Allows callers to check RNG readiness before security-critical
+/// operations that require strong entropy (e.g., ISN generation).
+///
+/// # Returns
+///
+/// `true` if CSPRNG is initialized and ready, `false` otherwise
+#[inline]
+pub fn is_ready() -> bool {
+    GLOBAL_RNG.lock().is_some()
+}
+
 /// Fill buffer with random bytes from the global CSPRNG
 ///
 /// # Arguments

@@ -42,6 +42,7 @@ use x86_64::{PhysAddr, VirtAddr};
 
 pub mod arp;
 pub mod buffer;
+pub mod conntrack;
 pub mod device;
 pub mod ethernet;
 pub mod fragment;

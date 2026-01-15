@@ -3,6 +3,10 @@ name = "net"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["conntrack"]
+conntrack = []
+
 [dependencies]
 spin = "0.9"
 mm = { path = "../mm" }

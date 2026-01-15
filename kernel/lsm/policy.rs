@@ -27,7 +27,7 @@ use core::fmt;
 
 use cap::{CapId, CapRights};
 
-use crate::{FileCtx, IpcCtx, NetCtx, OpenFlags, ProcessCtx, SignalCtx, SyscallCtx};
+use crate::{FileCtx, IpcCtx, NetCtx, NetControlCtx, OpenFlags, ProcessCtx, SignalCtx, SyscallCtx};
 
 // ============================================================================
 // LSM Result and Error Types
@@ -396,6 +396,14 @@ pub trait LsmPolicy: Send + Sync {
 
     /// Called when shutting down a socket.
     fn net_shutdown(&self, task: &ProcessCtx, ctx: &NetCtx, how: i32) -> LsmResult {
+        Ok(())
+    }
+
+    /// R62-7 FIX: Called for control-plane network operations (ARP, ICMP).
+    ///
+    /// This hook gates control-plane traffic that bypasses the socket layer,
+    /// allowing policies to deny or audit ARP cache updates and ICMP replies.
+    fn net_control(&self, ctx: &NetControlCtx) -> LsmResult {
         Ok(())
     }
 }

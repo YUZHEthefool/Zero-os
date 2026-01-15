@@ -346,7 +346,7 @@ fn process_ipv4(
         }
         Some(Ipv4Proto::Tcp) => {
             // Process TCP packet
-            process_tcp(&final_payload, &ip_hdr, eth_hdr, stats, is_broadcast_dst)
+            process_tcp(&final_payload, &ip_hdr, eth_hdr, stats, is_broadcast_dst, now_ms)
         }
         None => {
             stats.inc_unsupported_proto();
@@ -515,6 +515,7 @@ fn process_tcp(
     eth_hdr: &EthHeader,
     stats: &NetStats,
     is_broadcast_dst: bool,
+    now_ms: u64,
 ) -> ProcessResult {
     // Security: ignore TCP to broadcast/multicast destinations
     if is_broadcast_dst || ip_hdr.dst.is_multicast() {
@@ -546,6 +547,25 @@ fn process_tcp(
 
     // Extract payload (data after TCP header)
     let tcp_payload = &payload[hdr_len..];
+
+    // Conntrack: Update connection tracking state
+    // This provides stateful firewall support independent of socket layer
+    #[cfg(feature = "conntrack")]
+    {
+        use crate::conntrack::{ct_process_tcp, CtDecision};
+        let ct_result = ct_process_tcp(
+            ip_hdr.src,
+            ip_hdr.dst,
+            tcp_hdr.src_port,
+            tcp_hdr.dst_port,
+            tcp_hdr.flags,
+            tcp_payload.len(),
+            now_ms,
+        );
+        // Future: Use ct_result.decision for firewall policy
+        // For now, just track state without blocking
+        let _ = ct_result;
+    }
 
     // R58: Parse TCP options for window scaling support
     // Use the full segment so parse_tcp_options can validate header_len

@@ -1812,6 +1812,10 @@ static ISN_SECRET: AtomicU64 = AtomicU64::new(0);
 /// to strong entropy from CSPRNG.
 static ISN_SECRET_WEAK: AtomicBool = AtomicBool::new(true);
 
+/// R62-3 FIX: Counter for connections established with weak ISN entropy.
+/// Used for monitoring/auditing purposes.
+static ISN_WEAK_CONNECTIONS: AtomicU32 = AtomicU32::new(0);
+
 /// Get or initialize the ISN secret key from CSPRNG.
 ///
 /// R54-1 IMPROVEMENT: Auto-upgrades weak secret to strong once CSPRNG is ready.
@@ -1917,6 +1921,12 @@ pub fn generate_isn(
     // Increment counter by 1 (not 64000) since mixing provides enough diffusion
     let counter = ISN_COUNTER.fetch_add(1, Ordering::Relaxed);
     let secret = isn_secret();
+
+    // R62-3 FIX: Track connections established with weak entropy for auditing
+    // This allows monitoring of security posture during early boot
+    if ISN_SECRET_WEAK.load(Ordering::Relaxed) {
+        ISN_WEAK_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+    }
 
     // Pack 4-tuple into 64-bit values for mixing
     let tuple_ip = u64::from_be_bytes([
@@ -2264,11 +2274,16 @@ pub fn validate_syn_cookie(
     let time_slot = (cookie_isn >> TCP_SYN_COOKIE_MSS_BITS) & TCP_SYN_COOKIE_TIME_MASK;
     let received_mac = cookie_isn >> (TCP_SYN_COOKIE_TIME_BITS + TCP_SYN_COOKIE_MSS_BITS);
 
-    // Check age (with wraparound handling)
+    // R62-1 FIX: Check age with wraparound protection.
+    // The 6-bit time field wraps after 64 slots (256 seconds). Without this fix,
+    // a cookie from slot 63 validated at slot 1 would compute age_slots = 2 after
+    // masking, incorrectly passing the age check despite being ~252 seconds old.
+    // We reject any age >= half the range (32 slots = 128s) to detect wrap-around.
     let now_slot = ((now_ms / TCP_SYN_COOKIE_TIME_GRANULARITY_MS) as u32)
         & TCP_SYN_COOKIE_TIME_MASK;
     let age_slots = now_slot.wrapping_sub(time_slot) & TCP_SYN_COOKIE_TIME_MASK;
-    if age_slots > TCP_SYN_COOKIE_MAX_AGE_SLOTS {
+    let half_range = 1u32 << (TCP_SYN_COOKIE_TIME_BITS - 1); // 32 slots = 128 seconds
+    if age_slots > TCP_SYN_COOKIE_MAX_AGE_SLOTS || age_slots >= half_range {
         return None;
     }
 

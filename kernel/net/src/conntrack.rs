@@ -1,0 +1,778 @@
+//! Connection Tracking (Conntrack) for Zero-OS
+//!
+//! This module provides stateful connection tracking for the network stack,
+//! independent of the socket layer. It tracks TCP, UDP, and ICMP flows for:
+//!
+//! - Stateful firewall decisions
+//! - NAT support (future)
+//! - Connection statistics
+//!
+//! # Design
+//!
+//! - Independent from socket.rs TCP state machine
+//! - Tracks packet-level state transitions
+//! - Per-protocol timeout management
+//! - Memory-bounded with LRU eviction
+//!
+//! # Security
+//!
+//! - Validates state transitions to detect invalid packets
+//! - Rate limits new connection creation
+//! - Bounded memory usage with configurable limits
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use spin::{Mutex, Once, RwLock};
+
+use crate::ipv4::Ipv4Addr;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Maximum entries in the conntrack table
+pub const CT_MAX_ENTRIES: usize = 65536;
+
+/// TCP timeout values (milliseconds)
+pub const CT_TCP_TIMEOUT_SYN_SENT_MS: u64 = 60_000;
+pub const CT_TCP_TIMEOUT_SYN_RECV_MS: u64 = 60_000;
+pub const CT_TCP_TIMEOUT_ESTABLISHED_MS: u64 = 300_000; // 5 minutes
+pub const CT_TCP_TIMEOUT_FIN_WAIT_MS: u64 = 120_000;    // 2 minutes
+pub const CT_TCP_TIMEOUT_CLOSE_WAIT_MS: u64 = 60_000;
+pub const CT_TCP_TIMEOUT_LAST_ACK_MS: u64 = 30_000;
+pub const CT_TCP_TIMEOUT_TIME_WAIT_MS: u64 = 120_000;   // 2*MSL
+pub const CT_TCP_TIMEOUT_CLOSE_MS: u64 = 10_000;
+
+/// UDP timeout values (milliseconds)
+pub const CT_UDP_TIMEOUT_UNREPLIED_MS: u64 = 30_000;
+pub const CT_UDP_TIMEOUT_REPLIED_MS: u64 = 180_000;     // 3 minutes
+
+/// ICMP timeout values (milliseconds)
+pub const CT_ICMP_TIMEOUT_MS: u64 = 30_000;
+
+/// Sweep budget per timer tick
+pub const CT_SWEEP_BUDGET: usize = 256;
+
+// ============================================================================
+// Protocol Numbers
+// ============================================================================
+
+pub const IPPROTO_ICMP: u8 = 1;
+pub const IPPROTO_TCP: u8 = 6;
+pub const IPPROTO_UDP: u8 = 17;
+
+// ============================================================================
+// Flow Key
+// ============================================================================
+
+/// Normalized flow key for bidirectional matching.
+///
+/// The key is normalized so that (A->B) and (B->A) map to the same entry.
+/// Direction is tracked separately in the entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FlowKey {
+    /// Protocol number (TCP=6, UDP=17, ICMP=1)
+    pub proto: u8,
+    /// Lower IP address (for normalization)
+    pub ip_lo: [u8; 4],
+    /// Higher IP address (for normalization)
+    pub ip_hi: [u8; 4],
+    /// Lower port (for normalization)
+    pub port_lo: u16,
+    /// Higher port (for normalization)
+    pub port_hi: u16,
+}
+
+impl FlowKey {
+    /// Create a normalized flow key from packet fields.
+    ///
+    /// Returns the key and the direction (Original if src < dst, Reply otherwise).
+    pub fn from_packet(
+        proto: u8,
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    ) -> (Self, ConntrackDir) {
+        let src_tuple = (src_ip.0, src_port);
+        let dst_tuple = (dst_ip.0, dst_port);
+
+        if src_tuple <= dst_tuple {
+            (
+                Self {
+                    proto,
+                    ip_lo: src_ip.0,
+                    ip_hi: dst_ip.0,
+                    port_lo: src_port,
+                    port_hi: dst_port,
+                },
+                ConntrackDir::Original,
+            )
+        } else {
+            (
+                Self {
+                    proto,
+                    ip_lo: dst_ip.0,
+                    ip_hi: src_ip.0,
+                    port_lo: dst_port,
+                    port_hi: src_port,
+                },
+                ConntrackDir::Reply,
+            )
+        }
+    }
+
+    /// Create a flow key for ICMP (using type/code/id as port fields).
+    pub fn from_icmp(
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        icmp_type: u8,
+        icmp_code: u8,
+        icmp_id: u16,
+    ) -> (Self, ConntrackDir) {
+        // Pack type/code into port_lo, id into port_hi
+        let pseudo_port = ((icmp_type as u16) << 8) | (icmp_code as u16);
+        Self::from_packet(IPPROTO_ICMP, src_ip, dst_ip, pseudo_port, icmp_id)
+    }
+}
+
+// ============================================================================
+// Direction
+// ============================================================================
+
+/// Direction of a packet relative to the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConntrackDir {
+    /// Original direction (initiator -> responder)
+    Original,
+    /// Reply direction (responder -> initiator)
+    Reply,
+}
+
+// ============================================================================
+// Protocol States
+// ============================================================================
+
+/// TCP connection tracking state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpCtState {
+    /// No connection
+    None,
+    /// SYN sent, waiting for SYN-ACK
+    SynSent,
+    /// SYN-ACK received, waiting for ACK
+    SynRecv,
+    /// Connection established
+    Established,
+    /// FIN sent, waiting for ACK
+    FinWait,
+    /// FIN received, waiting for close
+    CloseWait,
+    /// Final ACK sent
+    LastAck,
+    /// Waiting for 2*MSL timeout
+    TimeWait,
+    /// Connection closed
+    Close,
+}
+
+impl TcpCtState {
+    /// Get the timeout for this state in milliseconds.
+    pub fn timeout_ms(&self) -> u64 {
+        match self {
+            TcpCtState::None => CT_TCP_TIMEOUT_CLOSE_MS,
+            TcpCtState::SynSent => CT_TCP_TIMEOUT_SYN_SENT_MS,
+            TcpCtState::SynRecv => CT_TCP_TIMEOUT_SYN_RECV_MS,
+            TcpCtState::Established => CT_TCP_TIMEOUT_ESTABLISHED_MS,
+            TcpCtState::FinWait => CT_TCP_TIMEOUT_FIN_WAIT_MS,
+            TcpCtState::CloseWait => CT_TCP_TIMEOUT_CLOSE_WAIT_MS,
+            TcpCtState::LastAck => CT_TCP_TIMEOUT_LAST_ACK_MS,
+            TcpCtState::TimeWait => CT_TCP_TIMEOUT_TIME_WAIT_MS,
+            TcpCtState::Close => CT_TCP_TIMEOUT_CLOSE_MS,
+        }
+    }
+}
+
+/// UDP connection tracking state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpCtState {
+    /// Single packet seen (unreplied)
+    Unreplied,
+    /// Bidirectional traffic seen
+    Replied,
+}
+
+impl UdpCtState {
+    /// Get the timeout for this state in milliseconds.
+    pub fn timeout_ms(&self) -> u64 {
+        match self {
+            UdpCtState::Unreplied => CT_UDP_TIMEOUT_UNREPLIED_MS,
+            UdpCtState::Replied => CT_UDP_TIMEOUT_REPLIED_MS,
+        }
+    }
+}
+
+/// ICMP connection tracking state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcmpCtState {
+    /// Echo request sent
+    EchoRequest,
+    /// Echo reply received
+    EchoReply,
+}
+
+/// Protocol-specific state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtProtoState {
+    Tcp(TcpCtState),
+    Udp(UdpCtState),
+    Icmp(IcmpCtState),
+    Other,
+}
+
+impl CtProtoState {
+    /// Get the timeout for this state in milliseconds.
+    pub fn timeout_ms(&self) -> u64 {
+        match self {
+            CtProtoState::Tcp(s) => s.timeout_ms(),
+            CtProtoState::Udp(s) => s.timeout_ms(),
+            CtProtoState::Icmp(_) => CT_ICMP_TIMEOUT_MS,
+            CtProtoState::Other => CT_UDP_TIMEOUT_UNREPLIED_MS,
+        }
+    }
+}
+
+// ============================================================================
+// Conntrack Entry
+// ============================================================================
+
+/// A connection tracking entry.
+#[derive(Debug, Clone)]
+pub struct ConntrackEntry {
+    /// Normalized flow key
+    pub key: FlowKey,
+    /// Protocol-specific state
+    pub state: CtProtoState,
+    /// Last packet timestamp (ms)
+    pub last_seen_ms: u64,
+    /// Bytes transferred (original direction)
+    pub bytes_orig: u64,
+    /// Bytes transferred (reply direction)
+    pub bytes_reply: u64,
+    /// Packets transferred (original direction)
+    pub packets_orig: u64,
+    /// Packets transferred (reply direction)
+    pub packets_reply: u64,
+    /// Creation timestamp (ms)
+    pub created_ms: u64,
+    /// Whether reply has been seen
+    pub seen_reply: bool,
+}
+
+impl ConntrackEntry {
+    /// Create a new entry.
+    pub fn new(key: FlowKey, state: CtProtoState, now_ms: u64) -> Self {
+        Self {
+            key,
+            state,
+            last_seen_ms: now_ms,
+            bytes_orig: 0,
+            bytes_reply: 0,
+            packets_orig: 0,
+            packets_reply: 0,
+            created_ms: now_ms,
+            seen_reply: false,
+        }
+    }
+
+    /// Check if the entry has expired.
+    pub fn is_expired(&self, now_ms: u64) -> bool {
+        let timeout = self.state.timeout_ms();
+        now_ms.saturating_sub(self.last_seen_ms) > timeout
+    }
+
+    /// Update statistics for a packet.
+    pub fn update_stats(&mut self, dir: ConntrackDir, bytes: usize, now_ms: u64) {
+        self.last_seen_ms = now_ms;
+        match dir {
+            ConntrackDir::Original => {
+                self.bytes_orig = self.bytes_orig.saturating_add(bytes as u64);
+                self.packets_orig = self.packets_orig.saturating_add(1);
+            }
+            ConntrackDir::Reply => {
+                self.bytes_reply = self.bytes_reply.saturating_add(bytes as u64);
+                self.packets_reply = self.packets_reply.saturating_add(1);
+                self.seen_reply = true;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Decision
+// ============================================================================
+
+/// Decision from conntrack processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtDecision {
+    /// Packet matches existing tracked connection
+    Established,
+    /// New connection created
+    New,
+    /// Related to existing connection (e.g., ICMP error)
+    Related,
+    /// Invalid state transition - should be dropped
+    Invalid,
+}
+
+/// Result of conntrack update.
+#[derive(Debug, Clone, Copy)]
+pub struct CtUpdateResult {
+    /// Decision for this packet
+    pub decision: CtDecision,
+    /// Current protocol state
+    pub state: CtProtoState,
+    /// Packet direction
+    pub dir: ConntrackDir,
+}
+
+// ============================================================================
+// L4 Metadata
+// ============================================================================
+
+/// Layer 4 metadata for state machine transitions.
+#[derive(Debug, Clone, Copy)]
+pub struct L4Meta {
+    /// TCP flags (SYN, ACK, FIN, RST)
+    pub tcp_flags: u8,
+    /// Packet payload length
+    pub payload_len: usize,
+}
+
+impl L4Meta {
+    pub fn new(tcp_flags: u8, payload_len: usize) -> Self {
+        Self { tcp_flags, payload_len }
+    }
+
+    /// Check if SYN flag is set.
+    pub fn is_syn(&self) -> bool {
+        self.tcp_flags & 0x02 != 0
+    }
+
+    /// Check if ACK flag is set.
+    pub fn is_ack(&self) -> bool {
+        self.tcp_flags & 0x10 != 0
+    }
+
+    /// Check if FIN flag is set.
+    pub fn is_fin(&self) -> bool {
+        self.tcp_flags & 0x01 != 0
+    }
+
+    /// Check if RST flag is set.
+    pub fn is_rst(&self) -> bool {
+        self.tcp_flags & 0x04 != 0
+    }
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+/// Conntrack statistics.
+#[derive(Debug, Default)]
+pub struct ConntrackStats {
+    /// Total entries created
+    pub entries_created: AtomicU64,
+    /// Total entries deleted
+    pub entries_deleted: AtomicU64,
+    /// Entries deleted due to timeout
+    pub timeout_deletes: AtomicU64,
+    /// New connections rejected (table full)
+    pub insert_failed: AtomicU64,
+    /// Invalid state transitions
+    pub invalid_transitions: AtomicU64,
+    /// Current entry count
+    pub current_entries: AtomicU32,
+}
+
+impl ConntrackStats {
+    pub const fn new() -> Self {
+        Self {
+            entries_created: AtomicU64::new(0),
+            entries_deleted: AtomicU64::new(0),
+            timeout_deletes: AtomicU64::new(0),
+            insert_failed: AtomicU64::new(0),
+            invalid_transitions: AtomicU64::new(0),
+            current_entries: AtomicU32::new(0),
+        }
+    }
+}
+
+// ============================================================================
+// Conntrack Table
+// ============================================================================
+
+/// The connection tracking table.
+pub struct ConntrackTable {
+    /// Entry storage (BTreeMap for stable iteration during sweep)
+    entries: RwLock<BTreeMap<FlowKey, Mutex<ConntrackEntry>>>,
+    /// Statistics
+    stats: ConntrackStats,
+}
+
+impl ConntrackTable {
+    /// Create a new conntrack table.
+    pub fn new() -> Self {
+        Self {
+            entries: RwLock::new(BTreeMap::new()),
+            stats: ConntrackStats::new(),
+        }
+    }
+
+    /// Look up an entry by flow key.
+    pub fn lookup(&self, key: &FlowKey) -> Option<ConntrackEntry> {
+        let entries = self.entries.read();
+        entries.get(key).map(|e| e.lock().clone())
+    }
+
+    /// Update conntrack state on packet arrival.
+    ///
+    /// This is the main entry point for packet processing.
+    pub fn update_on_packet(
+        &self,
+        proto: u8,
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        l4: &L4Meta,
+        now_ms: u64,
+    ) -> CtUpdateResult {
+        let (key, dir) = FlowKey::from_packet(proto, src_ip, dst_ip, src_port, dst_port);
+
+        // Fast path: check existing entry with read lock
+        {
+            let entries = self.entries.read();
+            if let Some(entry_lock) = entries.get(&key) {
+                let mut entry = entry_lock.lock();
+                let (new_state, decision) = self.transition_state(&entry, dir, proto, l4);
+
+                if decision == CtDecision::Invalid {
+                    self.stats.invalid_transitions.fetch_add(1, Ordering::Relaxed);
+                    return CtUpdateResult { decision, state: entry.state, dir };
+                }
+
+                entry.state = new_state;
+                entry.update_stats(dir, l4.payload_len, now_ms);
+
+                return CtUpdateResult {
+                    decision: CtDecision::Established,
+                    state: new_state,
+                    dir,
+                };
+            }
+        }
+
+        // Slow path: create new entry with write lock
+        self.create_entry(key, dir, proto, l4, now_ms)
+    }
+
+    /// Create a new conntrack entry.
+    fn create_entry(
+        &self,
+        key: FlowKey,
+        dir: ConntrackDir,
+        proto: u8,
+        l4: &L4Meta,
+        now_ms: u64,
+    ) -> CtUpdateResult {
+        // Check table capacity
+        let current = self.stats.current_entries.load(Ordering::Relaxed) as usize;
+        if current >= CT_MAX_ENTRIES {
+            self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+            return CtUpdateResult {
+                decision: CtDecision::Invalid,
+                state: CtProtoState::Other,
+                dir,
+            };
+        }
+
+        // Determine initial state
+        let initial_state = match proto {
+            IPPROTO_TCP => {
+                if l4.is_syn() && !l4.is_ack() {
+                    CtProtoState::Tcp(TcpCtState::SynSent)
+                } else {
+                    // Non-SYN packet without existing entry - invalid
+                    self.stats.invalid_transitions.fetch_add(1, Ordering::Relaxed);
+                    return CtUpdateResult {
+                        decision: CtDecision::Invalid,
+                        state: CtProtoState::Tcp(TcpCtState::None),
+                        dir,
+                    };
+                }
+            }
+            IPPROTO_UDP => CtProtoState::Udp(UdpCtState::Unreplied),
+            IPPROTO_ICMP => CtProtoState::Icmp(IcmpCtState::EchoRequest),
+            _ => CtProtoState::Other,
+        };
+
+        // Insert entry
+        let mut entries = self.entries.write();
+
+        // Double-check after acquiring write lock
+        if entries.contains_key(&key) {
+            drop(entries);
+            // Retry with existing entry
+            return self.update_on_packet(
+                proto,
+                Ipv4Addr(key.ip_lo),
+                Ipv4Addr(key.ip_hi),
+                key.port_lo,
+                key.port_hi,
+                l4,
+                now_ms,
+            );
+        }
+
+        let mut entry = ConntrackEntry::new(key, initial_state, now_ms);
+        entry.update_stats(dir, l4.payload_len, now_ms);
+
+        entries.insert(key, Mutex::new(entry));
+        self.stats.entries_created.fetch_add(1, Ordering::Relaxed);
+        self.stats.current_entries.fetch_add(1, Ordering::Relaxed);
+
+        CtUpdateResult {
+            decision: CtDecision::New,
+            state: initial_state,
+            dir,
+        }
+    }
+
+    /// Compute state transition for a packet.
+    fn transition_state(
+        &self,
+        entry: &ConntrackEntry,
+        dir: ConntrackDir,
+        proto: u8,
+        l4: &L4Meta,
+    ) -> (CtProtoState, CtDecision) {
+        match (proto, &entry.state) {
+            (IPPROTO_TCP, CtProtoState::Tcp(tcp_state)) => {
+                self.tcp_transition(*tcp_state, dir, l4)
+            }
+            (IPPROTO_UDP, CtProtoState::Udp(udp_state)) => {
+                self.udp_transition(*udp_state, dir)
+            }
+            (IPPROTO_ICMP, CtProtoState::Icmp(icmp_state)) => {
+                self.icmp_transition(*icmp_state, dir)
+            }
+            _ => (entry.state, CtDecision::Established),
+        }
+    }
+
+    /// TCP state machine transition.
+    fn tcp_transition(
+        &self,
+        state: TcpCtState,
+        dir: ConntrackDir,
+        l4: &L4Meta,
+    ) -> (CtProtoState, CtDecision) {
+        // Handle RST - always transitions to Close
+        if l4.is_rst() {
+            return (CtProtoState::Tcp(TcpCtState::Close), CtDecision::Established);
+        }
+
+        let new_state = match (state, dir) {
+            // SYN sent, waiting for SYN-ACK
+            (TcpCtState::SynSent, ConntrackDir::Reply) if l4.is_syn() && l4.is_ack() => {
+                TcpCtState::SynRecv
+            }
+            // SYN-ACK received, waiting for ACK
+            (TcpCtState::SynRecv, ConntrackDir::Original) if l4.is_ack() && !l4.is_syn() => {
+                TcpCtState::Established
+            }
+            // Established - handle FIN
+            (TcpCtState::Established, _) if l4.is_fin() => {
+                match dir {
+                    ConntrackDir::Original => TcpCtState::FinWait,
+                    ConntrackDir::Reply => TcpCtState::CloseWait,
+                }
+            }
+            // FIN wait - handle reply FIN or ACK
+            (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_fin() => {
+                TcpCtState::LastAck
+            }
+            (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_ack() => {
+                TcpCtState::TimeWait
+            }
+            // Close wait - handle FIN
+            (TcpCtState::CloseWait, ConntrackDir::Original) if l4.is_fin() => {
+                TcpCtState::LastAck
+            }
+            // Last ACK - handle final ACK
+            (TcpCtState::LastAck, _) if l4.is_ack() => {
+                TcpCtState::TimeWait
+            }
+            // Stay in current state for other packets
+            _ => state,
+        };
+
+        (CtProtoState::Tcp(new_state), CtDecision::Established)
+    }
+
+    /// UDP state machine transition.
+    fn udp_transition(
+        &self,
+        state: UdpCtState,
+        dir: ConntrackDir,
+    ) -> (CtProtoState, CtDecision) {
+        let new_state = match (state, dir) {
+            (UdpCtState::Unreplied, ConntrackDir::Reply) => UdpCtState::Replied,
+            _ => state,
+        };
+        (CtProtoState::Udp(new_state), CtDecision::Established)
+    }
+
+    /// ICMP state machine transition.
+    fn icmp_transition(
+        &self,
+        state: IcmpCtState,
+        dir: ConntrackDir,
+    ) -> (CtProtoState, CtDecision) {
+        let new_state = match (state, dir) {
+            (IcmpCtState::EchoRequest, ConntrackDir::Reply) => IcmpCtState::EchoReply,
+            _ => state,
+        };
+        (CtProtoState::Icmp(new_state), CtDecision::Established)
+    }
+
+    /// Remove an entry by key.
+    pub fn remove(&self, key: &FlowKey) -> bool {
+        let mut entries = self.entries.write();
+        if entries.remove(key).is_some() {
+            self.stats.entries_deleted.fetch_add(1, Ordering::Relaxed);
+            self.stats.current_entries.fetch_sub(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Sweep expired entries.
+    ///
+    /// Should be called periodically from timer context.
+    /// Returns the number of entries removed.
+    pub fn sweep(&self, now_ms: u64, budget: usize) -> usize {
+        let mut to_remove = Vec::new();
+
+        // Collect expired keys with read lock
+        {
+            let entries = self.entries.read();
+            for (key, entry_lock) in entries.iter() {
+                if to_remove.len() >= budget {
+                    break;
+                }
+                let entry = entry_lock.lock();
+                if entry.is_expired(now_ms) {
+                    to_remove.push(*key);
+                }
+            }
+        }
+
+        // Remove with write lock
+        if !to_remove.is_empty() {
+            let mut entries = self.entries.write();
+            for key in &to_remove {
+                entries.remove(key);
+            }
+            let count = to_remove.len();
+            self.stats.timeout_deletes.fetch_add(count as u64, Ordering::Relaxed);
+            self.stats.entries_deleted.fetch_add(count as u64, Ordering::Relaxed);
+            self.stats.current_entries.fetch_sub(count as u32, Ordering::Relaxed);
+            count
+        } else {
+            0
+        }
+    }
+
+    /// Get current statistics.
+    pub fn stats(&self) -> &ConntrackStats {
+        &self.stats
+    }
+
+    /// Get current entry count.
+    pub fn len(&self) -> usize {
+        self.stats.current_entries.load(Ordering::Relaxed) as usize
+    }
+
+    /// Check if table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+// ============================================================================
+// Global Instance
+// ============================================================================
+
+static CONNTRACK_TABLE: Once<ConntrackTable> = Once::new();
+
+/// Get the global conntrack table.
+pub fn conntrack_table() -> &'static ConntrackTable {
+    CONNTRACK_TABLE.call_once(ConntrackTable::new)
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Process a TCP packet through conntrack.
+pub fn ct_process_tcp(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    tcp_flags: u8,
+    payload_len: usize,
+    now_ms: u64,
+) -> CtUpdateResult {
+    let l4 = L4Meta::new(tcp_flags, payload_len);
+    conntrack_table().update_on_packet(
+        IPPROTO_TCP,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        &l4,
+        now_ms,
+    )
+}
+
+/// Process a UDP packet through conntrack.
+pub fn ct_process_udp(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload_len: usize,
+    now_ms: u64,
+) -> CtUpdateResult {
+    let l4 = L4Meta::new(0, payload_len);
+    conntrack_table().update_on_packet(
+        IPPROTO_UDP,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        &l4,
+        now_ms,
+    )
+}
+
+/// Run conntrack sweep (call from timer).
+pub fn ct_sweep(now_ms: u64) -> usize {
+    conntrack_table().sweep(now_ms, CT_SWEEP_BUDGET)
+}

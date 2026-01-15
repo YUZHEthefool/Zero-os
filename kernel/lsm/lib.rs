@@ -387,6 +387,36 @@ impl NetCtx {
     }
 }
 
+/// R62-7 FIX: Control-plane network operation type.
+///
+/// Used for LSM hooks on ARP and ICMP traffic that bypasses socket layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetControlOp {
+    /// ARP cache learning (dynamic entry insertion)
+    ArpLearn,
+    /// ARP reply transmission
+    ArpReply,
+    /// ICMP echo reply transmission
+    IcmpEchoReply,
+    /// ICMP error message transmission
+    IcmpError,
+}
+
+/// R62-7 FIX: Control-plane network context.
+///
+/// Provides context for LSM hooks on control-plane traffic (ARP, ICMP).
+#[derive(Debug, Clone, Copy)]
+pub struct NetControlCtx {
+    /// Operation type
+    pub op: NetControlOp,
+    /// Source IP address (packed IPv4)
+    pub src_ip: u32,
+    /// Destination IP address (packed IPv4)
+    pub dst_ip: u32,
+    /// Protocol-specific data (e.g., ICMP type/code, ARP opcode)
+    pub proto_data: u32,
+}
+
 // ============================================================================
 // Audit Helpers (LSM feature only)
 // ============================================================================
@@ -1486,6 +1516,45 @@ pub fn hook_net_shutdown(task: &ProcessCtx, ctx: &NetCtx, how: i32) -> LsmResult
     #[cfg(not(feature = "lsm"))]
     {
         let _ = (task, ctx, how);
+        Ok(())
+    }
+}
+
+/// R62-7 FIX: Hook for control-plane network operations (ARP, ICMP).
+///
+/// This hook gates control-plane traffic that bypasses the socket layer,
+/// ensuring LSM policy can deny or audit ARP cache updates and ICMP replies.
+///
+/// # Arguments
+///
+/// * `ctx` - Control-plane context with operation type and addresses
+///
+/// # Returns
+///
+/// `Ok(())` if operation is allowed, `Err(LsmError::Denied)` if blocked by policy
+#[inline]
+pub fn hook_net_control(ctx: &NetControlCtx) -> LsmResult {
+    #[cfg(feature = "lsm")]
+    {
+        // Default policy allows all control-plane traffic
+        // Custom policies can override net_control() to implement restrictions
+        let res = policy().net_control(ctx);
+        if let Err(ref err) = res {
+            // Use kernel context (pid=0) for control-plane operations
+            let subject = AuditSubject::new(0, 0, 0, None);
+            let op_name = match ctx.op {
+                NetControlOp::ArpLearn => "arp_learn",
+                NetControlOp::ArpReply => "arp_reply",
+                NetControlOp::IcmpEchoReply => "icmp_echo_reply",
+                NetControlOp::IcmpError => "icmp_error",
+            };
+            emit_denial_audit(subject, AuditObject::None, op_name, err);
+        }
+        res
+    }
+    #[cfg(not(feature = "lsm"))]
+    {
+        let _ = ctx;
         Ok(())
     }
 }

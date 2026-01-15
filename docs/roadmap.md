@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-13
+**Last Updated:** 2026-01-14
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -716,16 +716,18 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-13 | 59 | 2 | 2 | Ephemeral port randomization, CSPRNG fallback security - **ALL FIXED** |
 | 2026-01-13 | 60 | 10 | 10 | IP fragment reassembly (RFC 791/815/5722), security hardening - **ALL FIXED** |
 | 2026-01-13 | 61 | 2 | 2 | SYN cookies (RFC 4987), ACK validation, pure ACK enforcement - **ALL FIXED** |
-| **Total** | **61** | **266** | **233 (87.6%)** | **33 open (SMP-related)** |
+| 2026-01-14 | 62 | 7 | 6 | ARP static eviction, timer contention, fragment byte limits, SYN cookie age, ISN entropy, LSM hooks - **6 FIXED, 1 DEFERRED** |
+| 2026-01-14 | - | - | - | **Conntrack state machine implemented** (TCP/UDP/ICMP tracking, stateful firewall foundation) |
+| **Total** | **62** | **273** | **239 (87.5%)** | **34 open (SMP + VirtIO IOMMU)** |
 
 ### Current Status
 
-- **Fixed**: 233 issues (87.6%)
-- **Open**: 33 issues (12.4%)
+- **Fixed**: 239 issues (87.5%)
+- **Open**: 34 issues (12.5%)
   - SMP-related issues deferred to Phase E
-  - No open TCP/network issues blocking current phase
+  - R62-6 (VirtIO IOMMU) deferred to Phase F.3
 
-See [qa-2026-01-13-v3.md](review/qa-2026-01-13-v3.md) for latest audit report.
+See [qa-2026-01-14.md](review/qa-2026-01-14.md) for latest audit report.
 
 ---
 

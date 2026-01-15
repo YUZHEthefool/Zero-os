@@ -6,9 +6,8 @@ Cargo.lock
 
 
 # Binaries
-/.kilocode
 /.vscode
-/claude
+/.claude
 /esp
 /bootloader-target
 /kernel-target
