@@ -268,11 +268,25 @@ pub struct ConntrackEntry {
     pub created_ms: u64,
     /// Whether reply has been seen
     pub seen_reply: bool,
+    /// R63-1 FIX: True initiator direction for this flow.
+    ///
+    /// FlowKey normalization uses lexicographic ordering which may not match
+    /// the actual connection initiator. This field records the direction of
+    /// the first packet (the true initiator) so the state machine can correctly
+    /// distinguish Original (initiator→responder) from Reply (responder→initiator).
+    pub initiator_dir: ConntrackDir,
 }
 
 impl ConntrackEntry {
     /// Create a new entry.
-    pub fn new(key: FlowKey, state: CtProtoState, now_ms: u64) -> Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Normalized flow key
+    /// * `state` - Initial protocol state
+    /// * `now_ms` - Current timestamp in milliseconds
+    /// * `initiator_dir` - Direction of the first packet (true initiator)
+    pub fn new(key: FlowKey, state: CtProtoState, now_ms: u64, initiator_dir: ConntrackDir) -> Self {
         Self {
             key,
             state,
@@ -283,6 +297,7 @@ impl ConntrackEntry {
             packets_reply: 0,
             created_ms: now_ms,
             seen_reply: false,
+            initiator_dir,
         }
     }
 
@@ -393,6 +408,8 @@ pub struct ConntrackStats {
     pub insert_failed: AtomicU64,
     /// Invalid state transitions
     pub invalid_transitions: AtomicU64,
+    /// R63-3 FIX: Entries evicted via LRU when table is full
+    pub evictions: AtomicU64,
     /// Current entry count
     pub current_entries: AtomicU32,
 }
@@ -405,6 +422,7 @@ impl ConntrackStats {
             timeout_deletes: AtomicU64::new(0),
             insert_failed: AtomicU64::new(0),
             invalid_transitions: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
             current_entries: AtomicU32::new(0),
         }
     }
@@ -457,7 +475,17 @@ impl ConntrackTable {
             let entries = self.entries.read();
             if let Some(entry_lock) = entries.get(&key) {
                 let mut entry = entry_lock.lock();
-                let (new_state, decision) = self.transition_state(&entry, dir, proto, l4);
+
+                // R63-1 FIX: Compute state machine direction based on true initiator.
+                // FlowKey normalization uses lexicographic ordering, but the state machine
+                // needs to know if this packet is from the initiator (Original) or responder (Reply).
+                let state_dir = if dir == entry.initiator_dir {
+                    ConntrackDir::Original
+                } else {
+                    ConntrackDir::Reply
+                };
+
+                let (new_state, decision) = self.transition_state(&entry, state_dir, proto, l4);
 
                 if decision == CtDecision::Invalid {
                     self.stats.invalid_transitions.fetch_add(1, Ordering::Relaxed);
@@ -465,7 +493,7 @@ impl ConntrackTable {
                 }
 
                 entry.state = new_state;
-                entry.update_stats(dir, l4.payload_len, now_ms);
+                entry.update_stats(state_dir, l4.payload_len, now_ms);
 
                 return CtUpdateResult {
                     decision: CtDecision::Established,
@@ -488,18 +516,7 @@ impl ConntrackTable {
         l4: &L4Meta,
         now_ms: u64,
     ) -> CtUpdateResult {
-        // Check table capacity
-        let current = self.stats.current_entries.load(Ordering::Relaxed) as usize;
-        if current >= CT_MAX_ENTRIES {
-            self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
-            return CtUpdateResult {
-                decision: CtDecision::Invalid,
-                state: CtProtoState::Other,
-                dir,
-            };
-        }
-
-        // Determine initial state
+        // Determine initial state first (before acquiring lock)
         let initial_state = match proto {
             IPPROTO_TCP => {
                 if l4.is_syn() && !l4.is_ack() {
@@ -537,8 +554,28 @@ impl ConntrackTable {
             );
         }
 
-        let mut entry = ConntrackEntry::new(key, initial_state, now_ms);
-        entry.update_stats(dir, l4.payload_len, now_ms);
+        // R63-2 FIX: Check table capacity UNDER the write lock to prevent
+        // concurrent bypass. Previously, the check was done before acquiring
+        // the lock, allowing multiple threads to pass the check simultaneously.
+        // R63-3 FIX: Use LRU eviction instead of rejecting when table is full.
+        // This prevents attackers from filling the table to block legitimate traffic.
+        if entries.len() >= CT_MAX_ENTRIES {
+            if !self.evict_lru_locked(&mut entries) {
+                // Table is empty but still at capacity? Shouldn't happen.
+                self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+                return CtUpdateResult {
+                    decision: CtDecision::Invalid,
+                    state: CtProtoState::Other,
+                    dir,
+                };
+            }
+        }
+
+        // R63-1 FIX: Pass initiator_dir to track the true connection initiator.
+        // The first packet's direction (dir) is the initiator direction.
+        let mut entry = ConntrackEntry::new(key, initial_state, now_ms, dir);
+        // Use Original for stats since this is the first packet from initiator
+        entry.update_stats(ConntrackDir::Original, l4.payload_len, now_ms);
 
         entries.insert(key, Mutex::new(entry));
         self.stats.entries_created.fetch_add(1, Ordering::Relaxed);
@@ -661,6 +698,35 @@ impl ConntrackTable {
         }
     }
 
+    /// R63-3 FIX: Evict the least-recently-seen entry (LRU) while holding the write lock.
+    ///
+    /// This prevents table exhaustion attacks where an attacker fills the table
+    /// with long-lived UDP or half-open TCP connections to block legitimate traffic.
+    ///
+    /// # Returns
+    ///
+    /// `true` if an entry was evicted, `false` if the table is empty.
+    fn evict_lru_locked(
+        &self,
+        entries: &mut BTreeMap<FlowKey, Mutex<ConntrackEntry>>,
+    ) -> bool {
+        // Find the entry with the oldest last_seen_ms
+        let victim_key = entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.lock().last_seen_ms)
+            .map(|(key, _)| *key);
+
+        if let Some(key) = victim_key {
+            entries.remove(&key);
+            self.stats.entries_deleted.fetch_add(1, Ordering::Relaxed);
+            self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+            self.stats.current_entries.fetch_sub(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Sweep expired entries.
     ///
     /// Should be called periodically from timer context.
@@ -767,6 +833,59 @@ pub fn ct_process_udp(
         dst_ip,
         src_port,
         dst_port,
+        &l4,
+        now_ms,
+    )
+}
+
+/// Process an ICMP packet through connection tracking.
+///
+/// ICMP tracking is simpler than TCP/UDP:
+/// - Echo request/reply pairs can be tracked
+/// - ICMP error messages (Type 3, 11, etc.) are RELATED to existing connections
+/// - Other ICMP messages are treated as NEW
+///
+/// # Arguments
+/// * `src_ip` - Source IP address
+/// * `dst_ip` - Destination IP address
+/// * `icmp_type` - ICMP message type
+/// * `icmp_code` - ICMP message code
+/// * `payload_len` - Length of payload
+/// * `now_ms` - Current time in milliseconds
+pub fn ct_process_icmp(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    icmp_type: u8,
+    icmp_code: u8,
+    payload_len: usize,
+    now_ms: u64,
+) -> CtUpdateResult {
+    // ICMP error messages (Destination Unreachable, Time Exceeded, etc.)
+    // are RELATED to existing connections
+    let is_error_type = icmp_type == 3 || icmp_type == 11 || icmp_type == 12;
+
+    // Use type/code as pseudo-ports for flow tracking
+    // This allows tracking echo request/reply pairs
+    let pseudo_src_port = ((icmp_type as u16) << 8) | (icmp_code as u16);
+    let pseudo_dst_port = 0u16;
+
+    let l4 = L4Meta::new(0, payload_len);
+
+    // For ICMP errors, we could try to find the original connection
+    // For now, treat as simple flow tracking
+    if is_error_type {
+        // ICMP errors are typically RELATED - but without parsing the
+        // embedded packet, we can't confirm. Return NEW for now.
+        // A more sophisticated implementation would parse the embedded
+        // IP header to find the original connection.
+    }
+
+    conntrack_table().update_on_packet(
+        IPPROTO_ICMP,
+        src_ip,
+        dst_ip,
+        pseudo_src_port,
+        pseudo_dst_port,
         &l4,
         now_ms,
     )

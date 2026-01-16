@@ -612,11 +612,17 @@ impl FragmentCache {
 
         // R62-2 FIX: Pre-check global byte limit before insert for EXISTING queues
         // (New queue check is above; this catches fragments adding to existing queues)
+        // R63-6 FIX: Also check global fragment count for existing queues
         if !created_new_queue {
             let current_bytes = self.stats.buffered_bytes.load(Ordering::Relaxed) as usize;
             if current_bytes.saturating_add(payload.len()) > GLOBAL_MAX_FRAG_BYTES {
                 self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
                 return Err(FragmentDropReason::GlobalByteLimit);
+            }
+            let current_frags = self.stats.buffered_fragments.load(Ordering::Relaxed) as usize;
+            if current_frags.saturating_add(1) > GLOBAL_MAX_FRAGS {
+                self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
+                return Err(FragmentDropReason::GlobalFragLimit);
             }
         }
 

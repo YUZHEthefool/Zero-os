@@ -400,6 +400,52 @@ fn allow_challenge_ack(now_ms: u64) -> bool {
 }
 
 // ============================================================================
+// RST Rate Limiting (R63-4 FIX)
+// ============================================================================
+
+/// Maximum RST packets per window period.
+///
+/// R63-4 FIX: Prevents amplification attacks via spoofed packets that trigger
+/// RST responses. Without this limit, attackers can send invalid packets to
+/// cause unlimited RST generation, consuming CPU and bandwidth.
+const RST_RATE_LIMIT: u32 = 100;
+
+/// RST rate limiting window in milliseconds.
+const RST_RATE_WINDOW_MS: u64 = 1000;
+
+/// Token bucket for RST rate limiting.
+static RST_TOKENS: AtomicU32 = AtomicU32::new(RST_RATE_LIMIT);
+
+/// Window start time for RST rate limiter.
+static RST_WINDOW_START: AtomicU64 = AtomicU64::new(0);
+
+/// Check if an RST can be sent (rate limiter).
+///
+/// R63-4 FIX: Implements token bucket rate limiting for RST packets
+/// to prevent amplification attacks.
+fn allow_rst(now_ms: u64) -> bool {
+    let window_start = RST_WINDOW_START.load(Ordering::Relaxed);
+    if window_start == 0 || now_ms.saturating_sub(window_start) >= RST_RATE_WINDOW_MS {
+        RST_WINDOW_START.store(now_ms, Ordering::Relaxed);
+        RST_TOKENS.store(RST_RATE_LIMIT, Ordering::Relaxed);
+    }
+
+    let mut tokens = RST_TOKENS.load(Ordering::Relaxed);
+    while tokens > 0 {
+        match RST_TOKENS.compare_exchange_weak(
+            tokens,
+            tokens - 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(current) => tokens = current,
+        }
+    }
+    false
+}
+
+// ============================================================================
 // Socket Types
 // ============================================================================
 
@@ -1110,6 +1156,8 @@ pub struct SocketTable {
     /// Last observed timestamp (ms) used for TIME_WAIT bookkeeping.
     /// Updated by sweep_time_wait() and used by RX path when transitioning to TIME_WAIT.
     time_wait_clock: AtomicU64,
+    /// R63-5 FIX: Timer sweeps skipped due to lock contention
+    timer_sweeps_skipped: AtomicU64,
     /// Statistics
     created: AtomicU64,
     closed_count: AtomicU64,
@@ -1149,6 +1197,7 @@ impl SocketTable {
             tcp_bindings: Mutex::new(BTreeMap::new()),
             tcp_conns: Mutex::new(BTreeMap::new()),
             time_wait_clock: AtomicU64::new(0),
+            timer_sweeps_skipped: AtomicU64::new(0),
             created: AtomicU64::new(0),
             closed_count: AtomicU64::new(0),
             bind_count: AtomicU64::new(0),
@@ -2527,6 +2576,7 @@ impl SocketTable {
             closed: self.closed_count.load(Ordering::Relaxed),
             active: self.sockets.read().len(),
             bound_ports: self.udp_bindings.lock().len(),
+            timer_sweeps_skipped: self.timer_sweeps_skipped.load(Ordering::Relaxed),
         }
     }
 
@@ -3015,14 +3065,14 @@ impl SocketTable {
                             // This prevents attacks with forged ACK numbers that could
                             // corrupt send-window accounting
                             if header.ack_num != cookie_data.iss.wrapping_add(1) {
-                                return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                                return self.build_tcp_rst(dst_ip, src_ip, header, payload);
                             }
 
                             // Security: SYN-cookie completion must be a pure ACK (no data)
                             // Accepting data here would silently drop or misorder it
                             // and increase attack surface for injection attacks
                             if !payload.is_empty() {
-                                return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                                return self.build_tcp_rst(dst_ip, src_ip, header, payload);
                             }
 
                             // Valid SYN cookie - create connection
@@ -3053,7 +3103,7 @@ impl SocketTable {
                                 if let Some(listen_state) = listen_guard.as_ref() {
                                     if listen_state.accept_queue.len() >= listen_state.accept_backlog {
                                         // Accept queue full - send RST
-                                        return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                                        return self.build_tcp_rst(dst_ip, src_ip, header, payload);
                                     }
                                 }
                             }
@@ -3123,7 +3173,7 @@ impl SocketTable {
                                 // Accept queue became full between check and push
                                 child.mark_closed();
                                 self.cleanup_tcp_connection(&child);
-                                return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                                return self.build_tcp_rst(dst_ip, src_ip, header, payload);
                             }
 
                             // Wake waiting accept()
@@ -3136,7 +3186,7 @@ impl SocketTable {
                 }
 
                 // No connection found - send RST per RFC 793
-                return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                return self.build_tcp_rst(dst_ip, src_ip, header, payload);
             }
         };
 
@@ -3147,7 +3197,7 @@ impl SocketTable {
             None => {
                 // Socket has no TCP state (shouldn't happen for TCP sockets)
                 drop(guard);
-                return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                return self.build_tcp_rst(dst_ip, src_ip, header, payload);
             }
         };
 
@@ -3171,7 +3221,7 @@ impl SocketTable {
                     drop(guard);
                     self.cleanup_tcp_connection(&sock);
                     sock.wake_tcp_waiters();
-                    return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                    return self.build_tcp_rst(dst_ip, src_ip, header, payload);
                 }
 
                 // Validate ACK number: must acknowledge our SYN (ISS + 1)
@@ -3182,7 +3232,7 @@ impl SocketTable {
                     drop(guard);
                     self.cleanup_tcp_connection(&sock);
                     sock.wake_tcp_waiters();
-                    return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                    return self.build_tcp_rst(dst_ip, src_ip, header, payload);
                 }
 
                 // Accept the remote's ISN and transition to ESTABLISHED
@@ -4382,7 +4432,7 @@ impl SocketTable {
                     // it's removed from sockets map (cleanup checks is_closed())
                     sock.mark_closed();
                     self.cleanup_tcp_connection(&sock);
-                    return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                    return self.build_tcp_rst(dst_ip, src_ip, header, payload);
                 }
 
                 // Handshake complete - transition to Established
@@ -4421,7 +4471,7 @@ impl SocketTable {
                         // R51-1 FIX (Codex): Mark socket closed before cleanup
                         sock.mark_closed();
                         self.cleanup_tcp_connection(&sock);
-                        return Some(self.build_tcp_rst(dst_ip, src_ip, header, payload));
+                        return self.build_tcp_rst(dst_ip, src_ip, header, payload);
                     }
                 }
 
@@ -4625,6 +4675,8 @@ impl SocketTable {
                     // Still contended - skip this sweep but don't starve indefinitely
                     // The next timer tick will retry. Under sustained flood, some sweeps
                     // will succeed between write bursts.
+                    // R63-5 FIX: Track skipped sweeps for monitoring/alerting
+                    self.timer_sweeps_skipped.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             }
@@ -5083,6 +5135,8 @@ impl SocketTable {
 
     /// Build a TCP RST segment for invalid/unknown connections.
     ///
+    /// R63-4 FIX: Returns `None` if RST rate limit is exceeded.
+    ///
     /// Per RFC 793:
     /// - If ACK was set: RST seq = incoming ACK number, no ACK flag
     /// - If ACK was not set: RST seq = 0, ACK = incoming SEQ + segment length
@@ -5092,14 +5146,19 @@ impl SocketTable {
         remote_ip: Ipv4Addr,
         header: &TcpHeader,
         payload: &[u8],
-    ) -> Vec<u8> {
+    ) -> Option<Vec<u8>> {
+        // R63-4 FIX: Rate limit RST responses to prevent amplification attacks
+        if !allow_rst(self.time_wait_now()) {
+            return None;
+        }
+
         let is_ack = header.flags & TCP_FLAG_ACK != 0;
         let is_syn = header.flags & TCP_FLAG_SYN != 0;
         let is_fin = header.flags & 0x01 != 0; // FIN flag
 
         if is_ack {
             // RFC 793: <SEQ=SEG.ACK><CTL=RST>
-            build_tcp_segment(
+            Some(build_tcp_segment(
                 local_ip,
                 remote_ip,
                 header.dst_port,
@@ -5109,7 +5168,7 @@ impl SocketTable {
                 TCP_FLAG_RST,
                 0,
                 &[],
-            )
+            ))
         } else {
             // RFC 793: <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>
             let mut seg_len = payload.len() as u32;
@@ -5121,7 +5180,7 @@ impl SocketTable {
             }
             let ack_num = header.seq_num.wrapping_add(seg_len);
 
-            build_tcp_segment(
+            Some(build_tcp_segment(
                 local_ip,
                 remote_ip,
                 header.dst_port,
@@ -5131,7 +5190,7 @@ impl SocketTable {
                 TCP_FLAG_RST | TCP_FLAG_ACK,
                 0,
                 &[],
-            )
+            ))
         }
     }
 }
@@ -5143,6 +5202,8 @@ pub struct TableStats {
     pub closed: u64,
     pub active: usize,
     pub bound_ports: usize,
+    /// R63-5 FIX: Timer sweeps skipped due to lock contention
+    pub timer_sweeps_skipped: u64,
 }
 
 // ============================================================================

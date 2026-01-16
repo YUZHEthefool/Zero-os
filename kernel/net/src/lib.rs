@@ -45,6 +45,7 @@ pub mod buffer;
 pub mod conntrack;
 pub mod device;
 pub mod ethernet;
+pub mod firewall;
 pub mod fragment;
 pub mod icmp;
 pub mod ipv4;
@@ -110,6 +111,11 @@ pub use fragment::{
     process_fragment, cleanup_expired_fragments, fragment_cache,
     FragmentCache, FragmentDropReason, FragmentKey, FragmentStats,
     FRAG_TIMEOUT_MS, MAX_PACKET_SIZE, MAX_FRAGS_PER_QUEUE,
+};
+pub use firewall::{
+    firewall_table, log_match, CtStateMask, FirewallAction, FirewallPacket, FirewallRule,
+    FirewallRuleBuilder, FirewallStats, FirewallStatsSnapshot, FirewallTable, FirewallVerdict,
+    IpCidrMatch, PortRange,
 };
 
 // ============================================================================

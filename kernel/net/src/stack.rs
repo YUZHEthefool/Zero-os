@@ -37,6 +37,7 @@
 //! - Broadcast/multicast sources are rejected
 
 use alloc::vec::Vec;
+use core::cmp;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::{Mutex, Once};
 
@@ -44,15 +45,19 @@ use crate::arp::{process_arp, ArpCache, ArpEntryKind, ArpError, ArpResult, ArpSt
 use crate::buffer::NetBuf;
 use crate::device::TxError;
 use crate::ethernet::{parse_ethernet, build_ethernet_frame, EthAddr, EthHeader, ETHERTYPE_IPV4, ETHERTYPE_ARP};
+use crate::firewall::{firewall_table, FirewallAction, FirewallPacket, FirewallVerdict};
 use crate::fragment::{process_fragment as reassemble_fragment, cleanup_expired_fragments, FragmentDropReason};
 use crate::get_device;
-use crate::icmp::{build_echo_reply, parse_icmp, IcmpError, ICMP_RATE_LIMITER, ICMP_TYPE_ECHO_REQUEST};
+use crate::icmp::{build_dest_unreachable, build_echo_reply, parse_icmp, IcmpError, ICMP_CODE_PORT_UNREACHABLE, ICMP_RATE_LIMITER, ICMP_TYPE_ECHO_REQUEST};
 use crate::ipv4::{
-    build_ipv4_header, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
+    build_ipv4_header, compute_checksum, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
     IPV4_HEADER_MIN_LEN,
 };
 use crate::socket::socket_table;
-use crate::tcp::{parse_tcp_header, parse_tcp_options, verify_tcp_checksum, TcpError, TCP_HEADER_MIN_LEN};
+use crate::tcp::{
+    parse_tcp_header, parse_tcp_options, verify_tcp_checksum, build_tcp_segment,
+    TcpError, TCP_HEADER_MIN_LEN, TCP_FLAG_ACK, TCP_FLAG_SYN, TCP_FLAG_FIN, TCP_FLAG_RST,
+};
 use crate::udp::{parse_udp, UdpError, UdpResult, UdpStats};
 use crate::DEFAULT_MTU;
 
@@ -205,6 +210,11 @@ pub enum DropReason {
     UnsupportedProtocol,
     /// Rate limited
     RateLimited,
+    /// Dropped by firewall
+    Firewall {
+        rule_id: Option<u32>,
+        rejected: bool,
+    },
 }
 
 // ============================================================================
@@ -342,7 +352,7 @@ fn process_ipv4(
         }
         Some(Ipv4Proto::Udp) => {
             // Process UDP packet
-            process_udp(&final_payload, &ip_hdr, stats, is_broadcast_dst, now_ms)
+            process_udp(&final_payload, &ip_hdr, eth_hdr, stats, is_broadcast_dst, now_ms)
         }
         Some(Ipv4Proto::Tcp) => {
             // Process TCP packet
@@ -367,6 +377,7 @@ fn process_ipv4(
 fn process_udp(
     payload: &[u8],
     ip_hdr: &Ipv4Header,
+    eth_hdr: &EthHeader,
     stats: &NetStats,
     is_broadcast_dst: bool,
     now_ms: u64,
@@ -398,6 +409,36 @@ fn process_udp(
 
     // Record bytes received
     stats.udp_stats.add_rx_bytes(data.len() as u64);
+
+    // Conntrack: Update connection tracking state (used by firewall)
+    #[cfg(feature = "conntrack")]
+    let ct_result = {
+        use crate::conntrack::ct_process_udp;
+        Some(ct_process_udp(
+            ip_hdr.src,
+            ip_hdr.dst,
+            header.src_port,
+            header.dst_port,
+            payload.len(),
+            now_ms,
+        ))
+    };
+    #[cfg(not(feature = "conntrack"))]
+    let ct_result: Option<crate::conntrack::CtUpdateResult> = None;
+
+    // Firewall: Evaluate packet against rule table
+    let fw_packet = FirewallPacket {
+        src_ip: ip_hdr.src,
+        dst_ip: ip_hdr.dst,
+        proto: Ipv4Proto::Udp,
+        src_port: Some(header.src_port),
+        dst_port: Some(header.dst_port),
+        ct_state: ct_result.as_ref().map(|r| r.decision),
+    };
+    let fw_verdict = firewall_table().evaluate(&fw_packet);
+    if let Some(result) = apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, payload, now_ms) {
+        return result;
+    }
 
     // Deliver to socket layer
     if socket_table().deliver_udp(header.dst_port, ip_hdr.src, header.src_port, data, now_ms) {
@@ -440,6 +481,37 @@ fn process_icmp(
             return ProcessResult::Dropped(DropReason::IcmpError(e));
         }
     };
+
+    // R64-2 FIX: Add firewall evaluation for ICMP traffic
+    // ICMP uses conntrack for RELATED state (e.g., ICMP errors for tracked connections)
+    #[cfg(feature = "conntrack")]
+    let ct_result = {
+        use crate::conntrack::ct_process_icmp;
+        Some(ct_process_icmp(
+            ip_hdr.src,
+            ip_hdr.dst,
+            icmp_hdr.icmp_type,
+            icmp_hdr.code,
+            packet.len(),
+            now_ms,
+        ))
+    };
+    #[cfg(not(feature = "conntrack"))]
+    let ct_result: Option<crate::conntrack::CtUpdateResult> = None;
+
+    // Firewall: Evaluate ICMP packet against rule table
+    let fw_packet = FirewallPacket {
+        src_ip: ip_hdr.src,
+        dst_ip: ip_hdr.dst,
+        proto: Ipv4Proto::Icmp,
+        src_port: None,  // ICMP has no ports
+        dst_port: None,
+        ct_state: ct_result.as_ref().map(|r| r.decision),
+    };
+    let fw_verdict = firewall_table().evaluate(&fw_packet);
+    if let Some(result) = apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, packet, now_ms) {
+        return result;
+    }
 
     // Handle echo request (ping)
     if icmp_hdr.icmp_type == ICMP_TYPE_ECHO_REQUEST {
@@ -548,12 +620,11 @@ fn process_tcp(
     // Extract payload (data after TCP header)
     let tcp_payload = &payload[hdr_len..];
 
-    // Conntrack: Update connection tracking state
-    // This provides stateful firewall support independent of socket layer
+    // Conntrack: Update connection tracking state (used by firewall)
     #[cfg(feature = "conntrack")]
-    {
-        use crate::conntrack::{ct_process_tcp, CtDecision};
-        let ct_result = ct_process_tcp(
+    let ct_result = {
+        use crate::conntrack::ct_process_tcp;
+        Some(ct_process_tcp(
             ip_hdr.src,
             ip_hdr.dst,
             tcp_hdr.src_port,
@@ -561,10 +632,23 @@ fn process_tcp(
             tcp_hdr.flags,
             tcp_payload.len(),
             now_ms,
-        );
-        // Future: Use ct_result.decision for firewall policy
-        // For now, just track state without blocking
-        let _ = ct_result;
+        ))
+    };
+    #[cfg(not(feature = "conntrack"))]
+    let ct_result: Option<crate::conntrack::CtUpdateResult> = None;
+
+    // Firewall: Evaluate packet against rule table
+    let fw_packet = FirewallPacket {
+        src_ip: ip_hdr.src,
+        dst_ip: ip_hdr.dst,
+        proto: Ipv4Proto::Tcp,
+        src_port: Some(tcp_hdr.src_port),
+        dst_port: Some(tcp_hdr.dst_port),
+        ct_state: ct_result.as_ref().map(|r| r.decision),
+    };
+    let fw_verdict = firewall_table().evaluate(&fw_packet);
+    if let Some(result) = apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, payload, now_ms) {
+        return result;
     }
 
     // R58: Parse TCP options for window scaling support
@@ -807,6 +891,180 @@ pub fn transmit_tcp_segment(dst_ip: Ipv4Addr, segment: &[u8]) -> Result<(), TxEr
 /// * `Err(TxError)` on failure
 pub fn transmit_udp_datagram(dst_ip: Ipv4Addr, datagram: &[u8]) -> Result<(), TxError> {
     build_frame_and_transmit(Ipv4Proto::Udp, dst_ip, datagram)
+}
+
+// ============================================================================
+// Firewall Helpers
+// ============================================================================
+
+/// Build original IP header snapshot for ICMP reject response.
+///
+/// Per RFC 792, ICMP error messages include the original IP header + first 8 bytes
+/// of the original payload (L4 header).
+///
+/// # R64-3 NOTE: Current implementation reconstructs the IP header from parsed fields
+/// rather than copying the original bytes. This means:
+/// - IP options are not included (assumes IHL=5)
+/// - Checksum is recalculated
+///
+/// A more RFC-compliant implementation would pass through the original packet slice.
+/// This is acceptable for most cases but may cause issues with packets containing
+/// IP options. Future improvement: pass original IP header bytes through the call chain.
+fn build_original_ip_for_reject(ip_hdr: &Ipv4Header, l4_bytes: &[u8]) -> Vec<u8> {
+    let quoted_len = cmp::min(l4_bytes.len(), 8);
+    let mut hdr = [0u8; IPV4_HEADER_MIN_LEN];
+
+    // Build minimal header snapshot from the parsed fields
+    hdr[0] = 0x45; // Version + IHL (no options)
+    hdr[1] = ip_hdr.dscp_ecn;
+    let total_len = (IPV4_HEADER_MIN_LEN + quoted_len) as u16;
+    hdr[2..4].copy_from_slice(&total_len.to_be_bytes());
+    hdr[4..6].copy_from_slice(&ip_hdr.identification.to_be_bytes());
+    hdr[6..8].copy_from_slice(&ip_hdr.flags_fragment.to_be_bytes());
+    hdr[8] = ip_hdr.ttl;
+    hdr[9] = ip_hdr.protocol;
+    hdr[12..16].copy_from_slice(&ip_hdr.src.0);
+    hdr[16..20].copy_from_slice(&ip_hdr.dst.0);
+    let checksum = compute_checksum(&hdr, IPV4_HEADER_MIN_LEN);
+    hdr[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+    let mut snapshot = Vec::with_capacity(IPV4_HEADER_MIN_LEN + quoted_len);
+    snapshot.extend_from_slice(&hdr);
+    if quoted_len > 0 {
+        snapshot.extend_from_slice(&l4_bytes[..quoted_len]);
+    }
+    snapshot
+}
+
+/// Apply firewall verdict, generating response if needed.
+///
+/// Returns `Some(ProcessResult)` if the packet should be dropped/rejected,
+/// or `None` if the packet should be accepted and processing should continue.
+fn apply_firewall_verdict(
+    verdict: &FirewallVerdict,
+    packet: &FirewallPacket,
+    ip_hdr: &Ipv4Header,
+    eth_hdr: &EthHeader,
+    l4_bytes: &[u8],
+    now_ms: u64,
+) -> Option<ProcessResult> {
+    crate::firewall::log_match(verdict, packet, now_ms);
+
+    match verdict.action {
+        FirewallAction::Accept => None,
+        FirewallAction::Drop => Some(ProcessResult::Dropped(DropReason::Firewall {
+            rule_id: verdict.rule_id,
+            rejected: false,
+        })),
+        FirewallAction::Reject { icmp_code } => {
+            // Don't send ICMP errors to broadcast/multicast
+            if ip_hdr.dst.is_broadcast() || ip_hdr.dst.is_multicast() {
+                return Some(ProcessResult::Dropped(DropReason::Firewall {
+                    rule_id: verdict.rule_id,
+                    rejected: true,
+                }));
+            }
+
+            // R64-1 FIX: Rate limit firewall REJECT ICMP responses
+            // Prevents reflection/amplification attacks
+            if !ICMP_RATE_LIMITER.allow(now_ms) {
+                return Some(ProcessResult::Dropped(DropReason::Firewall {
+                    rule_id: verdict.rule_id,
+                    rejected: true,
+                }));
+            }
+
+            // R64-5 FIX: For TCP rejections, send a TCP RST per RFC 793 instead of ICMP
+            // This is more appropriate for TCP as RST immediately terminates the connection
+            // and is the standard response for rejected TCP traffic.
+            if packet.proto == Ipv4Proto::Tcp {
+                if let Ok(tcp_hdr) = parse_tcp_header(l4_bytes) {
+                    let hdr_len = tcp_hdr.header_len();
+                    if l4_bytes.len() >= hdr_len && hdr_len >= TCP_HEADER_MIN_LEN {
+                        let tcp_payload = &l4_bytes[hdr_len..];
+
+                        let is_ack = tcp_hdr.flags & TCP_FLAG_ACK != 0;
+                        let is_syn = tcp_hdr.flags & TCP_FLAG_SYN != 0;
+                        let is_fin = tcp_hdr.flags & TCP_FLAG_FIN != 0;
+
+                        // RFC 793: If ACK was set, RST seq = incoming ACK number, no ACK flag
+                        // If ACK was not set, RST seq = 0, ACK = incoming SEQ + segment length
+                        let (seq_num, ack_num, flags) = if is_ack {
+                            (tcp_hdr.ack_num, 0, TCP_FLAG_RST)
+                        } else {
+                            let mut seg_len = tcp_payload.len() as u32;
+                            if is_syn {
+                                seg_len = seg_len.wrapping_add(1);
+                            }
+                            if is_fin {
+                                seg_len = seg_len.wrapping_add(1);
+                            }
+                            let computed_ack = tcp_hdr.seq_num.wrapping_add(seg_len);
+                            (0, computed_ack, TCP_FLAG_RST | TCP_FLAG_ACK)
+                        };
+
+                        let rst_segment = build_tcp_segment(
+                            ip_hdr.dst,     // Our IP as source
+                            ip_hdr.src,     // Original source as destination
+                            tcp_hdr.dst_port,
+                            tcp_hdr.src_port,
+                            seq_num,
+                            ack_num,
+                            flags,
+                            0,              // Window size
+                            &[],            // No payload
+                        );
+
+                        let ip_reply = build_ipv4_header(
+                            ip_hdr.dst,
+                            ip_hdr.src,
+                            Ipv4Proto::Tcp,
+                            rst_segment.len() as u16,
+                            64,
+                        );
+
+                        let mut ip_packet = Vec::with_capacity(ip_reply.len() + rst_segment.len());
+                        ip_packet.extend_from_slice(&ip_reply);
+                        ip_packet.extend_from_slice(&rst_segment);
+
+                        let frame = build_ethernet_frame(
+                            eth_hdr.src,
+                            eth_hdr.dst,
+                            ETHERTYPE_IPV4,
+                            &ip_packet,
+                        );
+
+                        return Some(ProcessResult::Reply(frame));
+                    }
+                }
+                // If TCP header parsing fails, fall through to ICMP response
+            }
+
+            // Build ICMP destination unreachable for non-TCP protocols
+            let quoted = build_original_ip_for_reject(ip_hdr, l4_bytes);
+            let icmp = build_dest_unreachable(icmp_code, &quoted);
+            let ip_reply = build_ipv4_header(
+                ip_hdr.dst,
+                ip_hdr.src,
+                Ipv4Proto::Icmp,
+                icmp.len() as u16,
+                64,
+            );
+
+            let mut ip_packet = Vec::with_capacity(ip_reply.len() + icmp.len());
+            ip_packet.extend_from_slice(&ip_reply);
+            ip_packet.extend_from_slice(&icmp);
+
+            let frame = build_ethernet_frame(
+                eth_hdr.src,
+                eth_hdr.dst,
+                ETHERTYPE_IPV4,
+                &ip_packet,
+            );
+
+            Some(ProcessResult::Reply(frame))
+        }
+    }
 }
 
 // ============================================================================

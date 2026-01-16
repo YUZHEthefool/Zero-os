@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-14
+**Last Updated:** 2026-01-15
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -13,7 +13,7 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 ### Current Status: Phase D.3 In Progress (SYN Cookies Complete)
 
 Zero-OS has completed storage foundation and is building network infrastructure:
-- **61 security audits** with 266 issues found, ~233 fixed (87.6%)
+- **63 security audits** with 279 issues found, ~245 fixed (87.8%)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -38,7 +38,7 @@ Zero-OS has completed storage foundation and is building network infrastructure:
 |----------|-------|---------|-----|
 | **SMP** | 256+ CPUs | Single-core | Full implementation needed |
 | **Security Framework** | LSM/SELinux/AppArmor | LSM + Seccomp + Capabilities | ✅ Framework complete, policies needed |
-| **Network** | Full TCP/IP stack | TCP (w/retransmission + NewReno CC + Window Scaling + SYN cookies), UDP, ICMP | SACK, Timestamps, Conntrack |
+| **Network** | Full TCP/IP stack | TCP (w/retransmission + NewReno CC + Window Scaling + SYN cookies + Conntrack + Firewall), UDP, ICMP | SACK, Timestamps |
 | **Storage** | ext4/xfs/btrfs/zfs | virtio-blk + ext2 + procfs | Extended FS support needed |
 | **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard/VirtIO | Driver framework needed |
 | **Containers** | Namespaces/Cgroups | Not started | Full implementation needed |
@@ -496,8 +496,8 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] **R59-2 FIXED**: CSPRNG fallback uses RDTSC mixing (not predictable counter)
 - [x] **R60 IMPLEMENTED**: Fragment reassembly anti-DoS (per-source limits, overlap rejection)
 - [x] **R61 IMPLEMENTED**: SYN cookies (RFC 4987) - stateless SYN-ACK on backlog full
-- [ ] Conntrack state machine
-- [ ] Basic firewall (match + action table)
+- [x] **R63 IMPLEMENTED**: Conntrack state machine (TCP/UDP/ICMP tracking, direction fix, LRU eviction)
+- [x] **R63 IMPLEMENTED**: Basic firewall (match + action table, stateful filtering, ACCEPT/DROP/REJECT)
 
 #### D.4 Socket API ✅ COMPLETE
 
@@ -718,16 +718,17 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-13 | 61 | 2 | 2 | SYN cookies (RFC 4987), ACK validation, pure ACK enforcement - **ALL FIXED** |
 | 2026-01-14 | 62 | 7 | 6 | ARP static eviction, timer contention, fragment byte limits, SYN cookie age, ISN entropy, LSM hooks - **6 FIXED, 1 DEFERRED** |
 | 2026-01-14 | - | - | - | **Conntrack state machine implemented** (TCP/UDP/ICMP tracking, stateful firewall foundation) |
-| **Total** | **62** | **273** | **239 (87.5%)** | **34 open (SMP + VirtIO IOMMU)** |
+| 2026-01-15 | 63 | 6 | 6 | Conntrack direction fix, capacity bypass, LRU eviction, RST rate limit, timer monitoring, fragment count - **ALL FIXED** |
+| **Total** | **63** | **279** | **245 (87.8%)** | **34 open (SMP + VirtIO IOMMU)** |
 
 ### Current Status
 
-- **Fixed**: 239 issues (87.5%)
-- **Open**: 34 issues (12.5%)
+- **Fixed**: 245 issues (87.8%)
+- **Open**: 34 issues (12.2%)
   - SMP-related issues deferred to Phase E
   - R62-6 (VirtIO IOMMU) deferred to Phase F.3
 
-See [qa-2026-01-14.md](review/qa-2026-01-14.md) for latest audit report.
+See [qa-2026-01-15.md](review/qa-2026-01-15.md) for latest audit report.
 
 ---
 
