@@ -86,8 +86,8 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 // 堆地址必须在 bootloader 映射的范围内
 // Bootloader 映射了物理地址 0x0-0x1000000 (16MB) 到虚拟地址 0xffffffff80000000
 // 内核代码占用了前面的部分，我们将堆放在 2MB 之后
-const HEAP_START: usize = 0xffffffff80200000; // 虚拟地址 2MB 处
-const HEAP_SIZE: usize = 512 * 1024; // 512KB (increased for audit subsystem and shell)
+const HEAP_START: usize = 0xffffffff80400000; // 虚拟地址 4MB 处（确保不与BSS段重叠）
+const HEAP_SIZE: usize = 1024 * 1024; // 1MB (increased for runtime tests and buddy allocator bitmaps)
 
 /// 物理内存管理起始地址（硬编码后备值，在256MB处）
 const FALLBACK_PHYS_MEM_START: u64 = 0x10000000;

@@ -102,7 +102,8 @@ pub struct VirtioNetDevice {
     /// R44-1 FIX: Driver-tracked TX chain links (device can't tamper)
     tx_chain_next: Vec<Option<u16>>,
     /// Inflight RX buffers (indexed by descriptor head)
-    rx_inflight: Vec<Option<NetBuf>>,
+    /// R65-24 FIX: Now stores RxInflight with driver-tracked capacity
+    rx_inflight: Vec<Option<RxInflight>>,
     /// R44-1 FIX: Driver-tracked RX chain links (device can't tamper)
     rx_chain_next: Vec<Option<u16>>,
     /// Received packets ready for delivery
@@ -120,6 +121,18 @@ struct NetStats {
     rx_bytes: u64,
     tx_errors: u64,
     rx_errors: u64,
+}
+
+/// R65-24 FIX: Driver-owned metadata for inflight RX buffers.
+///
+/// Tracks the buffer and the maximum payload capacity we told the device.
+/// This allows us to clamp device-reported lengths to prevent DMA overrun
+/// attacks where a malicious device reports a larger length than the buffer.
+struct RxInflight {
+    /// The actual buffer
+    buf: NetBuf,
+    /// Maximum payload capacity posted to the device (excluding virtio-net header)
+    capacity: usize,
 }
 
 // SAFETY: VirtioNetDevice manages virtqueue and transport resources
@@ -364,8 +377,9 @@ impl VirtioNetDevice {
             .get_mut(head as usize)
             .and_then(Option::take);
 
-        // Retrieve the buffer
-        let buf = self
+        // Retrieve the buffer and its posted capacity
+        // R65-24 FIX: Extract driver-tracked capacity for length clamping
+        let RxInflight { buf, capacity } = self
             .rx_inflight
             .get_mut(head as usize)
             .and_then(Option::take)
@@ -400,7 +414,23 @@ impl VirtioNetDevice {
             return Err(RxError::InvalidPacket);
         }
 
-        let payload_len = total_len - VIRTIO_NET_HDR_SIZE;
+        // R65-24 FIX: Clamp payload length to driver-posted capacity
+        // This prevents DMA overrun attacks where device reports larger length
+        // than the buffer we actually posted. The DMA may have corrupted adjacent
+        // memory, but we at least won't propagate the inflated length upstream.
+        let raw_payload_len = total_len - VIRTIO_NET_HDR_SIZE;
+        let payload_len = if raw_payload_len > capacity {
+            // Device reported more bytes than we posted - log and count as error
+            // This makes device misbehavior visible while still delivering data
+            self.stats.rx_errors += 1;
+            drivers::println!(
+                "[net] WARNING: device reported len {} > posted capacity {}, clamping",
+                raw_payload_len, capacity
+            );
+            capacity
+        } else {
+            raw_payload_len
+        };
 
         let mut buf = buf;
         if !buf.set_len(payload_len) {
@@ -644,7 +674,13 @@ impl NetDevice for VirtioNetDevice {
             // Track inflight buffer
             // R44-1 FIX: Track driver-owned chain link
             self.rx_chain_next[header_idx as usize] = Some(data_idx);
-            self.rx_inflight[header_idx as usize] = Some(buf);
+            // R65-24 FIX: Store RxInflight with driver-tracked capacity
+            // Capture capacity BEFORE moving buf into the struct
+            let posted_capacity = buf.payload_capacity();
+            self.rx_inflight[header_idx as usize] = Some(RxInflight {
+                buf,
+                capacity: posted_capacity,
+            });
             posted += 1;
         }
 

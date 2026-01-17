@@ -64,10 +64,10 @@ use crate::tcp::{
     seq_ge, seq_gt, seq_in_window, syn_cookie_select_mss, update_congestion_control,
     validate_cwnd_after_idle, validate_syn_cookie, CongestionAction, TcpConnKey, TcpControlBlock,
     TcpHeader, TcpOptionKind, TcpOptions, TcpSegment, TcpState, TCP_DEFAULT_WINDOW, TCP_ETHERNET_MSS,
-    TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_FIN_TIMEOUT_MS,
-    TCP_MAX_ACCEPT_BACKLOG, TCP_MAX_ACTIVE_CONNECTIONS, TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES,
-    TCP_MAX_RTO_MS, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_WINDOW_SCALE, TCP_PROTO,
-    TCP_SYN_TIMEOUT_MS, TCP_TIME_WAIT_MS,
+    TCP_FIN_WAIT_2_TIMEOUT_MS, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN,
+    TCP_FIN_TIMEOUT_MS, TCP_MAX_ACCEPT_BACKLOG, TCP_MAX_ACTIVE_CONNECTIONS, TCP_MAX_FIN_RETRIES,
+    TCP_MAX_RETRIES, TCP_MAX_RTO_MS, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_WINDOW_SCALE,
+    TCP_PROTO, TCP_SYN_TIMEOUT_MS, TCP_TIME_WAIT_MS,
 };
 use crate::stack::transmit_tcp_segment;
 use crate::udp::{
@@ -3674,6 +3674,8 @@ impl SocketTable {
                     tcp_state.control.fin_sent_time = 0;
                     tcp_state.control.fin_retries = 0;
                     tcp_state.control.state = TcpState::FinWait2;
+                    // R65-5 FIX: Start FIN_WAIT_2 idle timeout timer
+                    tcp_state.control.fin_wait2_start = self.time_wait_now();
                 }
 
                 let mut data_received = false;
@@ -4640,7 +4642,9 @@ impl SocketTable {
     /// This function uses try_lock to avoid deadlock when called from timer
     /// interrupt context. If the sockets lock is held, the sweep is skipped
     /// and will be retried on the next timer tick.
-    pub fn run_tcp_timers(&self, current_time_ms: u64, sweep_time_wait: bool) {
+    /// R65-6 FIX: Returns `true` if timer sweep completed successfully, `false` if
+    /// skipped due to lock contention (caller should defer work to safe context).
+    pub fn run_tcp_timers(&self, current_time_ms: u64, sweep_time_wait: bool) -> bool {
         // Update cached time so RX path can stamp new TIME_WAIT transitions
         self.time_wait_clock.store(current_time_ms, Ordering::Relaxed);
 
@@ -4677,7 +4681,8 @@ impl SocketTable {
                     // will succeed between write bursts.
                     // R63-5 FIX: Track skipped sweeps for monitoring/alerting
                     self.timer_sweeps_skipped.fetch_add(1, Ordering::Relaxed);
-                    return;
+                    // R65-6 FIX: Return false to signal incomplete - caller should defer
+                    return false;
                 }
             }
         };
@@ -4719,6 +4724,27 @@ impl SocketTable {
                         && current_time_ms.saturating_sub(start) >= TCP_TIME_WAIT_MS
                     {
                         should_cleanup = true;
+                    }
+                }
+
+                // R65-5 FIX: FIN_WAIT_2 idle timeout handling
+                //
+                // Without this timeout, connections can remain in FIN_WAIT_2 indefinitely
+                // if the peer never sends their FIN. This creates a resource exhaustion
+                // vulnerability: an attacker can establish many connections, send FIN,
+                // and never complete the close sequence.
+                //
+                // Linux uses tcp_fin_timeout sysctl (default 60 seconds). We implement
+                // the same approach: if no FIN is received within the timeout, clean up
+                // the connection to reclaim resources.
+                if tcp_state.control.state == TcpState::FinWait2 && sweep_time_wait {
+                    let start = tcp_state.control.fin_wait2_start;
+                    if start != 0
+                        && current_time_ms.saturating_sub(start) >= TCP_FIN_WAIT_2_TIMEOUT_MS
+                    {
+                        // Timeout expired - peer never sent FIN, cleanup connection
+                        should_cleanup = true;
+                        mark_timeout_close = true;
                     }
                 }
 
@@ -5049,6 +5075,351 @@ impl SocketTable {
         for (dst_ip, seg) in data_retransmit {
             let _ = transmit_tcp_segment(dst_ip, &seg);
         }
+
+        // R65-6 FIX: Signal successful completion to caller
+        true
+    }
+
+    /// R65-6 FIX: Blocking variant of run_tcp_timers for safe (non-IRQ) context.
+    ///
+    /// Called from syscall return path to drain deferred timer work when IRQ-time
+    /// processing was incomplete due to lock contention.
+    ///
+    /// Unlike run_tcp_timers(), this function uses blocking locks and is guaranteed
+    /// to complete (unless the kernel is severely broken). This ensures timer work
+    /// is not starved indefinitely under sustained lock contention.
+    ///
+    /// # Returns
+    ///
+    /// Always `true` since blocking locks guarantee completion.
+    pub fn run_tcp_timers_blocking(&self, current_time_ms: u64, sweep_time_wait: bool) -> bool {
+        // Update cached time so RX path can stamp new TIME_WAIT transitions
+        self.time_wait_clock.store(current_time_ms, Ordering::Relaxed);
+
+        // Collect sockets for cleanup and FIN retransmissions
+        let mut to_cleanup: Vec<Arc<SocketState>> = Vec::new();
+        let mut fin_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
+        let mut data_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
+        let mut syn_timeouts: Vec<(Arc<SocketState>, Ipv4Addr, Option<Vec<u8>>)> = Vec::new();
+
+        // R65-6 FIX: Use blocking read lock - safe in non-IRQ context
+        let sockets_guard = self.sockets.read();
+
+        for sock in sockets_guard.values() {
+            let meta = sock.meta_snapshot();
+            let key_parts = match (
+                meta.local_ip.map(Ipv4Addr),
+                meta.local_port,
+                meta.remote_ip.map(Ipv4Addr),
+                meta.remote_port,
+            ) {
+                (Some(li), Some(lp), Some(ri), Some(rp)) => Some((li, lp, ri, rp)),
+                _ => None,
+            };
+
+            // R65-6 FIX: Use blocking lock for per-socket state
+            let mut tcp_guard = sock.tcp.lock();
+
+            let mut should_cleanup = false;
+            let mut need_init_timestamp = false;
+            let mut need_init_fin_time = false;
+            let mut need_fin_retransmit = false;
+            let mut mark_timeout_close = false;
+
+            if let Some(tcp_state) = tcp_guard.as_mut() {
+                // TIME_WAIT handling
+                if tcp_state.control.state == TcpState::TimeWait {
+                    let start = tcp_state.control.time_wait_start;
+                    if start == 0 {
+                        need_init_timestamp = true;
+                    } else if sweep_time_wait
+                        && current_time_ms.saturating_sub(start) >= TCP_TIME_WAIT_MS
+                    {
+                        should_cleanup = true;
+                    }
+                }
+
+                // R65-5 FIX: FIN_WAIT_2 idle timeout handling
+                if tcp_state.control.state == TcpState::FinWait2 && sweep_time_wait {
+                    let start = tcp_state.control.fin_wait2_start;
+                    if start != 0
+                        && current_time_ms.saturating_sub(start) >= TCP_FIN_WAIT_2_TIMEOUT_MS
+                    {
+                        should_cleanup = true;
+                        mark_timeout_close = true;
+                    }
+                }
+
+                // FIN retransmission handling
+                if matches!(
+                    tcp_state.control.state,
+                    TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
+                ) && tcp_state.control.fin_sent
+                {
+                    let fin_start = tcp_state.control.fin_sent_time;
+                    if fin_start == 0 {
+                        need_init_fin_time = true;
+                    } else {
+                        let fin_timeout = core::cmp::max(
+                            tcp_state.control.rto_ms,
+                            TCP_FIN_TIMEOUT_MS,
+                        );
+                        if current_time_ms.saturating_sub(fin_start) >= fin_timeout {
+                            if tcp_state.control.fin_retries >= TCP_MAX_FIN_RETRIES {
+                                should_cleanup = true;
+                            } else {
+                                need_fin_retransmit = true;
+                            }
+                        }
+                    }
+                }
+
+                // Data retransmission
+                if let Some((local_ip, local_port, remote_ip, remote_port)) = key_parts {
+                    if !tcp_state.control.send_buffer.is_empty()
+                        && matches!(
+                            tcp_state.control.state,
+                            TcpState::Established
+                                | TcpState::CloseWait
+                                | TcpState::FinWait1
+                                | TcpState::FinWait2
+                                | TcpState::Closing
+                                | TcpState::LastAck
+                        )
+                    {
+                        let rto = tcp_state.control.rto_ms;
+                        let ack = tcp_state.control.rcv_nxt;
+                        let advertised_wnd = Self::current_adv_window(&tcp_state.control);
+
+                        let needs_retransmit = tcp_state
+                            .control
+                            .send_buffer
+                            .front()
+                            .map(|seg| current_time_ms.saturating_sub(seg.sent_at) >= rto)
+                            .unwrap_or(false);
+
+                        if needs_retransmit {
+                            handle_retransmission_timeout(&mut tcp_state.control);
+
+                            if let Some(first_seg) = tcp_state.control.send_buffer.front_mut() {
+                                let flags = TCP_FLAG_ACK
+                                    | if !first_seg.data.is_empty() { TCP_FLAG_PSH } else { 0 };
+                                let seg_bytes = build_tcp_segment(
+                                    local_ip,
+                                    remote_ip,
+                                    local_port,
+                                    remote_port,
+                                    first_seg.seq,
+                                    ack,
+                                    flags,
+                                    advertised_wnd,
+                                    &first_seg.data,
+                                );
+
+                                first_seg.retrans_count = first_seg.retrans_count.saturating_add(1);
+                                first_seg.sent_at = current_time_ms;
+                                tcp_state.control.last_activity = current_time_ms;
+
+                                data_retransmit.push((remote_ip, seg_bytes));
+                            }
+
+                            tcp_state.control.retries =
+                                tcp_state.control.retries.saturating_add(1);
+                            tcp_state.control.rto_ms = tcp_state
+                                .control
+                                .rto_ms
+                                .saturating_mul(2)
+                                .min(TCP_MAX_RTO_MS);
+
+                            if tcp_state.control.retries >= TCP_MAX_RETRIES {
+                                tcp_state.control.state = TcpState::Closed;
+                                should_cleanup = true;
+                                mark_timeout_close = true;
+                            }
+                        }
+                    }
+                }
+            }
+            drop(tcp_guard);
+
+            if mark_timeout_close {
+                sock.mark_closed();
+            }
+
+            // Initialize TIME_WAIT timestamp if needed
+            if need_init_timestamp {
+                let mut guard = sock.tcp.lock();
+                if let Some(tcp_state) = guard.as_mut() {
+                    if tcp_state.control.state == TcpState::TimeWait
+                        && tcp_state.control.time_wait_start == 0
+                    {
+                        tcp_state.control.time_wait_start = current_time_ms;
+                    }
+                }
+            }
+
+            // Initialize FIN timestamp if needed
+            if need_init_fin_time {
+                let mut guard = sock.tcp.lock();
+                if let Some(tcp_state) = guard.as_mut() {
+                    if matches!(
+                        tcp_state.control.state,
+                        TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
+                    ) && tcp_state.control.fin_sent
+                        && tcp_state.control.fin_sent_time == 0
+                    {
+                        tcp_state.control.fin_sent_time = current_time_ms;
+                    }
+                }
+            }
+
+            // Build FIN retransmission segment
+            if need_fin_retransmit {
+                if let Some((local_ip, local_port, remote_ip, remote_port)) = key_parts {
+                    let mut guard = sock.tcp.lock();
+                    if let Some(tcp_state) = guard.as_mut() {
+                        if matches!(
+                            tcp_state.control.state,
+                            TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
+                        ) && tcp_state.control.fin_sent
+                            && tcp_state.control.fin_retries < TCP_MAX_FIN_RETRIES
+                        {
+                            let window_after = tcp_state
+                                .control
+                                .rcv_wnd
+                                .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                            let seq = tcp_state.control.snd_nxt.wrapping_sub(1);
+                            let ack = tcp_state.control.rcv_nxt;
+
+                            let seg = build_tcp_segment(
+                                local_ip,
+                                remote_ip,
+                                local_port,
+                                remote_port,
+                                seq,
+                                ack,
+                                TCP_FLAG_FIN | TCP_FLAG_ACK,
+                                Self::encode_adv_window(&tcp_state.control, window_after),
+                                &[],
+                            );
+
+                            tcp_state.control.fin_retries =
+                                tcp_state.control.fin_retries.saturating_add(1);
+                            tcp_state.control.fin_sent_time = current_time_ms;
+
+                            fin_retransmit.push((remote_ip, seg));
+                        }
+                    }
+                }
+            }
+
+            // Handle cleanup
+            if should_cleanup {
+                if mark_timeout_close {
+                    to_cleanup.push(sock.clone());
+                } else {
+                    let mut guard = sock.tcp.lock();
+                    if let Some(tcp_state) = guard.as_mut() {
+                        if tcp_state.control.state == TcpState::TimeWait
+                            || matches!(
+                                tcp_state.control.state,
+                                TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
+                            )
+                        {
+                            tcp_state.control.state = TcpState::Closed;
+                            to_cleanup.push(sock.clone());
+                        }
+                    }
+                }
+            }
+
+            // Sweep SYN queue for listening sockets
+            if sweep_time_wait {
+                let mut listen_guard = sock.listen.lock();
+                if let Some(listen_state) = listen_guard.as_mut() {
+                    let mut expired_keys: Vec<TcpLookupKey> = Vec::new();
+                    for (key, pending) in listen_state.syn_queue.iter() {
+                        if current_time_ms.saturating_sub(pending.syn_sent_at)
+                            >= TCP_SYN_TIMEOUT_MS
+                        {
+                            expired_keys.push(*key);
+                        }
+                    }
+
+                    for key in expired_keys {
+                        if let Some(pending) = listen_state.take_syn(&key) {
+                            let rst_seg = {
+                                let mut tcb_guard = pending.sock.tcp.lock();
+                                if let Some(tcb) = tcb_guard.as_mut() {
+                                    let local_ip = Ipv4Addr(key.0.to_be_bytes());
+                                    let remote_ip = Ipv4Addr(key.2.to_be_bytes());
+                                    let seq = tcb.control.snd_nxt;
+                                    let ack = tcb.control.rcv_nxt;
+
+                                    Some(build_tcp_segment(
+                                        local_ip,
+                                        remote_ip,
+                                        key.1,
+                                        key.3,
+                                        seq,
+                                        ack,
+                                        TCP_FLAG_RST | TCP_FLAG_ACK,
+                                        0,
+                                        &[],
+                                    ))
+                                } else {
+                                    None
+                                }
+                            };
+
+                            syn_timeouts.push((
+                                pending.sock.clone(),
+                                Ipv4Addr(key.2.to_be_bytes()),
+                                rst_seg,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        drop(sockets_guard);
+
+        // Cleanup phase (outside sockets lock)
+        let mut ids_to_remove: Vec<u64> = Vec::new();
+        for sock in &to_cleanup {
+            self.cleanup_tcp_connection(sock);
+            if sock.is_closed() {
+                ids_to_remove.push(sock.id);
+            }
+        }
+
+        for (child, dst_ip, rst_seg) in syn_timeouts {
+            child.mark_closed();
+            self.cleanup_tcp_connection(&child);
+            if let Some(seg) = rst_seg {
+                let _ = transmit_tcp_segment(dst_ip, &seg);
+            }
+            ids_to_remove.push(child.id);
+        }
+
+        if !ids_to_remove.is_empty() {
+            let mut sockets = self.sockets.write();
+            for id in ids_to_remove {
+                sockets.remove(&id);
+            }
+        }
+
+        for (dst_ip, seg) in fin_retransmit {
+            let _ = transmit_tcp_segment(dst_ip, &seg);
+        }
+
+        for (dst_ip, seg) in data_retransmit {
+            let _ = transmit_tcp_segment(dst_ip, &seg);
+        }
+
+        // Blocking variant always succeeds
+        true
     }
 
     /// Clean up TCP connection resources (bindings and 4-tuple registration).

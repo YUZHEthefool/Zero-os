@@ -119,6 +119,23 @@ impl OpenFlags {
 }
 
 // ============================================================================
+// Capability Operation Constants (R65-13 FIX)
+// ============================================================================
+
+/// Capability operation codes for LSM hook_task_cap_modify.
+///
+/// These match the AuditCapOperation enum values for consistency
+/// between LSM hooks and audit events.
+pub mod cap_op {
+    /// Capability allocation operation.
+    pub const ALLOCATE: u32 = 1;
+    /// Capability revocation operation.
+    pub const REVOKE: u32 = 2;
+    /// Capability delegation operation.
+    pub const DELEGATE: u32 = 3;
+}
+
+// ============================================================================
 // Context Provider Callbacks
 // ============================================================================
 

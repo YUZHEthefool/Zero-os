@@ -778,13 +778,29 @@ pub fn process_arp(
         }
     }
 
-    // R45 FIX + R48-2 FIX: Only learn mappings that involve us or pass
-    // the restricted gratuitous check. This reduces the attack surface
-    // for cache poisoning while still allowing legitimate ARP operations.
-    if for_us || allow_gratuitous {
-        if let Err(e) = cache.insert(pkt.sender_ip, pkt.sender_hw, ArpEntryKind::Dynamic, now_ms) {
-            stats.inc_cache_conflicts();
-            return ArpResult::Dropped(e);
+    // R65-7 FIX: Only learn from ARP replies (or allowed gratuitous/self-refresh requests).
+    // This blocks attackers from poisoning the cache via forged ARP requests targeted at us.
+    // Previously, any packet with target_ip == our_ip would learn the sender's mapping,
+    // allowing an attacker to send a request claiming sender_ip = gateway_ip to hijack traffic.
+    match pkt.op {
+        ArpOp::Reply => {
+            // Learn from replies addressed to us or allowed gratuitous
+            if for_us || allow_gratuitous {
+                if let Err(e) = cache.insert(pkt.sender_ip, pkt.sender_hw, ArpEntryKind::Dynamic, now_ms) {
+                    stats.inc_cache_conflicts();
+                    return ArpResult::Dropped(e);
+                }
+            }
+        }
+        ArpOp::Request => {
+            // Only allow gratuitous/self-refresh to update cache; ignore other requests.
+            // Normal requests should only trigger a reply, not learn the sender's mapping.
+            if allow_gratuitous {
+                if let Err(e) = cache.insert(pkt.sender_ip, pkt.sender_hw, ArpEntryKind::Dynamic, now_ms) {
+                    stats.inc_cache_conflicts();
+                    return ArpResult::Dropped(e);
+                }
+            }
         }
     }
 
@@ -813,7 +829,7 @@ pub fn process_arp(
             ArpResult::Reply(reply)
         }
         ArpOp::Reply => {
-            // Reply already learned sender mapping above (if relevant to us)
+            // Reply processing: mapping was already learned above (if applicable)
             ArpResult::Handled
         }
     }

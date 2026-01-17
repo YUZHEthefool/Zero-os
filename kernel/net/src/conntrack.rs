@@ -20,8 +20,9 @@
 //! - Rate limits new connection creation
 //! - Bounded memory usage with configurable limits
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BinaryHeap};
 use alloc::vec::Vec;
+use core::cmp::Reverse;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spin::{Mutex, Once, RwLock};
 
@@ -275,6 +276,8 @@ pub struct ConntrackEntry {
     /// the first packet (the true initiator) so the state machine can correctly
     /// distinguish Original (initiator→responder) from Reply (responder→initiator).
     pub initiator_dir: ConntrackDir,
+    /// R65-3 FIX: Monotonic generation for validating heap entries in the LRU index.
+    pub lru_gen: u64,
 }
 
 impl ConntrackEntry {
@@ -298,6 +301,7 @@ impl ConntrackEntry {
             created_ms: now_ms,
             seen_reply: false,
             initiator_dir,
+            lru_gen: 0,
         }
     }
 
@@ -429,6 +433,34 @@ impl ConntrackStats {
 }
 
 // ============================================================================
+// R65-3 FIX: LRU Index Entry for O(log n) eviction
+// ============================================================================
+
+/// Heap entry keyed by last_seen_ms and a generation to skip stale nodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LruIndexEntry {
+    last_seen_ms: u64,
+    generation: u64,
+    key: FlowKey,
+}
+
+impl PartialOrd for LruIndexEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LruIndexEntry {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        // Order by last_seen_ms first, then generation, then key for stability
+        self.last_seen_ms
+            .cmp(&other.last_seen_ms)
+            .then_with(|| self.generation.cmp(&other.generation))
+            .then_with(|| self.key.cmp(&other.key))
+    }
+}
+
+// ============================================================================
 // Conntrack Table
 // ============================================================================
 
@@ -436,6 +468,10 @@ impl ConntrackStats {
 pub struct ConntrackTable {
     /// Entry storage (BTreeMap for stable iteration during sweep)
     entries: RwLock<BTreeMap<FlowKey, Mutex<ConntrackEntry>>>,
+    /// R65-3 FIX: Min-heap (via Reverse) for O(log n) LRU eviction
+    lru_index: Mutex<BinaryHeap<Reverse<LruIndexEntry>>>,
+    /// R65-3 FIX: Monotonic generation counter for LRU heap validation
+    lru_clock: AtomicU64,
     /// Statistics
     stats: ConntrackStats,
 }
@@ -445,8 +481,25 @@ impl ConntrackTable {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(BTreeMap::new()),
+            lru_index: Mutex::new(BinaryHeap::new()),
+            lru_clock: AtomicU64::new(0),
             stats: ConntrackStats::new(),
         }
+    }
+
+    /// R65-3 FIX: Allocate a fresh LRU generation value.
+    fn next_lru_generation(&self) -> u64 {
+        self.lru_clock.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    }
+
+    /// R65-3 FIX: Record the latest access for a flow in the LRU heap.
+    fn record_lru(&self, key: FlowKey, last_seen_ms: u64, generation: u64) {
+        let mut heap = self.lru_index.lock();
+        heap.push(Reverse(LruIndexEntry {
+            last_seen_ms,
+            generation,
+            key,
+        }));
     }
 
     /// Look up an entry by flow key.
@@ -495,6 +548,14 @@ impl ConntrackTable {
                 entry.state = new_state;
                 entry.update_stats(state_dir, l4.payload_len, now_ms);
 
+                // R65-3 FIX: Record LRU access
+                let lru_gen = self.next_lru_generation();
+                entry.lru_gen = lru_gen;
+                let last_seen_ms = entry.last_seen_ms;
+                drop(entry);
+
+                self.record_lru(key, last_seen_ms, lru_gen);
+
                 return CtUpdateResult {
                     decision: CtDecision::Established,
                     state: new_state,
@@ -540,18 +601,46 @@ impl ConntrackTable {
         let mut entries = self.entries.write();
 
         // Double-check after acquiring write lock
-        if entries.contains_key(&key) {
-            drop(entries);
-            // Retry with existing entry
-            return self.update_on_packet(
-                proto,
-                Ipv4Addr(key.ip_lo),
-                Ipv4Addr(key.ip_hi),
-                key.port_lo,
-                key.port_hi,
-                l4,
-                now_ms,
-            );
+        // R65-2 FIX: Entry was inserted concurrently. Reuse the packet's real
+        // direction (`dir`) instead of calling update_on_packet with normalized
+        // (ip_lo, ip_hi) which would re-normalize and lose direction information.
+        if let Some(entry_lock) = entries.get(&key) {
+            let mut entry = entry_lock.lock();
+
+            // Calculate state direction relative to initiator
+            let state_dir = if dir == entry.initiator_dir {
+                ConntrackDir::Original
+            } else {
+                ConntrackDir::Reply
+            };
+
+            let (new_state, decision) = self.transition_state(&entry, state_dir, proto, l4);
+
+            if decision == CtDecision::Invalid {
+                self.stats.invalid_transitions.fetch_add(1, Ordering::Relaxed);
+                return CtUpdateResult {
+                    decision,
+                    state: entry.state,
+                    dir,
+                };
+            }
+
+            entry.state = new_state;
+            entry.update_stats(state_dir, l4.payload_len, now_ms);
+
+            // R65-3 FIX: Record LRU access
+            let lru_gen = self.next_lru_generation();
+            entry.lru_gen = lru_gen;
+            let last_seen_ms = entry.last_seen_ms;
+            drop(entry);
+
+            self.record_lru(key, last_seen_ms, lru_gen);
+
+            return CtUpdateResult {
+                decision: CtDecision::Established,
+                state: new_state,
+                dir,
+            };
         }
 
         // R63-2 FIX: Check table capacity UNDER the write lock to prevent
@@ -577,9 +666,16 @@ impl ConntrackTable {
         // Use Original for stats since this is the first packet from initiator
         entry.update_stats(ConntrackDir::Original, l4.payload_len, now_ms);
 
+        // R65-3 FIX: Set LRU generation and record in heap
+        let lru_gen = self.next_lru_generation();
+        entry.lru_gen = lru_gen;
+        let last_seen_ms = entry.last_seen_ms;
+
         entries.insert(key, Mutex::new(entry));
         self.stats.entries_created.fetch_add(1, Ordering::Relaxed);
         self.stats.current_entries.fetch_add(1, Ordering::Relaxed);
+
+        self.record_lru(key, last_seen_ms, lru_gen);
 
         CtUpdateResult {
             decision: CtDecision::New,
@@ -706,24 +802,42 @@ impl ConntrackTable {
     /// # Returns
     ///
     /// `true` if an entry was evicted, `false` if the table is empty.
+    /// R65-3 FIX: Evict the least-recently-seen entry (LRU) in O(log n) using heap index.
+    ///
+    /// This prevents table exhaustion attacks where an attacker fills the table
+    /// with long-lived UDP or half-open TCP connections to block legitimate traffic.
+    ///
+    /// # Returns
+    /// `true` if an entry was evicted, `false` if table is empty.
     fn evict_lru_locked(
         &self,
         entries: &mut BTreeMap<FlowKey, Mutex<ConntrackEntry>>,
     ) -> bool {
-        // Find the entry with the oldest last_seen_ms
-        let victim_key = entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.lock().last_seen_ms)
-            .map(|(key, _)| *key);
+        // R65-3 FIX: Use heap for O(log n) eviction instead of O(n) linear scan
+        loop {
+            let candidate = {
+                let mut heap = self.lru_index.lock();
+                heap.pop().map(|Reverse(entry)| entry)
+            };
 
-        if let Some(key) = victim_key {
-            entries.remove(&key);
-            self.stats.entries_deleted.fetch_add(1, Ordering::Relaxed);
-            self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-            self.stats.current_entries.fetch_sub(1, Ordering::Relaxed);
-            true
-        } else {
-            false
+            let Some(victim) = candidate else {
+                return false;
+            };
+
+            // Validate the heap entry is still current (not stale)
+            if let Some(entry_lock) = entries.get(&victim.key) {
+                let entry = entry_lock.lock();
+                if entry.lru_gen == victim.generation && entry.last_seen_ms == victim.last_seen_ms {
+                    drop(entry);
+                    entries.remove(&victim.key);
+                    self.stats.entries_deleted.fetch_add(1, Ordering::Relaxed);
+                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                    self.stats.current_entries.fetch_sub(1, Ordering::Relaxed);
+                    return true;
+                }
+                // Entry was updated since heap entry was created - skip stale entry
+            }
+            // Entry was removed or stale - continue to next candidate
         }
     }
 
@@ -749,16 +863,32 @@ impl ConntrackTable {
         }
 
         // Remove with write lock
+        // R65-4 FIX: Only decrement current_entries for entries actually removed.
+        // The previous code unconditionally decremented by to_remove.len(), but
+        // concurrent operations might have already removed some entries.
+        // Now we check remove() return value and only count successful removals.
         if !to_remove.is_empty() {
             let mut entries = self.entries.write();
+            let mut actually_removed: u64 = 0;
             for key in &to_remove {
-                entries.remove(key);
+                // R65-4 FIX: Check if entry actually existed before counting
+                if entries.remove(key).is_some() {
+                    actually_removed += 1;
+                }
             }
-            let count = to_remove.len();
-            self.stats.timeout_deletes.fetch_add(count as u64, Ordering::Relaxed);
-            self.stats.entries_deleted.fetch_add(count as u64, Ordering::Relaxed);
-            self.stats.current_entries.fetch_sub(count as u32, Ordering::Relaxed);
-            count
+            if actually_removed > 0 {
+                self.stats
+                    .timeout_deletes
+                    .fetch_add(actually_removed, Ordering::Relaxed);
+                self.stats
+                    .entries_deleted
+                    .fetch_add(actually_removed, Ordering::Relaxed);
+                // R65-4 FIX: Only subtract actually removed count to prevent underflow
+                self.stats
+                    .current_entries
+                    .fetch_sub(actually_removed as u32, Ordering::Relaxed);
+            }
+            actually_removed as usize
         } else {
             0
         }

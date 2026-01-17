@@ -14,8 +14,9 @@ pub mod ipi;
 pub mod syscall;
 
 pub use context_switch::{
-    enter_usermode, init_fpu, jump_to_usermode, restore_context, save_context, switch_context,
-    Context, FxSaveArea, USER_CODE_SELECTOR, USER_DATA_SELECTOR,
+    assert_kernel_context, enter_usermode, init_fpu, jump_to_usermode, restore_context,
+    save_context, switch_context, validate_kernel_context, Context, FxSaveArea,
+    USER_CODE_SELECTOR, USER_DATA_SELECTOR,
 };
 pub use cpu_protection::{check_cpu_features, enable_protections, CpuProtectionStatus};
 pub use gdt::{

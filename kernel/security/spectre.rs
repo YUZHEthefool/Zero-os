@@ -274,6 +274,12 @@ pub struct VulnerabilityInfo {
 /// # Returns
 ///
 /// `MitigationStatus` on success, `SpectreError` if critical mitigation fails.
+///
+/// # Note
+///
+/// R65-25 FIX: This function applies mitigations to the calling CPU only.
+/// For SMP systems, call `init_cpu()` on each Application Processor (AP)
+/// during their initialization sequence.
 pub fn init() -> Result<MitigationStatus, SpectreError> {
     let mut status = detect();
 
@@ -309,6 +315,56 @@ pub fn init() -> Result<MitigationStatus, SpectreError> {
     }
 
     Ok(status)
+}
+
+/// R65-25 FIX: Initialize Spectre mitigations for the current CPU.
+///
+/// This function should be called by each Application Processor (AP) during
+/// its initialization sequence. The BSP (Bootstrap Processor) should call
+/// `init()` during early boot.
+///
+/// # Why Per-CPU Initialization is Required
+///
+/// IBRS, STIBP, and SSBD are per-logical-processor settings stored in the
+/// IA32_SPEC_CTRL MSR. Each CPU must configure its own MSR independently.
+/// Without per-CPU initialization, secondary cores run without mitigations,
+/// leaving them vulnerable to cross-core speculative attacks.
+///
+/// # Usage
+///
+/// Call this function in the AP boot sequence after the CPU is in protected
+/// mode with access to MSRs:
+///
+/// ```rust,ignore
+/// // In AP startup code:
+/// fn ap_start() {
+///     // ... early AP initialization ...
+///     spectre::init_cpu();
+///     // ... continue AP initialization ...
+/// }
+/// ```
+pub fn init_cpu() {
+    let status = detect();
+
+    // Enable IBRS if supported on this CPU
+    if status.ibrs_supported {
+        let _ = enable_ibrs();
+    }
+
+    // Enable STIBP if supported on this CPU
+    if status.stibp_supported {
+        let _ = enable_stibp();
+    }
+
+    // Issue IBPB to clear predictor state for this CPU
+    if status.ibpb_supported {
+        let _ = issue_ibpb();
+    }
+
+    // Enable SSBD if supported on this CPU
+    if status.ssbd_supported {
+        let _ = enable_ssbd();
+    }
 }
 
 /// Enable IBRS by setting IA32_SPEC_CTRL.IBRS.

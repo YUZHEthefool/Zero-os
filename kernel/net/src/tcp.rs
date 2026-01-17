@@ -207,6 +207,19 @@ pub const TCP_MAX_RTO_MS: u64 = 120_000;
 /// TIME-WAIT duration (2*MSL = 2*60 seconds per RFC 793)
 pub const TCP_TIME_WAIT_MS: u64 = 120_000;
 
+/// R65-5 FIX: FIN_WAIT_2 idle timeout (60 seconds).
+///
+/// RFC 793 does not specify a timeout for FIN_WAIT_2, but without one, connections
+/// can remain in this state indefinitely if the peer never sends FIN. This creates
+/// a resource exhaustion vulnerability where an attacker can:
+/// 1. Establish many connections
+/// 2. Send FIN and receive our FIN-ACK (we move to FIN_WAIT_2)
+/// 3. Never send their FIN, leaking our TCB resources forever
+///
+/// Linux uses tcp_fin_timeout sysctl (default 60 seconds) to bound this state.
+/// We follow the same approach for consistency and security.
+pub const TCP_FIN_WAIT_2_TIMEOUT_MS: u64 = 60_000;
+
 /// R52-1 FIX: SYN timeout for half-open connections in SYN queue.
 ///
 /// Half-open connections (SYN received, SYN-ACK sent, awaiting final ACK) are
@@ -782,6 +795,8 @@ pub struct TcpControlBlock {
     pub last_activity: u64,
     /// TIME_WAIT start timestamp (for 2MSL timer)
     pub time_wait_start: u64,
+    /// R65-5 FIX: FIN_WAIT_2 start timestamp (for idle timeout)
+    pub fin_wait2_start: u64,
 }
 
 /// A TCP segment for buffering
@@ -844,6 +859,7 @@ impl TcpControlBlock {
             established_at: 0,
             last_activity: 0,
             time_wait_start: 0,
+            fin_wait2_start: 0,
         }
     }
 

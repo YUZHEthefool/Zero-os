@@ -159,7 +159,65 @@ impl Default for Context {
     }
 }
 
+/// R65-16 FIX: Validate that a context has kernel-mode segments.
+///
+/// This function should be called before switch_context to prevent
+/// a critical privilege escalation vulnerability where user-mode code
+/// could be executed at Ring 0 privilege level.
+///
+/// # Returns
+///
+/// `true` if the context has kernel-mode segments (cs/ss RPL=0),
+/// `false` if it has user-mode segments.
+///
+/// # Safety
+///
+/// The ctx pointer must be valid and point to a properly initialized Context.
+#[inline]
+pub unsafe fn validate_kernel_context(ctx: *const Context) -> bool {
+    let cs = (*ctx).cs;
+    let ss = (*ctx).ss;
+    // Check Ring Privilege Level (RPL) - bits 0-1 of segment selector
+    // RPL=0 means kernel mode, RPL=3 means user mode
+    (cs & 0x3) == 0 && (ss & 0x3) == 0
+}
+
+/// R65-16 FIX: Assert that a context has kernel-mode segments.
+///
+/// Panics if the context has user-mode segments, preventing privilege escalation.
+/// This should be called before switch_context in debug builds or when
+/// extra validation is desired.
+///
+/// # Safety
+///
+/// The ctx pointer must be valid and point to a properly initialized Context.
+#[inline]
+pub unsafe fn assert_kernel_context(ctx: *const Context) {
+    let cs = (*ctx).cs;
+    let ss = (*ctx).ss;
+    let cs_rpl = cs & 0x3;
+    let ss_rpl = ss & 0x3;
+
+    if cs_rpl != 0 || ss_rpl != 0 {
+        panic!(
+            "R65-16 SECURITY: Attempted to switch to non-kernel context! \
+             cs={:#x} (RPL={}), ss={:#x} (RPL={}). \
+             Use enter_usermode for user-mode transitions.",
+            cs, cs_rpl, ss, ss_rpl
+        );
+    }
+}
+
 /// 保存当前上下文并切换到新上下文
+///
+/// # R65-16 Security Note
+///
+/// This function must ONLY be called with kernel-mode contexts (cs/ss RPL=0).
+/// Calling with user-mode contexts would be a critical privilege escalation
+/// vulnerability. Use `assert_kernel_context` or `validate_kernel_context`
+/// before calling in debug builds or sensitive code paths.
+///
+/// For user-mode transitions, use the enter_usermode path with proper IRETQ.
 ///
 /// # Z-5 fix: rdi/rsi 按 SysV AMD64 caller-saved 处理
 ///
@@ -173,6 +231,7 @@ impl Default for Context {
 /// - old_ctx 和 new_ctx 指向有效的Context结构
 /// - 调用者了解上下文切换的影响
 /// - FPU 已通过 init_fpu() 初始化
+/// - 目标上下文必须是内核上下文（cs/ss RPL=0）- 使用 validate_kernel_context 验证
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const Context) {
     core::arch::naked_asm!(

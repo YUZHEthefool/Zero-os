@@ -318,6 +318,31 @@ impl Drop for UserCopyGuard {
 /// User space address boundary (canonical lower half on x86_64)
 pub const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
 
+/// R65-11 FIX: Minimum user-space mapping address.
+///
+/// Prevents NULL pointer dereference exploitation by disallowing mappings
+/// at low addresses. A kernel NULL pointer bug can be exploited if user
+/// space can map page 0 with controlled content.
+///
+/// 64KB is the Linux default (vm.mmap_min_addr). This prevents:
+/// - Direct NULL dereference exploitation
+/// - Near-NULL dereference exploitation (struct member access)
+/// - Integer overflow to near-zero addresses
+///
+/// This should be enforced in both mmap and pointer validation.
+pub const MMAP_MIN_ADDR: usize = 0x10000; // 64KB
+
+/// R65-10 FIX: Maximum bytes to copy before yielding to interrupts.
+///
+/// When copying large buffers with interrupts disabled (SMAP mode), we risk
+/// starving timer interrupts and causing scheduler/watchdog timeouts.
+/// Copy in chunks and briefly re-enable interrupts between chunks.
+///
+/// 4KB (page size) is a good balance:
+/// - Small enough to not noticeably delay timer interrupts (~1ms @ 1GHz)
+/// - Large enough to amortize the interrupt enable/disable overhead
+const USERCOPY_CHUNK_SIZE: usize = 4096;
+
 /// Check if a pointer is properly aligned for type T
 #[inline]
 fn is_aligned(ptr: usize, align: usize) -> bool {
@@ -336,18 +361,28 @@ fn is_aligned(ptr: usize, align: usize) -> bool {
 /// * `len` - Length in bytes
 ///
 /// # Returns
-/// * `true` if the range [ptr, ptr+len) is entirely in user space
-/// * `false` if null, in kernel space, or would overflow
+/// * `true` if the range [ptr, ptr+len) is entirely in valid user space
+/// * `false` if null, below MMAP_MIN_ADDR, in kernel space, or would overflow
 ///
 /// # Zero Length Handling
 ///
 /// When `len == 0`, returns `true` if `ptr` is a valid non-null user-space
 /// address. This allows validation of pointer-only operations where no
 /// actual memory access will occur.
+///
+/// # R65-11 FIX: Minimum Address Check
+///
+/// Rejects pointers below MMAP_MIN_ADDR to prevent NULL dereference
+/// exploitation attacks.
 #[inline]
 fn validate_user_range(ptr: usize, len: usize) -> bool {
     // Null pointer is always invalid
     if ptr == 0 {
+        return false;
+    }
+    // R65-11 FIX: Reject pointers below MMAP_MIN_ADDR
+    // This prevents NULL dereference exploitation
+    if ptr < MMAP_MIN_ADDR {
         return false;
     }
     // Pointer must be in user space (below canonical hole)
@@ -382,6 +417,12 @@ fn validate_user_range_aligned(ptr: usize, len: usize, align: usize) -> bool {
 /// instead of panicking. It copies one byte at a time to ensure
 /// we can detect faults at any point.
 ///
+/// # R65-10 FIX: Chunked Copy
+///
+/// For large buffers, copy in USERCOPY_CHUNK_SIZE chunks and briefly
+/// re-enable interrupts between chunks. This prevents timer starvation
+/// and scheduler delays during large copies.
+///
 /// # Arguments
 /// * `dst` - Destination kernel buffer
 /// * `src` - Source user space pointer
@@ -403,42 +444,55 @@ pub fn copy_from_user_safe(dst: &mut [u8], src: *const u8) -> Result<(), ()> {
         return Err(());
     }
 
-    // Allow supervisor access to user pages when SMAP is enabled
-    let _smap_guard = UserAccessGuard::new();
-
     // Set up the copy state with buffer range tracking
     let _guard = UserCopyGuard::new(src as usize, len);
     USER_COPY_STATE.with(|s| s.remaining.store(len, Ordering::SeqCst));
 
-    // Copy byte by byte to detect faults at each step
-    // This is slower but guarantees we can catch faults
-    for i in 0..len {
-        // Check if a fault occurred in a previous iteration
-        // (This handles the case where the fault handler returned)
-        if check_and_clear_fault() {
-            return Err(());
+    // R65-10 FIX: Copy in chunks to allow interrupt servicing
+    let mut offset = 0usize;
+    while offset < len {
+        let chunk_end = (offset + USERCOPY_CHUNK_SIZE).min(len);
+
+        // Allow supervisor access to user pages for this chunk
+        let _smap_guard = UserAccessGuard::new();
+
+        // Copy this chunk byte by byte
+        for i in offset..chunk_end {
+            // Check if a fault occurred in a previous iteration
+            if check_and_clear_fault() {
+                return Err(());
+            }
+
+            // Read one byte from user space
+            let byte = unsafe {
+                core::ptr::read_volatile(src.add(i))
+            };
+
+            // Check again after the read
+            if check_and_clear_fault() {
+                return Err(());
+            }
+
+            dst[i] = byte;
+            USER_COPY_STATE.with(|s| s.remaining.store(len - i - 1, Ordering::SeqCst));
         }
 
-        // Read one byte from user space
-        // If this faults, the handler will set the fault flag
-        let byte = unsafe {
-            // Use volatile read to prevent optimization
-            core::ptr::read_volatile(src.add(i))
-        };
+        offset = chunk_end;
 
-        // Check again after the read
-        if check_and_clear_fault() {
-            return Err(());
-        }
-
-        dst[i] = byte;
-        USER_COPY_STATE.with(|s| s.remaining.store(len - i - 1, Ordering::SeqCst));
+        // R65-10 FIX: SMAP guard dropped here, interrupts re-enabled briefly
+        // This allows pending timer/scheduler interrupts to be serviced
     }
 
     Ok(())
 }
 
 /// Fault-tolerant copy from kernel buffer to user space
+///
+/// # R65-10 FIX: Chunked Copy
+///
+/// For large buffers, copy in USERCOPY_CHUNK_SIZE chunks and briefly
+/// re-enable interrupts between chunks. This prevents timer starvation
+/// and scheduler delays during large copies.
 ///
 /// # Arguments
 /// * `dst` - Destination user space pointer
@@ -458,29 +512,40 @@ pub fn copy_to_user_safe(dst: *mut u8, src: &[u8]) -> Result<(), ()> {
         return Err(());
     }
 
-    // Allow supervisor access to user pages when SMAP is enabled
-    let _smap_guard = UserAccessGuard::new();
-
     // Set up the copy state with buffer range tracking
     let _guard = UserCopyGuard::new(dst as usize, len);
     USER_COPY_STATE.with(|s| s.remaining.store(len, Ordering::SeqCst));
 
-    // Copy byte by byte
-    for i in 0..len {
-        if check_and_clear_fault() {
-            return Err(());
+    // R65-10 FIX: Copy in chunks to allow interrupt servicing
+    let mut offset = 0usize;
+    while offset < len {
+        let chunk_end = (offset + USERCOPY_CHUNK_SIZE).min(len);
+
+        // Allow supervisor access to user pages for this chunk
+        let _smap_guard = UserAccessGuard::new();
+
+        // Copy this chunk byte by byte
+        for i in offset..chunk_end {
+            if check_and_clear_fault() {
+                return Err(());
+            }
+
+            // Write one byte to user space
+            unsafe {
+                core::ptr::write_volatile(dst.add(i), src[i]);
+            }
+
+            if check_and_clear_fault() {
+                return Err(());
+            }
+
+            USER_COPY_STATE.with(|s| s.remaining.store(len - i - 1, Ordering::SeqCst));
         }
 
-        // Write one byte to user space
-        unsafe {
-            core::ptr::write_volatile(dst.add(i), src[i]);
-        }
+        offset = chunk_end;
 
-        if check_and_clear_fault() {
-            return Err(());
-        }
-
-        USER_COPY_STATE.with(|s| s.remaining.store(len - i - 1, Ordering::SeqCst));
+        // R65-10 FIX: SMAP guard dropped here, interrupts re-enabled briefly
+        // This allows pending timer/scheduler interrupts to be serviced
     }
 
     Ok(())

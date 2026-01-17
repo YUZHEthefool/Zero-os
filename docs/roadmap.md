@@ -718,17 +718,19 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-13 | 61 | 2 | 2 | SYN cookies (RFC 4987), ACK validation, pure ACK enforcement - **ALL FIXED** |
 | 2026-01-14 | 62 | 7 | 6 | ARP static eviction, timer contention, fragment byte limits, SYN cookie age, ISN entropy, LSM hooks - **6 FIXED, 1 DEFERRED** |
 | 2026-01-14 | - | - | - | **Conntrack state machine implemented** (TCP/UDP/ICMP tracking, stateful firewall foundation) |
-| 2026-01-15 | 63 | 6 | 6 | Conntrack direction fix, capacity bypass, LRU eviction, RST rate limit, timer monitoring, fragment count - **ALL FIXED** |
-| **Total** | **63** | **279** | **245 (87.8%)** | **34 open (SMP + VirtIO IOMMU)** |
+| 2026-01-15 | 63-64 | 12 | 11 | Conntrack direction fix, capacity bypass, LRU eviction, RST rate limit, timer monitoring, fragment count, firewall - **11 FIXED, 1 DOCUMENTED** |
+| 2026-01-16 | 65 | 26 | 5 | Comprehensive audit - CLD fix, COW race, context switch validation, rate limiter CAS, conntrack accounting - **5 FIXED, 21 OPEN** |
+| **Total** | **65** | **305** | **250 (82.0%)** | **55 open (21 new R65 + SMP + VirtIO IOMMU)** |
 
 ### Current Status
 
-- **Fixed**: 245 issues (87.8%)
-- **Open**: 34 issues (12.2%)
+- **Fixed**: 250 issues (82.0%)
+- **Open**: 55 issues (18.0%)
+  - 21 new issues from Round 65 (including 1 CRITICAL: R65-24 VirtIO DMA)
   - SMP-related issues deferred to Phase E
   - R62-6 (VirtIO IOMMU) deferred to Phase F.3
 
-See [qa-2026-01-15.md](review/qa-2026-01-15.md) for latest audit report.
+See [qa-2026-01-16.md](review/qa-2026-01-16.md) for latest audit report.
 
 ---
 

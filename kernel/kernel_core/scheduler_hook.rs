@@ -78,8 +78,16 @@ pub fn on_scheduler_tick() {
 /// 检查并执行重调度（如果需要）
 ///
 /// 由系统调用返回路径调用，仅在 NEED_RESCHED 或 IRQ_RESCHED_PENDING 标志置位时执行调度
+///
+/// R65-6 FIX: Also drains any deferred TCP timer work that couldn't complete
+/// in IRQ context due to lock contention.
 #[inline]
 pub fn reschedule_if_needed() {
+    // R65-6 FIX: Drain deferred TCP timer work before scheduling check
+    // This ensures timer work is completed in safe (non-IRQ) context when
+    // IRQ-time processing was blocked by lock contention.
+    crate::time::drain_deferred_tcp_timers();
+
     // 消费中断触发的抢占请求
     let irq_pending = IRQ_RESCHED_PENDING.swap(false, Ordering::SeqCst);
 

@@ -263,6 +263,11 @@ pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, Signa
     // 注意：我们需要调用调度器的 resume_stopped，它在 sched crate 中
     // 由于循环依赖的限制，我们通过回调机制实现
 
+    // R65-26 FIX: Get target process Arc ONCE and hold it throughout the operation.
+    // This prevents TOCTOU where PID is reused between permission check and signal delivery.
+    // Previously, we fetched the process twice: once for permission check, once for signal.
+    let process_arc = process::get_process(pid).ok_or(SignalError::NoSuchProcess)?;
+
     // 【安全修复 Z-9】POSIX 权限检查（深度防御）
     // 使用 UID/EUID 而非仅父子关系
     if let Some(sender_pid) = process::current_pid() {
@@ -276,10 +281,9 @@ pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, Signa
             // 获取发送者凭证
             let sender_creds = process::current_credentials().ok_or(SignalError::NoSuchProcess)?;
 
-            // 获取目标进程凭证
-            // R39-3 FIX: 使用共享凭证读取目标进程 uid
-            let target_arc = process::get_process(pid).ok_or(SignalError::NoSuchProcess)?;
-            let target_uid = target_arc.lock().credentials.read().uid;
+            // R65-26 FIX: Read target UID from the same Arc we'll use for signal delivery
+            // This closes the TOCTOU window where PID could be reused between check and delivery
+            let target_uid = process_arc.lock().credentials.read().uid;
 
             // POSIX 权限检查：
             // 1. Root (euid == 0) 可以发信号给任何进程
@@ -295,7 +299,7 @@ pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, Signa
         }
     }
 
-    let process_arc = process::get_process(pid).ok_or(SignalError::NoSuchProcess)?;
+    // process_arc already obtained above (R65-26 FIX)
     let action = default_action(signal);
     let mut needs_reschedule = false;
     let mut terminate_code: Option<i32> = None;

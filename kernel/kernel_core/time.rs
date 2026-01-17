@@ -2,7 +2,7 @@
 //!
 //! 提供基于时钟中断的时间戳支持
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// 全局时钟计数器（每次时钟中断递增）
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -15,6 +15,18 @@ static LAST_TIME_WAIT_SWEEP: AtomicU64 = AtomicU64::new(0);
 
 /// Last TCP timer sweep timestamp (ms) for retransmission/FIN timers.
 static LAST_TCP_TIMER_SWEEP: AtomicU64 = AtomicU64::new(0);
+
+/// R65-6 FIX: Deferred TCP timer work pending flag.
+///
+/// Set when IRQ-time timer processing is incomplete (lock contention or
+/// exceeded socket budget). Cleared when work is drained in safe context.
+static TCP_TIMER_DEFERRED: AtomicBool = AtomicBool::new(false);
+
+/// R65-6 FIX: Deferred timestamp for retry.
+static TCP_TIMER_DEFERRED_TS: AtomicU64 = AtomicU64::new(0);
+
+/// R65-6 FIX: Whether TIME_WAIT sweep is deferred.
+static TCP_TIMER_DEFERRED_TW: AtomicBool = AtomicBool::new(false);
 
 /// TCP timer sweep interval in milliseconds (data/FIN retransmission).
 ///
@@ -61,8 +73,11 @@ pub fn on_timer_tick() {
     let need_rto = current.saturating_sub(last_rto) >= TCP_TIMER_SWEEP_INTERVAL_MS;
     let need_tw = current.saturating_sub(last_tw) >= TIME_WAIT_SWEEP_INTERVAL_MS;
 
-    // Early exit if neither timer has fired
-    if !need_rto && !need_tw {
+    // R65-6 FIX: Check if deferred work is pending from previous tick
+    let had_deferred = TCP_TIMER_DEFERRED.load(Ordering::Acquire);
+
+    // Early exit if neither timer has fired and no deferred work
+    if !need_rto && !need_tw && !had_deferred {
         return;
     }
 
@@ -87,9 +102,29 @@ pub fn on_timer_tick() {
         run_tw = true;
     }
 
-    // Run TCP timers if either was claimed
-    if run_rto || run_tw {
-        net::socket_table().run_tcp_timers(current, run_tw);
+    // R65-6 FIX: Include deferred TIME_WAIT sweep
+    if had_deferred && TCP_TIMER_DEFERRED_TW.load(Ordering::Relaxed) {
+        run_tw = true;
+    }
+
+    // Run TCP timers if either was claimed or we have deferred work
+    if run_rto || run_tw || had_deferred {
+        let completed = net::socket_table().run_tcp_timers(current, run_tw);
+
+        // R65-6 FIX: If timer processing was incomplete, defer to safe context
+        if !completed {
+            TCP_TIMER_DEFERRED.store(true, Ordering::Release);
+            TCP_TIMER_DEFERRED_TS.store(current, Ordering::Relaxed);
+            if run_tw {
+                TCP_TIMER_DEFERRED_TW.store(true, Ordering::Relaxed);
+            }
+            // Request reschedule to drain in safe context
+            crate::request_resched_from_irq();
+        } else {
+            // Clear deferred flags on successful completion
+            TCP_TIMER_DEFERRED.store(false, Ordering::Release);
+            TCP_TIMER_DEFERRED_TW.store(false, Ordering::Relaxed);
+        }
     }
 }
 
@@ -134,4 +169,34 @@ pub fn tsc_since_boot() -> u64 {
     let current = read_tsc();
     let boot = BOOT_TSC.load(Ordering::SeqCst);
     current.saturating_sub(boot)
+}
+
+/// R65-6 FIX: Drain deferred TCP timer work in safe (non-IRQ) context.
+///
+/// Called from syscall return path to ensure timer work is not starved when
+/// IRQ-time processing was incomplete due to lock contention or exceeded
+/// socket budget.
+///
+/// This provides a safety net: even if IRQ-time timer processing is repeatedly
+/// blocked, the work will eventually complete when a process makes a syscall.
+pub fn drain_deferred_tcp_timers() {
+    // Fast path: nothing deferred
+    if !TCP_TIMER_DEFERRED.load(Ordering::Acquire) {
+        return;
+    }
+
+    // Get deferred parameters
+    let ts = TCP_TIMER_DEFERRED_TS.load(Ordering::Relaxed);
+    let sweep_tw = TCP_TIMER_DEFERRED_TW.load(Ordering::Relaxed);
+    let current = if ts == 0 { current_timestamp_ms() } else { ts };
+
+    // Use blocking variant which will wait for locks
+    let completed = net::socket_table().run_tcp_timers_blocking(current, sweep_tw);
+
+    if completed {
+        TCP_TIMER_DEFERRED.store(false, Ordering::Release);
+        TCP_TIMER_DEFERRED_TW.store(false, Ordering::Relaxed);
+        TCP_TIMER_DEFERRED_TS.store(0, Ordering::Relaxed);
+    }
+    // If still incomplete, leave deferred flag set for next opportunity
 }

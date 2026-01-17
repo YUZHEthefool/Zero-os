@@ -364,6 +364,19 @@ pub unsafe fn copy_page_table_cow(
 ///
 /// 当进程尝试写入COW页时调用
 ///
+/// # R65-21 FIX: Race Condition Prevention
+///
+/// This function now uses a global lock to serialize COW page fault handling.
+/// Without synchronization, two threads writing to the same COW page simultaneously
+/// could cause:
+/// - Both threads unmapping/mapping independently
+/// - Double-decrementing the old page's reference count (use-after-free)
+/// - One thread's new mapping being overwritten by the other
+///
+/// The lock ensures only one COW resolution happens at a time. After acquiring
+/// the lock, we re-check if the page is still COW (another thread may have
+/// resolved it while we were waiting).
+///
 /// # Arguments
 ///
 /// * `pid` - 触发页错误的进程ID
@@ -374,6 +387,14 @@ pub unsafe fn copy_page_table_cow(
 /// 此函数分配新的物理页并更新页表
 pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result<(), ForkError> {
     use mm::page_table::with_current_manager;
+    use spin::Mutex;
+
+    // R65-21 FIX: Global lock to serialize COW page fault handling.
+    // This prevents race conditions when multiple threads fault on the same COW page.
+    // Using a static Mutex ensures all COW faults are serialized.
+    // Note: In SMP future, this could be made per-page or per-address-space for better scalability.
+    static COW_FAULT_LOCK: Mutex<()> = Mutex::new(());
+    let _cow_guard = COW_FAULT_LOCK.lock();
 
     let virt = VirtAddr::new(fault_addr as u64);
     let page = Page::containing_address(virt);
@@ -382,9 +403,13 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
     let pte = find_pte(virt).ok_or(ForkError::PageTableCopyFailed)?;
     let flags = pte.flags();
 
-    // 检查是否为 COW 页
+    // R65-21 FIX: After acquiring the lock, re-check if the page is still COW.
+    // Another thread may have resolved this COW fault while we were waiting for the lock.
+    // If COW flag is no longer set, the page has already been resolved - just flush TLB and return.
     if !flags.contains(cow_flag()) {
-        return Err(ForkError::PageTableCopyFailed);
+        // COW already resolved by another thread, just ensure TLB is consistent
+        x86_64::instructions::tlb::flush(virt);
+        return Ok(());
     }
 
     // 使用基于当前 CR3 的页表管理器，确保操作正确的地址空间

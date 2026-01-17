@@ -255,6 +255,48 @@ impl Ext2Fs {
             return Err(FsError::Invalid);
         }
 
+        // R65-EXT2-1 FIX: Validate critical superblock fields to prevent DoS.
+        //
+        // A malicious superblock can cause:
+        // - Division by zero if blocks_per_group or inodes_per_group is 0
+        // - Massive allocation if groups_count is unbounded
+        // - Out-of-bounds access via crafted group descriptors
+        //
+        // Minimum reasonable values:
+        // - blocks_per_group: at least 8 blocks (8 * 1024 = 8KB minimum)
+        // - inodes_per_group: at least 1 inode
+        // - blocks_count: at least 1 block
+        if sb.blocks_per_group == 0 || sb.blocks_per_group < 8 {
+            return Err(FsError::Invalid);
+        }
+        if sb.inodes_per_group == 0 {
+            return Err(FsError::Invalid);
+        }
+        if sb.blocks_count == 0 {
+            return Err(FsError::Invalid);
+        }
+
+        // R65-EXT2-4 FIX: Validate blocks_per_group/inodes_per_group against bitmap capacity.
+        //
+        // Each block bitmap and inode bitmap is exactly one block in size.
+        // A block can only describe block_size * 8 entries (1 bit per entry).
+        // If blocks_per_group or inodes_per_group exceeds this, the bitmap scan
+        // in allocate_block will read beyond the buffer, causing a kernel panic.
+        let max_bitmap_entries = block_size.saturating_mul(8);
+        if sb.blocks_per_group > max_bitmap_entries || sb.inodes_per_group > max_bitmap_entries {
+            return Err(FsError::Invalid);
+        }
+
+        // R65-EXT2-2 FIX: Bound groups_count to prevent memory exhaustion.
+        //
+        // Maximum practical limit: 64K groups (each group desc is 32 bytes = 2MB total).
+        // This allows filesystems up to 64K * 128MB = 8TB (with 128MB per group).
+        let groups_count = (sb.blocks_count + sb.blocks_per_group - 1) / sb.blocks_per_group;
+        const MAX_GROUPS: u32 = 65536;
+        if groups_count > MAX_GROUPS {
+            return Err(FsError::Invalid);
+        }
+
         Ok((sb, block_size))
     }
 
@@ -335,24 +377,45 @@ impl Ext2Fs {
         if ino == 0 || ino > sb.inodes_count {
             return Err(FsError::NotFound);
         }
+        let blocks_count = sb.blocks_count;
         drop(sb);
 
         // Calculate group and index
         let (group, index) = self.inode_group_index(ino);
 
         // Get inode table block
+        // R65-EXT2-3 FIX: Bounds check group descriptor access to prevent OOB read.
         let group_descs = self.group_descs.read();
+        if group >= group_descs.len() {
+            return Err(FsError::Invalid);
+        }
         let inode_table_block = group_descs[group].inode_table;
         drop(group_descs);
+
+        // Validate inode table block is within filesystem bounds
+        if inode_table_block == 0 || inode_table_block >= blocks_count {
+            return Err(FsError::Invalid);
+        }
 
         // Calculate offset within inode table
         let inode_offset = index as u64 * self.inode_size as u64;
         let block_offset = inode_offset / self.block_size as u64;
         let offset_in_block = inode_offset % self.block_size as u64;
 
+        // R65-EXT2-5 FIX: Use checked arithmetic to prevent overflow and validate bounds.
+        // A malicious inodes_per_group/inode_size could cause block_offset to overflow u32
+        // or push the computed block past filesystem bounds.
+        if block_offset > u32::MAX as u64 {
+            return Err(FsError::Invalid);
+        }
+        let inode_block = inode_table_block
+            .checked_add(block_offset as u32)
+            .filter(|b| *b < blocks_count)
+            .ok_or(FsError::Invalid)?;
+
         // Read the block containing the inode
         let mut block_buf = alloc::vec![0u8; self.block_size as usize];
-        self.read_block(inode_table_block + block_offset as u32, &mut block_buf)?;
+        self.read_block(inode_block, &mut block_buf)?;
 
         // Parse inode
         let inode: Ext2InodeRaw = unsafe {
@@ -368,23 +431,42 @@ impl Ext2Fs {
         if ino == 0 || ino > sb.inodes_count {
             return Err(FsError::NotFound);
         }
+        let blocks_count = sb.blocks_count;
         drop(sb);
 
         // Serialize inode table updates
         let _guard = self.meta_lock.lock();
 
         let (group, index) = self.inode_group_index(ino);
+        // R65-EXT2-3 FIX: Bounds check group descriptor access to prevent OOB read.
         let group_descs = self.group_descs.read();
+        if group >= group_descs.len() {
+            return Err(FsError::Invalid);
+        }
         let inode_table_block = group_descs[group].inode_table;
         drop(group_descs);
+
+        // Validate inode table block is within filesystem bounds
+        if inode_table_block == 0 || inode_table_block >= blocks_count {
+            return Err(FsError::Invalid);
+        }
 
         let inode_offset = index as u64 * self.inode_size as u64;
         let block_offset = inode_offset / self.block_size as u64;
         let offset_in_block = inode_offset % self.block_size as u64;
 
+        // R65-EXT2-5 FIX: Use checked arithmetic to prevent overflow and validate bounds.
+        if block_offset > u32::MAX as u64 {
+            return Err(FsError::Invalid);
+        }
+        let inode_block = inode_table_block
+            .checked_add(block_offset as u32)
+            .filter(|b| *b < blocks_count)
+            .ok_or(FsError::Invalid)?;
+
         // Read-modify-write the block containing the inode
         let mut block_buf = alloc::vec![0u8; self.block_size as usize];
-        self.read_block(inode_table_block + block_offset as u32, &mut block_buf)?;
+        self.read_block(inode_block, &mut block_buf)?;
 
         // Copy inode data into buffer
         let copy_len = cmp::min(self.inode_size as usize, size_of::<Ext2InodeRaw>());
@@ -403,7 +485,7 @@ impl Ext2Fs {
             block_buf[start + copy_len..end].fill(0);
         }
 
-        self.write_block(inode_table_block + block_offset as u32, &block_buf)
+        self.write_block(inode_block, &block_buf)
     }
 
     /// Write updated superblock to disk
@@ -475,13 +557,23 @@ impl Ext2Fs {
         let groups_count = (sb.blocks_count + sb.blocks_per_group - 1) / sb.blocks_per_group;
 
         for group in 0..groups_count as usize {
+            // R65-EXT2-3 FIX: Bounds check group descriptor access
+            if group >= group_descs.len() {
+                break;
+            }
             if group_descs[group].free_blocks_count == 0 {
                 continue;
             }
 
+            // Validate block_bitmap is within filesystem bounds
+            let block_bitmap = group_descs[group].block_bitmap;
+            if block_bitmap == 0 || block_bitmap >= sb.blocks_count {
+                continue; // Skip corrupted group descriptor
+            }
+
             // Read the block bitmap for this group
             let mut bitmap = alloc::vec![0u8; self.block_size as usize];
-            self.read_block(group_descs[group].block_bitmap, &mut bitmap)?;
+            self.read_block(block_bitmap, &mut bitmap)?;
 
             // Calculate blocks in this group
             let group_blocks = cmp::min(
@@ -503,8 +595,8 @@ impl Ext2Fs {
                 bitmap[byte_idx] |= bit_mask;
                 let phys_block = group_start + bit;
 
-                // Write updated bitmap
-                self.write_block(group_descs[group].block_bitmap, &bitmap)?;
+                // Write updated bitmap (using validated block_bitmap)
+                self.write_block(block_bitmap, &bitmap)?;
 
                 // Update counters
                 group_descs[group].free_blocks_count -= 1;

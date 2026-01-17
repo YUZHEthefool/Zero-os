@@ -50,6 +50,7 @@ extern crate alloc;
 extern crate drivers;
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::RwLock;
 
 // Audit integration for violation logging
@@ -65,6 +66,7 @@ pub use types::{
 
 // ============================================================================
 // R29-2 FIX: Callback-based process integration
+// R65-14 FIX: Fail-closed after initialization
 // ============================================================================
 
 /// Callback type for evaluating seccomp filters on current process.
@@ -77,6 +79,12 @@ static CURRENT_EVALUATOR: RwLock<Option<SeccompEvaluator>> = RwLock::new(None);
 /// Registered enabled-check callback (set by kernel_core during init).
 static CURRENT_ENABLED_CHECK: RwLock<Option<SeccompEnabledCheck>> = RwLock::new(None);
 
+/// R65-14 FIX: Track whether seccomp has been properly initialized.
+///
+/// Before initialization: allow all syscalls (needed for kernel boot)
+/// After initialization: fail-closed if evaluator is missing (bug/attack)
+static SECCOMP_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
 /// Register callbacks for current-process seccomp evaluation.
 ///
 /// This function is called from kernel_core::init() to bridge the dependency
@@ -86,10 +94,18 @@ static CURRENT_ENABLED_CHECK: RwLock<Option<SeccompEnabledCheck>> = RwLock::new(
 ///
 /// * `evaluator` - Function to evaluate seccomp filters for current process
 /// * `enabled_check` - Function to check if current process has seccomp enabled
+///
+/// # R65-14 FIX
+///
+/// Sets SECCOMP_INITIALIZED to true after registering callbacks.
+/// After this point, if the evaluator is somehow unset, syscalls will be
+/// denied rather than allowed (fail-closed behavior).
 pub fn register_current_hooks(evaluator: SeccompEvaluator, enabled_check: SeccompEnabledCheck) {
     *CURRENT_EVALUATOR.write() = Some(evaluator);
     *CURRENT_ENABLED_CHECK.write() = Some(enabled_check);
-    println!("  Seccomp hooks registered for current-process evaluation");
+    // R65-14 FIX: Mark seccomp as initialized - fail-closed after this point
+    SECCOMP_INITIALIZED.store(true, Ordering::SeqCst);
+    println!("  Seccomp hooks registered for current-process evaluation (fail-closed mode active)");
 }
 
 // ============================================================================
@@ -273,20 +289,46 @@ pub fn pledge_to_filter(promises: PledgePromises) -> SeccompFilter {
 /// Evaluate seccomp filters for the current process.
 ///
 /// This is the main entry point called from syscall dispatcher.
-/// Returns Allow if no filters are installed or no evaluator is registered.
 ///
 /// # R29-2 FIX
 ///
 /// Previously this function always returned Allow, completely bypassing
 /// seccomp filters. Now it delegates to the registered callback from
 /// kernel_core which evaluates the actual process's SeccompState.
+///
+/// # R65-14 FIX: Fail-Closed After Initialization
+///
+/// The behavior depends on the initialization state:
+///
+/// 1. **Before initialization** (early boot): Returns Allow.
+///    The kernel itself needs to make syscalls during boot.
+///
+/// 2. **After initialization, evaluator present**: Delegates to evaluator.
+///    Normal operation path.
+///
+/// 3. **After initialization, evaluator missing**: Returns Kill (fail-closed).
+///    This indicates a bug or attack where the evaluator was cleared.
+///    Failing closed prevents a security bypass.
 #[inline]
 pub fn evaluate_current(syscall_nr: u64, args: &[u64; 6]) -> SeccompVerdict {
     // Use registered callback if available
     if let Some(evaluator) = *CURRENT_EVALUATOR.read() {
         return evaluator(syscall_nr, args);
     }
-    // Fallback: no callback registered yet (during early boot)
+
+    // R65-14 FIX: Fail-closed after initialization
+    // If seccomp is initialized but evaluator is None, something is wrong
+    // (bug or attack that cleared the callback). Fail-closed to prevent bypass.
+    if SECCOMP_INITIALIZED.load(Ordering::SeqCst) {
+        // Log this critical error - evaluator should never be None after init
+        // Using Kill action with filter_id 0 to indicate internal error
+        return SeccompVerdict {
+            action: SeccompAction::Kill,
+            filter_id: 0,
+        };
+    }
+
+    // Pre-initialization: allow (needed for kernel boot)
     SeccompVerdict::allow()
 }
 

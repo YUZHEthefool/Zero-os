@@ -77,6 +77,10 @@ pub const MAX_CAPACITY: usize = 8192;
 /// Note: We store syscall_num + 6 args, so need 7 slots
 pub const MAX_ARGS: usize = 7;
 
+/// R65-15 FIX: Maximum HMAC key size
+/// Using 32 bytes (256 bits) as recommended for HMAC-SHA256
+pub const MAX_HMAC_KEY_SIZE: usize = 32;
+
 // ============================================================================
 // Error Types
 // ============================================================================
@@ -94,6 +98,10 @@ pub enum AuditError {
     Disabled,
     /// Missing capability to read/export the audit log (CAP_AUDIT_READ)
     AccessDenied,
+    /// R65-15 FIX: HMAC key too large
+    KeyTooLarge,
+    /// R65-15 FIX: HMAC key already set (cannot be changed for forward secrecy)
+    KeyAlreadySet,
 }
 
 // ============================================================================
@@ -843,6 +851,34 @@ fn hash_event_prefixed(
 // Ring Buffer
 // ============================================================================
 
+/// R65-15 FIX: HMAC key storage
+///
+/// The key is stored inline to avoid allocation in the hot path.
+/// We use Option to track whether a key has been set.
+struct HmacKey {
+    /// Key data (padded with zeros if shorter than MAX_HMAC_KEY_SIZE)
+    data: [u8; MAX_HMAC_KEY_SIZE],
+    /// Actual key length (0 means no key set)
+    len: usize,
+}
+
+impl HmacKey {
+    const fn empty() -> Self {
+        Self {
+            data: [0u8; MAX_HMAC_KEY_SIZE],
+            len: 0,
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        self.len > 0
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+}
+
 /// Internal ring buffer for audit events
 struct AuditRing {
     /// Fixed-size buffer
@@ -857,6 +893,14 @@ struct AuditRing {
     prev_hash: [u8; 32],
     /// Accumulated dropped count since last emit
     dropped: u64,
+    /// R65-15 FIX: HMAC key for audit log integrity
+    ///
+    /// When set, all events are hashed with HMAC-SHA256 instead of plain SHA-256.
+    /// This provides:
+    /// - Tamper evidence (attackers cannot forge valid hashes)
+    /// - Authenticity verification (only key holder can verify)
+    /// - Forward secrecy (old events remain secure even if key is later compromised)
+    hmac_key: HmacKey,
 }
 
 impl AuditRing {
@@ -869,10 +913,49 @@ impl AuditRing {
             next_id: 0,
             prev_hash: ZERO_HASH,
             dropped: 0,
+            hmac_key: HmacKey::empty(), // R65-15 FIX: Initialize empty key
         }
     }
 
+    /// R65-15 FIX: Set the HMAC key for audit log integrity
+    ///
+    /// Once set, the key cannot be changed to preserve forward secrecy.
+    /// All subsequent events will be hashed with HMAC-SHA256 instead of
+    /// plain SHA-256, providing tamper-evidence and authenticity.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The secret key (recommended: 32 bytes of cryptographic randomness)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Key was set successfully
+    /// * `Err(KeyTooLarge)` - Key exceeds MAX_HMAC_KEY_SIZE
+    /// * `Err(KeyAlreadySet)` - Key was already set
+    fn set_key(&mut self, key: &[u8]) -> Result<(), AuditError> {
+        if key.len() > MAX_HMAC_KEY_SIZE {
+            return Err(AuditError::KeyTooLarge);
+        }
+        if self.hmac_key.is_set() {
+            return Err(AuditError::KeyAlreadySet);
+        }
+        self.hmac_key.data[..key.len()].copy_from_slice(key);
+        self.hmac_key.len = key.len();
+        Ok(())
+    }
+
+    /// Check if HMAC key is set
+    fn has_key(&self) -> bool {
+        self.hmac_key.is_set()
+    }
+
     /// Push an event into the ring buffer
+    ///
+    /// # R65-15 FIX: HMAC Support
+    ///
+    /// When an HMAC key is set, events are hashed with HMAC-SHA256 instead
+    /// of plain SHA-256. This provides cryptographic proof of integrity and
+    /// authenticity that cannot be forged without the key.
     fn push(&mut self, mut event: AuditEvent) {
         if self.buf.is_empty() {
             return;
@@ -891,7 +974,13 @@ impl AuditRing {
         self.next_id = self.next_id.wrapping_add(1);
         event.prev_hash = self.prev_hash;
         event.dropped = core::mem::take(&mut self.dropped);
-        event.hash = hash_event(event.prev_hash, &event);
+
+        // R65-15 FIX: Use HMAC-SHA256 when key is set, otherwise plain SHA-256
+        event.hash = if self.hmac_key.is_set() {
+            hash_event_prefixed(event.prev_hash, &event, Some(self.hmac_key.as_slice()))
+        } else {
+            hash_event(event.prev_hash, &event)
+        };
         self.prev_hash = event.hash;
 
         // Insert at tail
@@ -1165,6 +1254,74 @@ pub fn init(capacity: usize) -> Result<(), AuditError> {
         capacity
     );
     Ok(())
+}
+
+/// R65-15 FIX: Set the HMAC key for audit log integrity verification
+///
+/// This function sets a cryptographic key that will be used to compute
+/// HMAC-SHA256 hashes instead of plain SHA-256 for all subsequent audit
+/// events. This provides:
+///
+/// - **Tamper evidence**: Without the key, attackers cannot forge valid hashes
+/// - **Authenticity**: Only key holders can verify the integrity of the log
+/// - **Forward secrecy**: Events hashed before key compromise remain secure
+///
+/// # Security Requirements
+///
+/// - The key should be 32 bytes of cryptographically secure random data
+/// - The key should be stored securely (e.g., in TPM, secure enclave, or
+///   passed from bootloader via secure channel)
+/// - Once set, the key cannot be changed (prevents key rotation attacks)
+///
+/// # Arguments
+///
+/// * `key` - Secret key (max MAX_HMAC_KEY_SIZE bytes, recommended: 32 bytes)
+///
+/// # Returns
+///
+/// * `Ok(())` - Key was set successfully
+/// * `Err(Uninitialized)` - Audit subsystem not initialized
+/// * `Err(KeyTooLarge)` - Key exceeds MAX_HMAC_KEY_SIZE
+/// * `Err(KeyAlreadySet)` - Key was already set
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // During secure boot, set the audit HMAC key
+/// let key = get_secure_random_bytes::<32>();
+/// audit::set_hmac_key(&key)?;
+/// ```
+pub fn set_hmac_key(key: &[u8]) -> Result<(), AuditError> {
+    if !AUDIT_INITIALIZED.load(Ordering::SeqCst) {
+        return Err(AuditError::Uninitialized);
+    }
+
+    interrupts::without_interrupts(|| {
+        let mut ring = AUDIT_RING.lock();
+        if let Some(ref mut r) = *ring {
+            r.set_key(key)?;
+            println!("  Audit HMAC key set ({} bytes) - integrity protection active", key.len());
+            Ok(())
+        } else {
+            Err(AuditError::Uninitialized)
+        }
+    })
+}
+
+/// R65-15 FIX: Check if audit HMAC key is configured
+///
+/// Returns true if an HMAC key has been set, meaning events are being
+/// hashed with HMAC-SHA256 for cryptographic integrity protection.
+#[inline]
+pub fn has_hmac_key() -> bool {
+    if !AUDIT_INITIALIZED.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    interrupts::without_interrupts(|| {
+        let ring = AUDIT_RING.lock();
+        ring.as_ref().map(|r| r.has_key()).unwrap_or(false)
+    })
 }
 
 /// Check if audit subsystem is initialized

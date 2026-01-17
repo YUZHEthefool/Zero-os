@@ -364,6 +364,66 @@ impl Vfs {
                 return Err(FsError::CrossDev);
             }
 
+            // R65-20 FIX: Validate execute permission on the mount point before crossing
+            // into the mounted filesystem. This enforces directory traversal permissions
+            // up to and including the mount point itself, preventing permission bypass.
+            //
+            // We must verify traverse permission on the mount point directory in the
+            // parent filesystem before allowing access to the mounted filesystem's contents.
+            if mount_path != "/" {
+                // Split to get parent path and mount point name
+                if let Some(last_slash) = mount_path.rfind('/') {
+                    let parent_path = if last_slash == 0 {
+                        "/".to_string()
+                    } else {
+                        mount_path[..last_slash].to_string()
+                    };
+                    let mp_name = &mount_path[last_slash + 1..];
+
+                    if !mp_name.is_empty() {
+                        // Resolve the parent directory path
+                        if let Ok((_, parent_fs, parent_relative)) = self.find_mount(&parent_path) {
+                            // Walk to the parent directory in the parent filesystem
+                            let mut parent_inode = parent_fs.root_inode();
+                            let parent_components: Vec<&str> = parent_relative
+                                .split('/')
+                                .filter(|s| !s.is_empty())
+                                .collect();
+
+                            for comp in parent_components {
+                                if !parent_inode.is_dir() {
+                                    return Err(FsError::NotDir);
+                                }
+                                let dir_stat = parent_inode.stat()?;
+                                if !check_access_permission(&dir_stat, false, false, true) {
+                                    return Err(FsError::PermDenied);
+                                }
+                                parent_inode = parent_fs.lookup(&parent_inode, comp)?;
+                            }
+
+                            // Check execute permission on parent directory
+                            if !parent_inode.is_dir() {
+                                return Err(FsError::NotDir);
+                            }
+                            let parent_stat = parent_inode.stat()?;
+                            if !check_access_permission(&parent_stat, false, false, true) {
+                                return Err(FsError::PermDenied);
+                            }
+
+                            // Now check the mount point directory itself
+                            if let Ok(mount_inode) = parent_fs.lookup(&parent_inode, mp_name) {
+                                if mount_inode.is_dir() {
+                                    let mount_stat = mount_inode.stat()?;
+                                    if !check_access_permission(&mount_stat, false, false, true) {
+                                        return Err(FsError::PermDenied);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let mut current = fs.root_inode();
 
             // Handle empty relative path (mount point itself)

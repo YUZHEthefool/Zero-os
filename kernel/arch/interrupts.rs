@@ -8,6 +8,13 @@
 //! 以恢复 SMAP 保护。这防止了攻击者利用中断窗口绕过 SMAP。
 //!
 //! V-4 fix: 直接读取CR4而非使用全局缓存，确保SMP环境下每个CPU正确检测SMAP状态。
+//!
+//! # FPU/SSE 安全 (R65-18 fix)
+//!
+//! 硬件中断处理器必须保存/恢复 FPU/SSE 状态，因为：
+//! 1. x86-interrupt 调用约定不保存 FPU 寄存器
+//! 2. 中断处理器内的代码（如 println!, memcpy）可能使用 SSE 指令
+//! 3. 不保存会破坏被中断进程的 FPU 状态
 
 use crate::context_switch;
 use crate::gdt;
@@ -19,10 +26,69 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, Pag
 // Serial port for debug output (0x3F8)
 const SERIAL_PORT: u16 = 0x3F8;
 
-/// Clear AC flag if SMAP is enabled (S-6 fix + V-4 SMP fix)
+// ============================================================================
+// R65-18 FIX: FPU/SSE State Save for Interrupt Handlers
+// ============================================================================
+
+/// FXSAVE 区域大小（512 字节）
+const FXSAVE_SIZE: usize = 512;
+
+/// R65-18 FIX: Per-CPU FPU save area for interrupt handlers.
 ///
-/// Called at the entry of interrupt handlers to restore SMAP protection
-/// in case the interrupt occurred during a STAC region.
+/// This static buffer is used to save/restore FPU state in IRQ handlers
+/// to prevent corruption of user/kernel FPU state.
+///
+/// # Safety
+///
+/// Must be 16-byte aligned for FXSAVE/FXRSTOR instructions.
+/// On SMP systems, each CPU would need its own buffer (not implemented here).
+#[repr(C, align(64))]
+struct IrqFpuSaveArea {
+    data: [u8; FXSAVE_SIZE],
+}
+
+static mut IRQ_FPU_AREA: IrqFpuSaveArea = IrqFpuSaveArea {
+    data: [0; FXSAVE_SIZE],
+};
+
+/// R65-18 FIX: Save FPU/SSE state before IRQ handler work.
+///
+/// Must be called at the beginning of IRQ handlers that may use FPU/SSE.
+/// Pairs with `irq_restore_fpu()`.
+///
+/// # Safety
+///
+/// - Must be called with interrupts disabled (which they are in IRQ handlers)
+/// - The IRQ_FPU_AREA must not be used by nested interrupts (single CPU only)
+#[inline]
+unsafe fn irq_save_fpu() {
+    let ptr = &raw mut IRQ_FPU_AREA as *mut u8;
+    core::arch::asm!(
+        "fxsave64 [{}]",
+        in(reg) ptr,
+        options(nostack)
+    );
+}
+
+/// R65-18 FIX: Restore FPU/SSE state after IRQ handler work.
+///
+/// Must be called before returning from IRQ handlers that called `irq_save_fpu()`.
+#[inline]
+unsafe fn irq_restore_fpu() {
+    let ptr = &raw const IRQ_FPU_AREA as *const u8;
+    core::arch::asm!(
+        "fxrstor64 [{}]",
+        in(reg) ptr,
+        options(nostack)
+    );
+}
+
+/// Clear Direction Flag and AC flag if SMAP is enabled (S-6 fix + V-4 SMP fix + R65-17 fix)
+///
+/// Called at the entry of interrupt handlers to:
+/// 1. R65-17 FIX: Clear DF to prevent backwards string operations if user entered
+///    kernel with DF=1. This is critical for memory safety.
+/// 2. Restore SMAP protection in case the interrupt occurred during a STAC region.
 ///
 /// V-4 fix: Reads CR4 directly instead of using a cached value. This ensures
 /// correct SMAP detection on each CPU in SMP environments where different
@@ -36,11 +102,22 @@ const SERIAL_PORT: u16 = 0x3F8;
 ///
 /// # Safety
 ///
-/// Safe to call from any context. CLAC is a no-op if SMAP is not enabled
-/// or if AC is already clear.
+/// Safe to call from any context. CLD and CLAC are no-ops if already in the
+/// expected state.
 #[inline(always)]
 fn clac_if_smap() {
     use x86_64::registers::control::{Cr4, Cr4Flags};
+
+    // R65-17 FIX: Always clear Direction Flag to prevent backwards string operations.
+    // A user process can enter the kernel with DF=1 (e.g., via interrupt or syscall),
+    // which would cause all subsequent string ops (rep movsb, rep stosb, etc.) to run
+    // backwards, potentially corrupting memory or leaking data.
+    // This is a critical security fix - CLD must be executed before any string operations.
+    // Note: CLD modifies EFLAGS.DF, so we cannot use preserves_flags here.
+    unsafe {
+        core::arch::asm!("cld", options(nostack, nomem));
+    }
+
     if Cr4::read().contains(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION) {
         unsafe {
             core::arch::asm!("clac", options(nostack, nomem));
@@ -663,11 +740,17 @@ extern "x86-interrupt" fn virtualization_handler(_stack_frame: InterruptStackFra
 /// 4. 发送 EOI
 /// 5. 如果从用户态返回且需要重调度，执行抢占
 ///
+/// R65-18 FIX: Saves/restores FPU state to prevent corruption when IRQ code uses SSE.
+///
 /// 注意：必须先发送 EOI 再执行抢占，避免上下文切换后 IRQ0 被屏蔽。
 /// 内核态中断不抢占，以避免持锁时发生调度。
 extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
+
+    // R65-18 FIX: Save FPU state before any code that might use SSE
+    // This prevents corruption of user/kernel FPU state by IRQ handler code
+    unsafe { irq_save_fpu(); }
 
     INTERRUPT_STATS.timer.fetch_add(1, Ordering::Relaxed);
 
@@ -696,12 +779,20 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     if returning_to_user {
         kernel_core::request_resched_from_irq();
     }
+
+    // R65-18 FIX: Restore FPU state before returning from IRQ
+    unsafe { irq_restore_fpu(); }
 }
 
 /// IRQ 1 - Keyboard Interrupt (键盘中断)
+///
+/// R65-18 FIX: Saves/restores FPU state to prevent corruption.
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
+
+    // R65-18 FIX: Save FPU state
+    unsafe { irq_save_fpu(); }
 
     INTERRUPT_STATS.keyboard.fetch_add(1, Ordering::Relaxed);
 
@@ -725,6 +816,9 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     unsafe {
         core::arch::asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
     }
+
+    // R65-18 FIX: Restore FPU state
+    unsafe { irq_restore_fpu(); }
 }
 
 /// IRQ 4 - Serial COM1 Interrupt (串口中断)
@@ -733,9 +827,14 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 ///
 /// 注意：16550 UART 有16字节的 FIFO 缓冲区，必须循环读取所有可用数据，
 /// 否则如果 FIFO 未清空，可能不会触发新的中断。
+///
+/// R65-18 FIX: Saves/restores FPU state to prevent corruption.
 extern "x86-interrupt" fn serial_interrupt_handler(_stack_frame: InterruptStackFrame) {
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
+
+    // R65-18 FIX: Save FPU state
+    unsafe { irq_save_fpu(); }
 
     let mut received_any = false;
 
@@ -776,6 +875,9 @@ extern "x86-interrupt" fn serial_interrupt_handler(_stack_frame: InterruptStackF
     unsafe {
         core::arch::asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
     }
+
+    // R65-18 FIX: Restore FPU state
+    unsafe { irq_restore_fpu(); }
 }
 
 /// 触发断点异常（用于测试）

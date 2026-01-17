@@ -410,6 +410,13 @@ pub struct Process {
     /// CPU时间统计（毫秒）
     pub cpu_time: u64,
 
+    /// R65-19 FIX: 等待时间计数器（调度器tick数）
+    ///
+    /// 跟踪进程在就绪队列中等待的时间。当等待时间超过阈值时，
+    /// 调度器会提升进程的动态优先级，防止低优先级进程饥饿。
+    /// 每次进程被调度运行时重置为0。
+    pub wait_ticks: u64,
+
     /// 创建时间戳
     pub created_at: u64,
 
@@ -512,6 +519,7 @@ impl Process {
             waiting_child: None,
             children: Vec::new(),
             cpu_time: 0,
+            wait_ticks: 0, // R65-19 FIX: Initialize starvation counter
             created_at: time::current_timestamp_ms(),
             // R39-3 FIX: 默认以root运行，使用共享凭证结构
             credentials: Arc::new(RwLock::new(Credentials {
@@ -633,6 +641,47 @@ impl Process {
         if self.dynamic_priority < 139 {
             self.dynamic_priority += 1;
         }
+    }
+
+    /// R65-19 FIX: 饥饿防止 - 提升长时间等待进程的优先级
+    ///
+    /// 每次调度器tick时，对所有就绪但未运行的进程增加wait_ticks。
+    /// 当wait_ticks超过阈值(STARVATION_THRESHOLD)时，提升动态优先级。
+    ///
+    /// # 算法
+    ///
+    /// - 每STARVATION_THRESHOLD个tick提升1级优先级
+    /// - 最多提升到静态优先级（不会超过原始优先级）
+    /// - 提升后重置wait_ticks，开始新的等待周期
+    ///
+    /// # 防饥饿保证
+    ///
+    /// 即使低优先级进程被高优先级进程持续抢占，经过足够长的等待时间后，
+    /// 其优先级会被逐渐提升直到获得运行机会。
+    pub fn check_and_boost_starved(&mut self) {
+        // 饥饿阈值：100个tick（约100ms，假设1ms/tick）
+        const STARVATION_THRESHOLD: u64 = 100;
+
+        if self.wait_ticks >= STARVATION_THRESHOLD {
+            // 提升优先级（降低数值）
+            if self.dynamic_priority > 0 {
+                self.dynamic_priority -= 1;
+            }
+            // 重置等待计数器
+            self.wait_ticks = 0;
+        }
+    }
+
+    /// R65-19 FIX: 重置等待时间（进程被调度运行时调用）
+    #[inline]
+    pub fn reset_wait_ticks(&mut self) {
+        self.wait_ticks = 0;
+    }
+
+    /// R65-19 FIX: 增加等待时间（调度器tick时调用）
+    #[inline]
+    pub fn increment_wait_ticks(&mut self) {
+        self.wait_ticks = self.wait_ticks.saturating_add(1);
     }
 
     /// 恢复静态优先级

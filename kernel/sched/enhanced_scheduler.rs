@@ -18,7 +18,7 @@ use x86_64::instructions::interrupts;
 // 导入arch模块的上下文切换功能
 use arch::Context as ArchContext;
 use arch::{default_kernel_stack_top, set_kernel_stack};
-use arch::{enter_usermode, save_context, switch_context};
+use arch::{assert_kernel_context, enter_usermode, save_context, switch_context};
 
 /// 调度器调试输出开关
 ///
@@ -278,6 +278,12 @@ impl Scheduler {
     ///
     /// **重要**: 此函数在中断上下文中运行，只设置 NEED_RESCHED 标志，
     /// 不执行实际的调度/CR3切换。这避免了在中断返回时运行在错误地址空间的问题。
+    ///
+    /// # R65-19 FIX: 饥饿防止
+    ///
+    /// 每次tick时，遍历所有就绪进程，增加等待计数器，并在超过阈值时
+    /// 提升其优先级。这确保了即使低优先级进程被高优先级进程持续抢占，
+    /// 也能在合理时间内获得CPU时间。
     pub fn on_clock_tick() {
         // 使用 without_interrupts 确保在持有锁期间不会被嵌套中断打断
         interrupts::without_interrupts(|| {
@@ -303,6 +309,26 @@ impl Scheduler {
                     proc.reset_time_slice();
                     // 设置重调度标志，不在中断上下文中直接切换
                     NEED_RESCHED.store(true, Ordering::SeqCst);
+                }
+            }
+
+            // R65-19 FIX: 饥饿防止 - 增加等待进程的等待计数并检查饥饿
+            {
+                let queue = READY_QUEUE.lock();
+                for (_priority, bucket) in queue.iter() {
+                    for (&pid, pcb) in bucket.iter() {
+                        // 跳过当前运行的进程
+                        if Some(pid) == current_pid {
+                            continue;
+                        }
+                        let mut proc = pcb.lock();
+                        if proc.state == ProcessState::Ready {
+                            // 增加等待时间
+                            proc.increment_wait_ticks();
+                            // 检查并提升饥饿进程的优先级
+                            proc.check_and_boost_starved();
+                        }
+                    }
                 }
             }
 
@@ -374,6 +400,7 @@ impl Scheduler {
                         let mut pcb = proc.lock();
                         pcb.state = ProcessState::Running;
                         pcb.reset_time_slice();
+                        pcb.reset_wait_ticks(); // R65-19 FIX: Reset wait counter when scheduled
                         pcb.memory_space
                     } else {
                         0 // 默认使用引导页表
@@ -600,6 +627,9 @@ impl Scheduler {
                 } else {
                     // 内核态进程：使用标准的 switch_context
                     // 对于旧进程，函数会在下次被调度时从这里"返回"
+                    // R65-16 FIX: Validate target context has kernel-mode segments before switching.
+                    // This prevents a critical privilege escalation vulnerability.
+                    assert_kernel_context(new_ctx_ptr);
                     switch_context(old_ctx_ptr, new_ctx_ptr);
                 }
             }

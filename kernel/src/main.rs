@@ -31,6 +31,7 @@ mod demo;
 mod integration_test;
 mod interrupt_demo;
 mod process_demo;
+mod runtime_tests;
 mod stack_guard;
 mod syscall_demo;
 mod usermode_test;
@@ -488,6 +489,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
     // 运行集成测试
     integration_test::run_all_tests();
+
+    // 运行运行时功能测试
+    let test_report = runtime_tests::run_all_runtime_tests();
+    if test_report.failed > 0 {
+        println!("WARNING: {} runtime tests failed!", test_report.failed);
+    }
 
     // 运行 Ring 3 用户态测试
     println!("[9/9] Running Ring 3 user mode test...");

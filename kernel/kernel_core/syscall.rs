@@ -13,6 +13,7 @@ use crate::process::{
     with_current_cap_table, ProcessId, ProcessState,
 };
 use crate::usercopy::UserAccessGuard;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
@@ -1606,6 +1607,125 @@ fn enforce_lsm_task_fork(parent_pid: ProcessId, child_pid: ProcessId) -> Result<
     }
 
     Ok(())
+}
+
+// ============================================================================
+// R65-13 FIX: Capability Operation Wrappers with LSM/Audit Integration
+// ============================================================================
+
+/// Allocate a capability with LSM check and audit logging.
+///
+/// # Security
+///
+/// 1. Calls LSM hook_task_cap_modify before allocation
+/// 2. If LSM denies, returns EPERM without allocating
+/// 3. On success, emits audit event for tracking
+///
+/// # Arguments
+///
+/// * `cap_table` - The capability table to allocate in
+/// * `entry` - The capability entry to allocate
+/// * `proc_ctx` - Process context for LSM check
+///
+/// # Returns
+///
+/// * `Ok(CapId)` - The allocated capability ID
+/// * `Err(SyscallError)` - LSM denied or allocation failed
+fn cap_allocate_with_lsm(
+    cap_table: &cap::CapTable,
+    entry: cap::CapEntry,
+    proc_ctx: Option<&lsm::ProcessCtx>,
+) -> Result<cap::CapId, SyscallError> {
+    // Create a placeholder CapId for LSM check (will be replaced by actual ID)
+    let placeholder_id = cap::CapId::INVALID;
+
+    // LSM hook: check permission before allocation
+    if let Some(ctx) = proc_ctx {
+        if let Err(err) = lsm::hook_task_cap_modify(ctx, placeholder_id, lsm::cap_op::ALLOCATE) {
+            return Err(lsm_error_to_syscall(err));
+        }
+    }
+
+    // Perform the allocation
+    let cap_id = cap_table.allocate(entry).map_err(cap_error_to_syscall)?;
+
+    // Emit audit event on success
+    if let Some(ctx) = proc_ctx {
+        let subject = audit::AuditSubject::new(
+            ctx.pid as u32,
+            ctx.uid,
+            ctx.gid,
+            ctx.cap.map(|c| c.raw()),
+        );
+        let timestamp = crate::time::get_ticks();
+        let _ = audit::emit_capability_event(
+            audit::AuditOutcome::Success,
+            subject,
+            cap_id.raw(),
+            audit::AuditCapOperation::Allocate,
+            None,
+            0,
+            timestamp,
+        );
+    }
+
+    Ok(cap_id)
+}
+
+/// Revoke a capability with LSM check and audit logging.
+///
+/// # Security
+///
+/// 1. Calls LSM hook_task_cap_modify before revocation
+/// 2. If LSM denies, returns EPERM without revoking
+/// 3. On success, emits audit event for tracking
+///
+/// # Arguments
+///
+/// * `cap_table` - The capability table to revoke from
+/// * `cap_id` - The capability ID to revoke
+/// * `proc_ctx` - Process context for LSM check
+///
+/// # Returns
+///
+/// * `Ok(CapEntry)` - The revoked capability entry
+/// * `Err(SyscallError)` - LSM denied or revocation failed
+fn cap_revoke_with_lsm(
+    cap_table: &cap::CapTable,
+    cap_id: cap::CapId,
+    proc_ctx: Option<&lsm::ProcessCtx>,
+) -> Result<cap::CapEntry, SyscallError> {
+    // LSM hook: check permission before revocation
+    if let Some(ctx) = proc_ctx {
+        if let Err(err) = lsm::hook_task_cap_modify(ctx, cap_id, lsm::cap_op::REVOKE) {
+            return Err(lsm_error_to_syscall(err));
+        }
+    }
+
+    // Perform the revocation
+    let entry = cap_table.revoke(cap_id).map_err(cap_error_to_syscall)?;
+
+    // Emit audit event on success
+    if let Some(ctx) = proc_ctx {
+        let subject = audit::AuditSubject::new(
+            ctx.pid as u32,
+            ctx.uid,
+            ctx.gid,
+            ctx.cap.map(|c| c.raw()),
+        );
+        let timestamp = crate::time::get_ticks();
+        let _ = audit::emit_capability_event(
+            audit::AuditOutcome::Success,
+            subject,
+            cap_id.raw(),
+            audit::AuditCapOperation::Revoke,
+            None,
+            0,
+            timestamp,
+        );
+    }
+
+    Ok(entry)
 }
 
 /// 系统调用分发器
@@ -3923,46 +4043,60 @@ fn sys_mmap(
         page_flags |= PageTableFlags::NO_EXECUTE;
     }
 
-    // 从进程 PCB 中选择地址并检查重叠
-    let (base, end, update_next) = {
-        let proc = process.lock();
+    // R65-9 FIX: Hold process lock across address selection, page ops, and PCB commit
+    // This prevents race conditions where concurrent mmap calls select overlapping addresses
+    // or concurrent mmap/munmap calls corrupt page table state.
+    let mut proc = process.lock();
 
-        // 选择起始虚拟地址（使用 checked_add 防止溢出）
-        let chosen_base = if addr == 0 {
-            proc.next_mmap_addr
-                .checked_add(0xfff)
-                .ok_or(SyscallError::EINVAL)?
-                & !0xfff
+    // 选择起始虚拟地址（使用 checked_add 防止溢出）
+    // R65-11 FIX: Ensure auto-selected address is at least MMAP_MIN_ADDR
+    let base = if addr == 0 {
+        let candidate = proc.next_mmap_addr
+            .checked_add(0xfff)
+            .ok_or(SyscallError::EINVAL)?
+            & !0xfff;
+        // Ensure we don't auto-select addresses below MMAP_MIN_ADDR
+        if candidate < crate::usercopy::MMAP_MIN_ADDR {
+            crate::usercopy::MMAP_MIN_ADDR
         } else {
-            addr
-        };
+            candidate
+        }
+    } else {
+        addr
+    };
 
-        // 检查地址对齐
-        if chosen_base & 0xfff != 0 {
+    // 检查地址对齐
+    if base & 0xfff != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // R65-11 FIX: Reject mappings below MMAP_MIN_ADDR to prevent NULL dereference exploitation
+    // A kernel NULL pointer bug could be exploited if user space can map page 0 with controlled content.
+    // 64KB is the Linux default (vm.mmap_min_addr).
+    if base < crate::usercopy::MMAP_MIN_ADDR {
+        return Err(SyscallError::EPERM);
+    }
+
+    // 计算结束地址并检查用户空间边界
+    let end = base
+        .checked_add(length_aligned)
+        .ok_or(SyscallError::EFAULT)?;
+
+    if end > USER_SPACE_TOP {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // 检查与现有映射的重叠
+    for (&region_base, &region_len) in proc.mmap_regions.iter() {
+        let region_end = region_base
+            .checked_add(region_len)
+            .ok_or(SyscallError::EFAULT)?;
+        if base < region_end && end > region_base {
             return Err(SyscallError::EINVAL);
         }
+    }
 
-        // 计算结束地址并检查用户空间边界
-        let end = chosen_base
-            .checked_add(length_aligned)
-            .ok_or(SyscallError::EFAULT)?;
-
-        if end > USER_SPACE_TOP {
-            return Err(SyscallError::EFAULT);
-        }
-
-        // 检查与现有映射的重叠
-        for (&region_base, &region_len) in proc.mmap_regions.iter() {
-            let region_end = region_base
-                .checked_add(region_len)
-                .ok_or(SyscallError::EFAULT)?;
-            if chosen_base < region_end && end > region_base {
-                return Err(SyscallError::EINVAL);
-            }
-        }
-
-        (chosen_base, end, addr == 0)
-    };
+    let update_next = addr == 0;
 
     // 使用基于当前 CR3 的页表管理器进行映射
     // 使用 tracked vector 记录已映射的页，确保失败时完整回滚，避免帧泄漏
@@ -4024,16 +4158,14 @@ fn sys_mmap(
 
     map_result?;
 
-    // 记录映射到进程 PCB
-    {
-        let mut proc = process.lock();
-        proc.mmap_regions.insert(base, length_aligned);
-        if update_next {
-            proc.next_mmap_addr = end;
-        } else if proc.next_mmap_addr < end {
-            proc.next_mmap_addr = end;
-        }
+    // 记录映射到进程 PCB（锁仍持有，R65-9 FIX）
+    proc.mmap_regions.insert(base, length_aligned);
+    if update_next {
+        proc.next_mmap_addr = end;
+    } else if proc.next_mmap_addr < end {
+        proc.next_mmap_addr = end;
     }
+    drop(proc); // Explicitly drop the lock
 
     println!(
         "sys_mmap: pid={}, mapped {} bytes at 0x{:x}",
@@ -4067,11 +4199,12 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     // 对齐到页边界（使用 checked_add 防止整数溢出）
     let length_aligned = length.checked_add(0xfff).ok_or(SyscallError::EINVAL)? & !0xfff;
 
+    // R65-9 FIX: Hold process lock across validation, unmapping, and PCB update
+    // This prevents race conditions where concurrent munmap calls double-free pages
+    let mut proc = process.lock();
+
     // 检查该区域是否在进程的 mmap 记录中
-    let recorded_length = {
-        let proc = process.lock();
-        *proc.mmap_regions.get(&addr).ok_or(SyscallError::EINVAL)?
-    };
+    let recorded_length = *proc.mmap_regions.get(&addr).ok_or(SyscallError::EINVAL)?;
 
     // 验证长度匹配
     if recorded_length != length_aligned {
@@ -4133,11 +4266,9 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
 
     unmap_result?;
 
-    // 从进程 PCB 中移除映射记录
-    {
-        let mut proc = process.lock();
-        proc.mmap_regions.remove(&addr);
-    }
+    // 从进程 PCB 中移除映射记录（锁仍持有，R65-9 FIX）
+    proc.mmap_regions.remove(&addr);
+    drop(proc); // Explicitly drop the lock
 
     println!(
         "sys_munmap: pid={}, unmapped {} bytes at 0x{:x}",
@@ -5262,14 +5393,58 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
         .map_err(|_| SyscallError::EINVAL)?
         .to_string();
 
-    // Check relative path with non-AT_FDCWD dirfd (not yet supported)
-    if dirfd != AT_FDCWD && !path_str.starts_with('/') {
-        return Err(SyscallError::ENOSYS);
-    }
-
     // Get current process
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // R65-22 FIX: Handle dirfd for relative paths
+    // Resolve relative paths against the directory referenced by dirfd
+    let resolved_path = if path_str.starts_with('/') {
+        // Absolute path: dirfd is ignored
+        path_str.clone()
+    } else if dirfd == AT_FDCWD {
+        // AT_FDCWD: resolve relative to current working directory
+        // For now, treat as relative to root (cwd support is limited)
+        if path_str.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", path_str)
+        }
+    } else {
+        // R65-22 FIX: Resolve relative path against dirfd
+        // Get the directory fd and resolve path relative to it
+        let dir_path = {
+            let proc_guard = process.lock();
+            let dir_fd = proc_guard.get_fd(dirfd).ok_or(SyscallError::EBADF)?;
+
+            // The fd must be a directory for relative path resolution
+            // Check via file type if available, or defer to VFS for directory check
+            // For now, we require the fd to represent a directory inode
+            if let Some(path_info) = proc_guard.fd_table.get(&dirfd) {
+                // Use the path from the fd if we can extract it
+                // Fall back to requiring explicit directory support
+            }
+            drop(proc_guard);
+
+            // Since we don't have full fd_path tracking yet, return ENOSYS for
+            // non-AT_FDCWD dirfd with relative paths. This is safer than incorrectly
+            // resolving paths, as it prevents potential sandbox escapes.
+            //
+            // TODO: Implement full fd_paths tracking for complete openat2 support
+            return Err(SyscallError::ENOSYS);
+        };
+    };
+
+    // R65-22 FIX: Validate RESOLVE_BENEATH/RESOLVE_IN_ROOT constraints
+    // These flags should confine path resolution to the anchor directory.
+    // Without proper dirfd tracking, we cannot fully enforce these flags for
+    // non-AT_FDCWD dirfd, so we reject such combinations.
+    let resolve = how_local.resolve;
+    if dirfd != AT_FDCWD && (resolve & 0x08 != 0 || resolve & 0x10 != 0) {
+        // RESOLVE_BENEATH (0x08) or RESOLVE_IN_ROOT (0x10) with non-AT_FDCWD dirfd
+        // Cannot properly enforce without fd_path tracking
+        return Err(SyscallError::ENOSYS);
+    }
 
     // Validate flags: reject unknown flags
     let known_flags: u64 = 0o17777777; // All valid O_* flags
@@ -5285,18 +5460,18 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
 
     let open_flags = how_local.flags as u32;
     let mode = how_local.mode as u32;
-    let resolve = how_local.resolve;
+    // Note: `resolve` already defined above for R65-22 validation
 
     // LSM hook: check file create permission if O_CREAT is set
-    let path_hash = audit::hash_path(&path_str);
+    let path_hash = audit::hash_path(&resolved_path);
 
     if let Some(proc_ctx) = lsm_current_process_ctx() {
         if open_flags & lsm::OpenFlags::O_CREAT != 0 {
-            let (parent_hash, name_hash) = match path_str.rfind('/') {
-                Some(0) => (audit::hash_path("/"), audit::hash_path(&path_str[1..])),
+            let (parent_hash, name_hash) = match resolved_path.rfind('/') {
+                Some(0) => (audit::hash_path("/"), audit::hash_path(&resolved_path[1..])),
                 Some(idx) => (
-                    audit::hash_path(&path_str[..idx]),
-                    audit::hash_path(&path_str[idx + 1..]),
+                    audit::hash_path(&resolved_path[..idx]),
+                    audit::hash_path(&resolved_path[idx + 1..]),
                 ),
                 None => (audit::hash_path("."), path_hash),
             };
@@ -5315,7 +5490,7 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
     };
 
     // Call VFS with resolve flags
-    let file_ops = open_fn(&path_str, open_flags, mode, resolve)?;
+    let file_ops = open_fn(&resolved_path, open_flags, mode, resolve)?;
 
     // LSM hook: check file open permission
     if let Some(proc_ctx) = lsm_current_process_ctx() {
@@ -5861,17 +6036,65 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
     );
 
     // Allocate CapId + fd
+    // R65-13 FIX: Add LSM/audit integration for capability allocation
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
     let fd = {
         let mut proc = process.lock();
-        let cap_id = proc.cap_table.allocate(cap_entry).map_err(cap_error_to_syscall)?;
+        let proc_ctx = lsm_process_ctx_from(&proc);
+
+        // R65-13 FIX: LSM hook before capability allocation
+        if let Err(err) = lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE) {
+            drop(proc);
+            net::socket_table().close(socket.id);
+            return Err(lsm_error_to_syscall(err));
+        }
+
+        // Allocate capability for the socket
+        let cap_id = match proc.cap_table.allocate(cap_entry) {
+            Ok(id) => id,
+            Err(e) => {
+                drop(proc);
+                net::socket_table().close(socket.id);
+                return Err(cap_error_to_syscall(e));
+            }
+        };
+
+        // R65-13 FIX: Audit event for capability allocation
+        {
+            let subject = audit::AuditSubject::new(proc_ctx.pid as u32, proc_ctx.uid, proc_ctx.gid, proc_ctx.cap.map(|c| c.raw()));
+            let timestamp = crate::time::get_ticks();
+            let _ = audit::emit_capability_event(
+                audit::AuditOutcome::Success,
+                subject,
+                cap_id.raw(),
+                audit::AuditCapOperation::Allocate,
+                None,
+                0,
+                timestamp,
+            );
+        }
+
         let sock_file = SocketFile::new(cap_id, socket.id, nonblock);
         // R51-4 FIX: Roll back allocations if fd table is full
         let fd = match proc.allocate_fd(alloc::boxed::Box::new(sock_file)) {
             Some(fd) => fd,
             None => {
                 // Release capability and close socket to prevent resource leak
+                // R65-13 FIX: Audit event for capability revocation (rollback)
+                {
+                    let subject = audit::AuditSubject::new(proc_ctx.pid as u32, proc_ctx.uid, proc_ctx.gid, proc_ctx.cap.map(|c| c.raw()));
+                    let timestamp = crate::time::get_ticks();
+                    let _ = audit::emit_capability_event(
+                        audit::AuditOutcome::Success,
+                        subject,
+                        cap_id.raw(),
+                        audit::AuditCapOperation::Revoke,
+                        None,
+                        0,
+                        timestamp,
+                    );
+                }
                 let _ = proc.cap_table.revoke(cap_id);
                 drop(proc);
                 net::socket_table().close(socket.id);
@@ -6131,6 +6354,15 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
     };
     let new_fd = {
         let mut proc = process.lock();
+        let proc_ctx = lsm_process_ctx_from(&proc);
+
+        // R65-13 FIX: LSM hook before capability allocation
+        if let Err(err) = lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE) {
+            drop(proc);
+            cleanup_child(&child);
+            return Err(lsm_error_to_syscall(err));
+        }
+
         let new_cap = match proc.cap_table.allocate(cap_entry) {
             Ok(c) => c,
             Err(e) => {
@@ -6139,11 +6371,41 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
                 return Err(cap_error_to_syscall(e));
             }
         };
+
+        // R65-13 FIX: Audit event for capability allocation
+        {
+            let subject = audit::AuditSubject::new(proc_ctx.pid as u32, proc_ctx.uid, proc_ctx.gid, proc_ctx.cap.map(|c| c.raw()));
+            let timestamp = crate::time::get_ticks();
+            let _ = audit::emit_capability_event(
+                audit::AuditOutcome::Success,
+                subject,
+                new_cap.raw(),
+                audit::AuditCapOperation::Allocate,
+                None,
+                0,
+                timestamp,
+            );
+        }
+
         let sock_file = SocketFile::new(new_cap, child.id, nonblock);
         match proc.allocate_fd(alloc::boxed::Box::new(sock_file)) {
             Some(fd) => fd,
             None => {
                 // Rollback capability allocation
+                // R65-13 FIX: Audit event for capability revocation (rollback)
+                {
+                    let subject = audit::AuditSubject::new(proc_ctx.pid as u32, proc_ctx.uid, proc_ctx.gid, proc_ctx.cap.map(|c| c.raw()));
+                    let timestamp = crate::time::get_ticks();
+                    let _ = audit::emit_capability_event(
+                        audit::AuditOutcome::Success,
+                        subject,
+                        new_cap.raw(),
+                        audit::AuditCapOperation::Revoke,
+                        None,
+                        0,
+                        timestamp,
+                    );
+                }
                 let _ = proc.cap_table.revoke(new_cap);
                 drop(proc);
                 cleanup_child(&child);

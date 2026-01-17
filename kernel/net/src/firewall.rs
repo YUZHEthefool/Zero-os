@@ -591,10 +591,18 @@ pub fn firewall_table() -> &'static FirewallTable {
 ///
 /// R64-4 FIX: Rate limit firewall logs to prevent console flooding
 /// from invalid traffic or DoS attempts.
+///
+/// R65-1 FIX: Use CAS loop for atomic token decrement to prevent race condition
+/// where multiple threads can simultaneously pass the `current > 0` check and
+/// underflow the counter to u64::MAX, effectively disabling rate limiting.
 static FW_LOG_TOKENS: AtomicU64 = AtomicU64::new(100);
 static FW_LOG_WINDOW_START: AtomicU64 = AtomicU64::new(0);
 
 /// Check if we can log (simple token bucket, 100/sec).
+///
+/// R65-1 FIX: Uses atomic compare-and-swap to safely decrement tokens.
+/// This prevents race conditions where multiple threads could consume
+/// the "last" token simultaneously, causing counter underflow.
 fn can_log(now_ms: u64) -> bool {
     const LOG_RATE_LIMIT: u64 = 100;
     const LOG_RATE_WINDOW_MS: u64 = 1000;
@@ -605,13 +613,19 @@ fn can_log(now_ms: u64) -> bool {
         FW_LOG_TOKENS.store(LOG_RATE_LIMIT, AtomicOrdering::Relaxed);
     }
 
-    let current = FW_LOG_TOKENS.load(AtomicOrdering::Relaxed);
-    if current > 0 {
-        FW_LOG_TOKENS.fetch_sub(1, AtomicOrdering::Relaxed);
-        true
-    } else {
-        false
-    }
+    // R65-1 FIX: Use fetch_update with CAS loop to atomically check and decrement.
+    // This ensures only one thread can consume each token, preventing underflow.
+    // If current is 0, the closure returns None and fetch_update returns Err,
+    // indicating no token was available.
+    FW_LOG_TOKENS
+        .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |current| {
+            if current > 0 {
+                Some(current - 1)
+            } else {
+                None
+            }
+        })
+        .is_ok()
 }
 
 /// Log a firewall match (only if verdict.log is true and not rate limited).
