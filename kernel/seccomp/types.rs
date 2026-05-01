@@ -1052,6 +1052,22 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
             const CLONE_VM: u64 = 0x0000_0100;
             const CLONE_SIGHAND: u64 = 0x0000_0800;
             const CLONE_THREAD: u64 = 0x0001_0000;
+            // R154-11 FIX: Explicitly reject CLONE_NEW* namespace flags.
+            // The THREAD promise should only create threads within the
+            // existing namespace context. Without this check, a pledged
+            // "thread"-only process could smuggle namespace-creating flags
+            // alongside the required thread flags.
+            const CLONE_NEWNS: u64 = 0x0002_0000;
+            const CLONE_NEWUTS: u64 = 0x0400_0000;
+            const CLONE_NEWIPC: u64 = 0x0800_0000;
+            const CLONE_NEWUSER: u64 = 0x1000_0000;
+            const CLONE_NEWPID: u64 = 0x2000_0000;
+            const CLONE_NEWNET: u64 = 0x4000_0000;
+            const NS_DISALLOWED: u64 =
+                CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
+            if (clone_flags & NS_DISALLOWED) != 0 {
+                return false;
+            }
             let required = CLONE_THREAD | CLONE_VM | CLONE_SIGHAND;
             return (clone_flags & required) == required;
         }
