@@ -223,7 +223,13 @@ fn socket_wait_hooks() -> Option<&'static dyn SocketWaitHooks> {
 pub struct WaitQueue {
     /// Flag indicating if the queue is closed
     closed: AtomicBool,
-    /// Wakeup counter (incremented on wake, read on wait to detect wakeup)
+    /// Wakeup counter (incremented on wake, read on wait to detect wakeup).
+    ///
+    /// R153-I3 NOTE: Under sustained traffic, wake_one()/wake_all() accumulate
+    /// tokens faster than waiters consume them. This is benign — the 2^64
+    /// wraparound is non-exploitable, and try_consume_wakeup() returns early
+    /// `Woken` (not a spin loop). If this becomes a performance concern under
+    /// heavy load, consider a generation counter or 0/1 pending-wake flag.
     wakeup_count: AtomicU64,
 }
 
@@ -396,18 +402,25 @@ fn allow_challenge_ack(now_ms: u64) -> bool {
     // R121-6 FIX: Use compare_exchange on window start so only one CPU
     // wins the reset race. Without CAS, multiple CPUs can simultaneously
     // observe the window as expired and all refill tokens to the full limit.
-    let window_start = CHALLENGE_ACK_WINDOW_START.load(Ordering::Relaxed);
+    //
+    // R154-15 FIX: Use Release ordering on the CAS success and Acquire on
+    // the token load. Between CAS on WINDOW_START and store on TOKENS, a
+    // second CPU with Relaxed ordering could observe the new window start
+    // but stale (zero) tokens, permanently losing a window's worth of
+    // budget. Release on the TOKENS store pairs with Acquire on the load
+    // to ensure the refilled count is visible after the window transition.
+    let window_start = CHALLENGE_ACK_WINDOW_START.load(Ordering::Acquire);
     if window_start == 0 || now_ms.saturating_sub(window_start) >= CHALLENGE_ACK_WINDOW_MS {
         if CHALLENGE_ACK_WINDOW_START
-            .compare_exchange(window_start, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(window_start, now_ms, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            CHALLENGE_ACK_TOKENS.store(CHALLENGE_ACK_LIMIT, Ordering::Relaxed);
+            CHALLENGE_ACK_TOKENS.store(CHALLENGE_ACK_LIMIT, Ordering::Release);
         }
     }
 
     // Try to consume a token using CAS loop
-    let mut tokens = CHALLENGE_ACK_TOKENS.load(Ordering::Relaxed);
+    let mut tokens = CHALLENGE_ACK_TOKENS.load(Ordering::Acquire);
     while tokens > 0 {
         match CHALLENGE_ACK_TOKENS.compare_exchange_weak(
             tokens,
@@ -451,17 +464,20 @@ static RST_WINDOW_START: AtomicU64 = AtomicU64::new(0);
 fn allow_rst(now_ms: u64) -> bool {
     // R121-6 FIX: Use compare_exchange on window start so only one CPU
     // wins the reset race, preventing concurrent token refill on SMP.
-    let window_start = RST_WINDOW_START.load(Ordering::Relaxed);
+    // R154-15 FIX: Use AcqRel/Release ordering (same rationale as
+    // allow_challenge_ack) to prevent a second CPU from seeing the new
+    // window but stale zero tokens.
+    let window_start = RST_WINDOW_START.load(Ordering::Acquire);
     if window_start == 0 || now_ms.saturating_sub(window_start) >= RST_RATE_WINDOW_MS {
         if RST_WINDOW_START
-            .compare_exchange(window_start, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(window_start, now_ms, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            RST_TOKENS.store(RST_RATE_LIMIT, Ordering::Relaxed);
+            RST_TOKENS.store(RST_RATE_LIMIT, Ordering::Release);
         }
     }
 
-    let mut tokens = RST_TOKENS.load(Ordering::Relaxed);
+    let mut tokens = RST_TOKENS.load(Ordering::Acquire);
     while tokens > 0 {
         match RST_TOKENS.compare_exchange_weak(
             tokens,
@@ -505,17 +521,20 @@ static SYNACK_COOKIE_WINDOW_START: AtomicU64 = AtomicU64::new(0);
 fn allow_syn_cookie_ack(now_ms: u64) -> bool {
     // Use compare_exchange on window start so only one CPU wins the reset
     // race, preventing concurrent token refill on SMP (same as allow_rst).
-    let window_start = SYNACK_COOKIE_WINDOW_START.load(Ordering::Relaxed);
+    // R154-15 FIX: Use AcqRel/Release ordering (same rationale as
+    // allow_challenge_ack) to prevent a second CPU from seeing the new
+    // window but stale zero tokens.
+    let window_start = SYNACK_COOKIE_WINDOW_START.load(Ordering::Acquire);
     if window_start == 0 || now_ms.saturating_sub(window_start) >= SYNACK_COOKIE_RATE_WINDOW_MS {
         if SYNACK_COOKIE_WINDOW_START
-            .compare_exchange(window_start, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(window_start, now_ms, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            SYNACK_COOKIE_TOKENS.store(SYNACK_COOKIE_RATE_LIMIT, Ordering::Relaxed);
+            SYNACK_COOKIE_TOKENS.store(SYNACK_COOKIE_RATE_LIMIT, Ordering::Release);
         }
     }
 
-    let mut tokens = SYNACK_COOKIE_TOKENS.load(Ordering::Relaxed);
+    let mut tokens = SYNACK_COOKIE_TOKENS.load(Ordering::Acquire);
     while tokens > 0 {
         match SYNACK_COOKIE_TOKENS.compare_exchange_weak(
             tokens,
@@ -552,6 +571,12 @@ static GLOBAL_HALF_OPEN_COUNT: AtomicU32 = AtomicU32::new(0);
 /// R74-5 FIX: Tracks all active connections to prevent resource exhaustion.
 /// This is already partially enforced via tcp_conns.len() checks, but we
 /// add this counter for O(1) limit checking without holding the lock.
+///
+/// R154-I6 FIX: Scope clarification -- this counter tracks passive-open (accepted)
+/// connections only. Client-initiated (active-open / connect()) sockets are NOT
+/// counted here. The counter is incremented in `queue_accept()` and decremented
+/// on connection teardown. For observability, note that the public accessor
+/// returns the passive-open count, not total TCP connections.
 static GLOBAL_ACTIVE_CONN_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Global maximum for half-open connections (SYN flood protection).
@@ -5581,9 +5606,28 @@ impl SocketTable {
                 let mut ack_response: Option<Vec<u8>> = None;
                 let is_fin = header.flags & TCP_FLAG_FIN != 0;
 
-                if !payload.is_empty()
+                // R154-7 FIX: Apply LSM recv hook BEFORE buffering piggybacked data.
+                // Established/FinWait1/FinWait2 all call hook_net_recv; SynReceived
+                // was missing this check, allowing one segment of unauthorized data.
+                let payload_allowed = if !payload.is_empty() {
+                    let mut ctx = self.ctx_from_socket(&sock);
+                    ctx.remote = ipv4_to_u64(src_ip.0);
+                    ctx.remote_port = header.src_port;
+                    hook_net_recv(&sock.label.creator, &ctx, payload.len()).is_ok()
+                } else {
+                    true
+                };
+
+                if payload_allowed && !payload.is_empty()
                     && header.seq_num == tcp_state.control.rcv_nxt
                 {
+                    // R154-I2 FIX: Window calculation uses recv_buffer.len() without ooo_bytes.
+                    // Invariant: SynReceived state cannot have out-of-order data because OOO
+                    // buffering only occurs in Established/FinWait1/FinWait2 paths. This is
+                    // the first data segment accepted after handshake completion, so ooo_bytes
+                    // is guaranteed to be zero here.
+                    debug_assert_eq!(tcp_state.control.ooo_bytes, 0,
+                        "R154-I2: OOO bytes non-zero in SynReceived→Established transition");
                     let consumed = tcp_state.control.recv_buffer.len() as u32;
                     let available = tcp_state.control.rcv_wnd.saturating_sub(consumed);
                     if (payload.len() as u32) <= available {
@@ -5640,6 +5684,12 @@ impl SocketTable {
                     drop(listen_guard);
 
                     // Push to accept queue and wake accept() waiters
+                    // R154-9 FIX: Defense-in-depth note — completed child sockets are
+                    // pushed here without a per-socket LSM accept check. Currently
+                    // sys_accept() performs hook_net_accept() before returning the fd
+                    // to userspace, so security is maintained. If a future code path
+                    // hands out accepted sockets without going through sys_accept(),
+                    // an LSM gate should be added here as well.
                     if !listener.push_accept_ready(sock.clone()) {
                         // Accept queue full - abort connection
                         // R51-1 FIX (Codex): Mark socket closed before cleanup

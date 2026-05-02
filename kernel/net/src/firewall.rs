@@ -705,10 +705,23 @@ fn can_log(now_ms: u64) -> bool {
     const LOG_RATE_LIMIT: u64 = 100;
     const LOG_RATE_WINDOW_MS: u64 = 1000;
 
+    // R154-I7 FIX: Use compare_exchange instead of store() for window reset.
+    // On SMP, two CPUs can both observe an expired window and both call store(),
+    // causing a double-refill that admits up to 2x the intended rate. CAS ensures
+    // only one CPU wins the reset; the loser harmlessly proceeds with existing tokens.
     let window_start = FW_LOG_WINDOW_START.load(AtomicOrdering::Relaxed);
     if now_ms.saturating_sub(window_start) >= LOG_RATE_WINDOW_MS {
-        FW_LOG_WINDOW_START.store(now_ms, AtomicOrdering::Relaxed);
-        FW_LOG_TOKENS.store(LOG_RATE_LIMIT, AtomicOrdering::Relaxed);
+        if FW_LOG_WINDOW_START
+            .compare_exchange(
+                window_start,
+                now_ms,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            )
+            .is_ok()
+        {
+            FW_LOG_TOKENS.store(LOG_RATE_LIMIT, AtomicOrdering::Relaxed);
+        }
     }
 
     // R65-1 FIX: Use fetch_update with CAS loop to atomically check and decrement.
