@@ -1562,8 +1562,15 @@ impl FileOps for Ext2File {
     }
 
     /// R41-1 FIX: Return actual inode metadata for fstat.
+    /// R154-1 FIX: MAC gate for fd-backed stat — prevents metadata probe
+    /// via inherited/pre-policy fds that bypass path-based R153-2 check.
     fn stat(&self) -> Result<VfsStat, SyscallError> {
         let inode_stat = self.inode.stat().map_err(SyscallError::from)?;
-        Ok(VfsStat::from(inode_stat))
+        let vfs_stat = VfsStat::from(inode_stat);
+        if let Some(task) = lsm::ProcessCtx::from_current() {
+            lsm::hook_file_permission(&task, vfs_stat.ino, 0)
+                .map_err(|_| SyscallError::EACCES)?;
+        }
+        Ok(vfs_stat)
     }
 }

@@ -38,8 +38,22 @@ use kernel_core::{process, FileOps};
 /// Global cgroupfs ID counter (starts at 300 to avoid collision with other FS types)
 static NEXT_FS_ID: AtomicU64 = AtomicU64::new(300);
 
-/// Next inode number counter
-static NEXT_INO: AtomicU64 = AtomicU64::new(2);
+/// R154-2 FIX: Deterministic inode computation replaces unstable NEXT_INO counter.
+/// Inode = (cgroup_id + 1) * STRIDE + file_offset.
+/// STRIDE = 16 (1 dir + 12 control files + 3 spare). Root cgroup (id=0) → dir ino=16.
+/// file_offset: 0 = directory, 1..12 = control files (matching CtrlKind::all() index + 1).
+const CGROUPFS_INO_STRIDE: u64 = 16;
+
+/// Compute deterministic inode for a cgroup directory.
+fn cgroup_dir_ino(cgroup_id: CgroupId) -> u64 {
+    (cgroup_id + 1) * CGROUPFS_INO_STRIDE
+}
+
+/// Compute deterministic inode for a cgroup control file.
+/// `ctrl_index` is the 0-based index into CtrlKind::all().
+fn cgroup_ctrl_ino(cgroup_id: CgroupId, ctrl_index: usize) -> u64 {
+    (cgroup_id + 1) * CGROUPFS_INO_STRIDE + (ctrl_index as u64) + 1
+}
 
 // ============================================================================
 // Control File Types
@@ -132,6 +146,11 @@ impl CtrlKind {
         ]
     }
 
+    /// R154-2 FIX: Get 0-based index of this control kind in all().
+    fn index(&self) -> usize {
+        CtrlKind::all().iter().position(|k| k == self).unwrap_or(0)
+    }
+
     /// Parse filename to control kind
     fn from_filename(name: &str) -> Option<CtrlKind> {
         match name {
@@ -171,9 +190,10 @@ impl CgroupFs {
             .expect("cgroupfs: NEXT_FS_ID overflow");
 
         // Root directory maps to root cgroup (id=0)
+        // R154-2 FIX: Deterministic inode computation
         let root = Arc::new(CgroupDirInode {
             fs_id,
-            ino: 1,
+            ino: cgroup_dir_ino(0),
             cgroup_id: 0,
             name: String::new(),
         });
@@ -234,9 +254,8 @@ impl FileSystem for CgroupFs {
         // Create child cgroup
         match cgroup::create_cgroup(dir.cgroup_id, controllers) {
             Ok(child) => {
-                let ino = NEXT_INO
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-                    .expect("cgroupfs: NEXT_INO overflow");
+                // R154-2 FIX: Deterministic inode from cgroup_id
+                let ino = cgroup_dir_ino(child.id());
                 Ok(Arc::new(CgroupDirInode {
                     fs_id: self.fs_id,
                     ino,
@@ -311,9 +330,8 @@ impl CgroupDirInode {
                 }
             }
 
-            let ino = NEXT_INO
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-                .expect("cgroupfs: NEXT_INO overflow");
+            // R154-2 FIX: Deterministic inode from cgroup_id + control index
+            let ino = cgroup_ctrl_ino(self.cgroup_id, kind.index());
             return Ok(Arc::new(CgroupCtrlInode {
                 fs_id,
                 ino,
@@ -330,9 +348,8 @@ impl CgroupDirInode {
             // Simple matching: name could be the cgroup name or ID
             let id_str = format!("{}", child_id);
             if name == id_str {
-                let ino = NEXT_INO
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-                    .expect("cgroupfs: NEXT_INO overflow");
+                // R154-2 FIX: Deterministic inode from child cgroup_id
+                let ino = cgroup_dir_ino(child_id);
                 return Ok(Arc::new(CgroupDirInode {
                     fs_id,
                     ino,
@@ -424,9 +441,8 @@ impl Inode for CgroupDirInode {
                 offset + 1,
                 DirEntry {
                     name: String::from(kind.filename()),
-                    ino: NEXT_INO
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-                        .expect("cgroupfs: NEXT_INO overflow"),
+                    // R154-2 FIX: Deterministic inode
+                    ino: cgroup_ctrl_ino(self.cgroup_id, kind.index()),
                     file_type: FileType::Regular,
                 },
             )));
@@ -443,9 +459,8 @@ impl Inode for CgroupDirInode {
                 offset + 1,
                 DirEntry {
                     name: format!("{}", child_id),
-                    ino: NEXT_INO
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-                        .expect("cgroupfs: NEXT_INO overflow"),
+                    // R154-2 FIX: Deterministic inode
+                    ino: cgroup_dir_ino(child_id),
                     file_type: FileType::Directory,
                 },
             )));
@@ -825,10 +840,29 @@ impl Inode for CgroupCtrlInode {
     }
 
     fn stat(&self) -> Result<Stat, FsError> {
+        // R153-8 FIX: Reflect actual write permission in reported mode.
+        // Previously all writable control files reported 0o644 regardless
+        // of delegation status, making them appear writable to everyone
+        // despite write_content() enforcing root/delegate checks. Now we
+        // check delegation status and only report 0o644 for root or the
+        // delegated UID; others see 0o444 for defense-in-depth at the
+        // VFS DAC layer.
         let mode = if self.kind.is_readonly() {
             FileMode::regular(0o444)
         } else {
-            FileMode::regular(0o644)
+            // Check if current caller would be allowed to write
+            let can_write = kernel_core::current_is_host_root()
+                || kernel_core::current_host_euid()
+                    .and_then(|euid| {
+                        cgroup::lookup_cgroup(self.cgroup_id)
+                            .filter(|cg| cg.is_delegated_to(euid))
+                    })
+                    .is_some();
+            if can_write {
+                FileMode::regular(0o644)
+            } else {
+                FileMode::regular(0o444)
+            }
         };
 
         // P1-3: Reflect delegated owner in DAC metadata so non-root

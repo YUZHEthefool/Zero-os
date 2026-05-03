@@ -952,9 +952,22 @@ impl Vfs {
     }
 
     /// Get file status by path
+    ///
+    /// R153-2 FIX: Enforce MAC via LSM hook before returning stat metadata.
+    /// Without this, attackers can probe file metadata (size, timestamps,
+    /// permissions) even under MAC denial — inconsistent with open()/readdir()
+    /// which already have LSM gates.
     pub fn stat(&self, path: &str) -> Result<Stat, FsError> {
         let inode = self.lookup_path(path)?;
-        inode.stat()
+        let stat = inode.stat()?;
+
+        // R153-2 FIX: MAC gate for stat — access_mask 0 = existence/metadata check.
+        if let Some(task) = LsmProcessCtx::from_current() {
+            lsm::hook_file_permission(&task, stat.ino, 0)
+                .map_err(|_| FsError::PermDenied)?;
+        }
+
+        Ok(stat)
     }
 
     /// Read directory entries
