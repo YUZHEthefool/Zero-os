@@ -404,6 +404,10 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
 ///     });
 /// }
 /// ```
+/// R153-10 NOTE: This function bypasses PT_LOCK and is restricted to single-CPU
+/// early boot via the num_online_cpus() assertion. Post-SMP callers MUST use
+/// with_pt_lock() or with_current_manager() instead. All current call sites
+/// (memory_hardening::cleanup_identity_mapping, enforce_nx) are early-boot only.
 pub unsafe fn with_active_level_4_table<T, F>(f: F) -> T
 where
     F: FnOnce(&mut PageTable) -> T,
