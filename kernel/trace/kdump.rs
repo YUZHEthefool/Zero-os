@@ -843,8 +843,34 @@ unsafe fn outb(port: u16, val: u8) {
     );
 }
 
+#[inline(always)]
+unsafe fn inb(port: u16) -> u8 {
+    let val: u8;
+    asm!(
+        "in al, dx",
+        out("al") val,
+        in("dx") port,
+        options(nomem, nostack, preserves_flags)
+    );
+    val
+}
+
+/// R154-I4 FIX: Wait for UART Transmitter Holding Register (THR) to be empty
+/// before writing each byte, preventing character drops on slow serial lines.
+/// The busy-wait is bounded to avoid infinite loops if the serial port is dead.
 #[inline]
 fn serial_write_byte(byte: u8) {
+    const LSR_OFFSET: u16 = 5; // Line Status Register offset from base
+    const LSR_THRE: u8 = 1 << 5; // Transmitter Holding Register Empty bit
+    const MAX_WAIT: u32 = 10_000; // Bounded wait to avoid hang on dead UART
+
+    // Poll LSR bit 5 (THR empty) before writing
+    for _ in 0..MAX_WAIT {
+        if unsafe { inb(SERIAL_PORT + LSR_OFFSET) } & LSR_THRE != 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
     unsafe { outb(SERIAL_PORT, byte); }
 }
 
