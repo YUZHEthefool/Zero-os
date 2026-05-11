@@ -322,9 +322,11 @@ impl VirtQueue {
     /// The caller must ensure the index is valid and the descriptor
     /// is not currently in use by the device.
     pub unsafe fn desc_mut(&self, idx: u16) -> &mut VringDesc {
-        // R150-I2 FIX: Catch out-of-bounds descriptor access in debug builds.
-        // All current callers use driver-allocated indices, but a future bug
-        // would silently produce UB without this assertion.
+        // R150-I2 FIX / R154-I3 FIX: Bounds check is debug_assert (stripped in release).
+        // This is intentional: all callers are audited to pass driver-allocated indices
+        // bounded by queue size, so the check serves as a development-time invariant
+        // rather than a runtime guard. A release-mode panic here would be unrecoverable
+        // in an interrupt context.
         debug_assert!(idx < self.size, "desc_mut: idx {} >= size {}", idx, self.size);
         &mut *self.desc.add(idx as usize)
     }

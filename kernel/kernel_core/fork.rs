@@ -734,6 +734,11 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
         // (set by `PAGE_REF_COUNT.increment(entry.addr().as_u64() as usize)` in fork).
         // Using unaligned `old_phys` would miss the entry and return 0, causing
         // premature frame deallocation.
+        // R153-I2 FIX: Assert alignment to catch future misuse of the refcount API.
+        debug_assert!(
+            old_frame.start_address().as_u64() % 4096 == 0,
+            "COW refcount key must be page-aligned"
+        );
         let remaining = PAGE_REF_COUNT.decrement(old_frame.start_address().as_u64() as usize);
         if remaining == 0 {
             frame_alloc.deallocate_frame(old_frame);
