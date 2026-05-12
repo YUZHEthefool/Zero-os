@@ -784,23 +784,20 @@ extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptSta
     };
 
     // Disable interrupts during FPU owner transition to prevent races
-    x86_interrupts::without_interrupts(|| {
+    let transfer_complete = x86_interrupts::without_interrupts(|| {
         let per_cpu = current_cpu();
         let prev_owner = per_cpu.get_fpu_owner();
 
         // Fast path: same process re-accessing FPU
         if prev_owner == current {
-            // Already own the FPU, just ensure ownership is tracked
             per_cpu.set_fpu_owner(current);
-            return;
+            return true;
         }
 
         // R154-4 FIX: Use try_lock() to avoid deadlock if #NM interrupts code
-        // already holding a Process lock. If ANY try_lock fails, abort the full
-        // ownership transfer — leave fpu_owner unchanged and CR0.TS cleared.
-        // The faulting instruction will proceed with stale FPU state (acceptable:
-        // the interrupted code holds the lock because it's modifying the PCB,
-        // and the normal context-switch path will do a proper save/restore).
+        // already holding a Process lock.
+        // R155-1 FIX: If ANY try_lock fails, abort the transfer and restore
+        // CR0.TS below so the faulting instruction retries #NM later.
         //
         // IMPORTANT: We must not fxrstor current without first fxsave previous,
         // because that would destroy the previous owner's unsaved live FPU state.
@@ -816,15 +813,14 @@ extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptSta
                     pcb.fpu_used = true;
                     true
                 } else {
-                    false // Lock contended — abort transfer
+                    false
                 }
             } else {
-                // Previous owner no longer exists — safe to proceed
                 per_cpu.clear_fpu_owner_if(prev_owner);
                 true
             }
         } else {
-            true // No previous owner — nothing to save
+            true
         };
 
         // Step 2: Only restore current if we successfully saved previous
@@ -837,17 +833,24 @@ extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptSta
                     }
                     pcb.fpu_used = true;
                     per_cpu.set_fpu_owner(current);
+                    true
+                } else {
+                    false
                 }
-                // If cur try_lock fails: CR0.TS cleared, runs with stale state.
-                // Context switch will do proper save/restore later.
             } else {
                 per_cpu.set_fpu_owner(NO_FPU_OWNER);
+                true
             }
+        } else {
+            false
         }
-        // If prev_saved == false: neither save nor restore happened.
-        // CR0.TS is cleared, prev_owner retains fpu_owner. The faulting
-        // instruction proceeds; next context switch does eager save/restore.
     });
+
+    // R155-1 FIX: If ownership transfer failed (try_lock contention), restore
+    // CR0.TS so the faulting instruction re-triggers #NM for retry.
+    if !transfer_complete {
+        unsafe { Cr0::write(cr0) };
+    }
 
     // R117-4 FIX: Check pending_kill after FPU state is settled.
     check_pending_kill_on_exception_return(&stack_frame);
@@ -1245,20 +1248,34 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
         if !AP_TIMER_SEEN[cpu_id].swap(true, Ordering::Relaxed) {
             // Write directly to serial port 0x3F8 without locking
             // Format: "[T:X]" where X is CPU ID
+            //
+            // R155-14 FIX: Bound UART busy-wait to avoid infinite loop in
+            // hard IRQ context on dead/unresponsive UART. Matches the
+            // bounded MAX_WAIT pattern used in kernel/trace/.
             unsafe {
                 let port = 0x3F8u16;
-                // Wait for transmit buffer empty
-                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                const MAX_WAIT: u32 = 1000;
+                // Helper: Poll LSR bit 5 (THR empty) with bounded loop
+                macro_rules! uart_wait_thr {
+                    () => {
+                        for _ in 0..MAX_WAIT {
+                            if (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) != 0 {
+                                break;
+                            }
+                        }
+                    };
+                }
+                uart_wait_thr!();
                 x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'[');
-                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                uart_wait_thr!();
                 x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'T');
-                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                uart_wait_thr!();
                 x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b':');
-                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                uart_wait_thr!();
                 x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'0' + (cpu_id as u8));
-                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                uart_wait_thr!();
                 x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b']');
-                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                uart_wait_thr!();
                 x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'\n');
             }
         }
@@ -1318,36 +1335,37 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     // 实际调度延迟到安全路径（syscall 返回）执行
     if returning_to_user {
         // R116-2 FIX: Check pending_kill before returning to user-mode.
-        // The R115-1 pending_kill flag is only consumed at syscall return
-        // (syscall.rs:2186). A userspace thread in a tight CPU loop (no syscalls)
-        // never reaches that check. Timer IRQ is the only interrupt that regularly
-        // fires on compute-bound threads, so we must check here to ensure
-        // exit_group()/SIGKILL can terminate such threads.
         if let Some(pid) = current_pid() {
             if let Some(exit_code) = kernel_core::process::take_pending_process_exit(pid) {
-                kernel_core::process::terminate_process(pid, exit_code);
+                // R155-6 FIX: Defer heavy terminate_process() to process context.
+                // Only set Zombie AFTER defer succeeds to avoid unreaped zombie
+                // if the deferred queue is full.
+                if kernel_core::process::defer_irq_terminate(pid, exit_code) {
+                    // Deferred successfully — now mark Zombie to prevent rescheduling
+                    if let Some(proc_arc) = kernel_core::process::get_process(pid) {
+                        if let Some(mut proc) = proc_arc.try_lock() {
+                            proc.state = kernel_core::process::ProcessState::Zombie;
+                            proc.exit_code = Some(exit_code);
+                        }
+                    }
 
-                // Must restore FPU and exit IRQ context before entering halt loop,
-                // otherwise we leak IRQ nesting state on this CPU.
-                unsafe {
-                    irq_restore_fpu();
-                }
-                current_cpu().irq_exit();
+                    unsafe {
+                        irq_restore_fpu();
+                    }
+                    current_cpu().irq_exit();
 
-                // R117-1 FIX: Disable interrupts and switch to boot CR3 before
-                // halting. Without this, timer IRQs continue pushing frames onto
-                // the zombie's kernel stack, and freed user page tables remain
-                // in the TLB. Same safety rationale as terminate_self_and_halt().
-                x86_interrupts::disable();
-                kernel_core::process::activate_memory_space(0, Some(0));
+                    x86_interrupts::disable();
+                    kernel_core::process::activate_memory_space(0, Some(0));
 
-                kernel_core::force_reschedule();
+                    kernel_core::force_reschedule();
 
-                // Re-disable after force_reschedule which may re-enable interrupts.
-                x86_interrupts::disable();
-                // SAFETY: Process is Zombie on safe boot CR3; halt with IF=0.
-                loop {
-                    x86_64::instructions::hlt();
+                    x86_interrupts::disable();
+                    loop {
+                        x86_64::instructions::hlt();
+                    }
+                } else {
+                    // Deferred queue full — re-flag for next tick
+                    kernel_core::process::request_process_exit(pid, exit_code);
                 }
             }
         }
@@ -1621,6 +1639,13 @@ extern "x86-interrupt" fn reschedule_ipi_handler(_stack_frame: InterruptStackFra
     // R69-3 FIX: Mark entering IRQ context
     current_cpu().irq_enter();
 
+    // R155-11 FIX: Save FPU state before any code that might use SSE.
+    // Compiler auto-vectorization can emit SSE instructions in handler code,
+    // corrupting the interrupted context's FPU state without save/restore.
+    unsafe {
+        irq_save_fpu();
+    }
+
     // Mark this CPU as needing a reschedule
     current_cpu().set_need_resched();
 
@@ -1630,6 +1655,11 @@ extern "x86-interrupt" fn reschedule_ipi_handler(_stack_frame: InterruptStackFra
     // Send LAPIC EOI (not PIC - this is an IPI)
     unsafe {
         apic::lapic_eoi();
+    }
+
+    // R155-11 FIX: Restore FPU state before returning
+    unsafe {
+        irq_restore_fpu();
     }
 
     // R69-3 FIX: Mark leaving IRQ context
@@ -1657,12 +1687,24 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStack
     // R69-3 FIX: Mark entering IRQ context
     current_cpu().irq_enter();
 
+    // R155-11 FIX: Save FPU state before any code that might use SSE.
+    // Compiler auto-vectorization can emit SSE instructions in handler code,
+    // corrupting the interrupted context's FPU state without save/restore.
+    unsafe {
+        irq_save_fpu();
+    }
+
     // Delegate to the TLB shootdown module
     tlb_shootdown::handle_shootdown_ipi();
 
     // Send LAPIC EOI (not PIC - this is an IPI)
     unsafe {
         apic::lapic_eoi();
+    }
+
+    // R155-11 FIX: Restore FPU state before returning
+    unsafe {
+        irq_restore_fpu();
     }
 
     // R69-3 FIX: Mark leaving IRQ context
