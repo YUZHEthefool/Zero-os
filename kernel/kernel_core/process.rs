@@ -3098,6 +3098,51 @@ fn notify_kpti_cr3_update(user_cr3: u64, kernel_cr3: u64) {
     }
 }
 
+// R155-6 FIX: Deferred IRQ termination queue.
+// Timer IRQ handlers cannot safely run terminate_process() (blocking locks,
+// heap allocation, deep call stack) on the interrupt stack. Instead, they
+// enqueue the (pid, exit_code) here and set the process to Blocked. The
+// next process-context drain_deferred_irq_terminates() call performs the
+// full cleanup.
+const MAX_DEFERRED_IRQ_KILLS: usize = 8;
+static DEFERRED_IRQ_KILL_PIDS: [AtomicU64; MAX_DEFERRED_IRQ_KILLS] =
+    [const { AtomicU64::new(0) }; MAX_DEFERRED_IRQ_KILLS];
+static DEFERRED_IRQ_KILL_CODES: [AtomicI32; MAX_DEFERRED_IRQ_KILLS] =
+    [const { AtomicI32::new(0) }; MAX_DEFERRED_IRQ_KILLS];
+static DEFERRED_IRQ_KILL_PENDING: AtomicBool = AtomicBool::new(false);
+
+pub fn defer_irq_terminate(pid: ProcessId, exit_code: i32) -> bool {
+    for i in 0..MAX_DEFERRED_IRQ_KILLS {
+        if DEFERRED_IRQ_KILL_PIDS[i].load(Ordering::Relaxed) == 0 {
+            // Store exit code BEFORE publishing PID to prevent drain from
+            // reading a stale code on a concurrent swap.
+            DEFERRED_IRQ_KILL_CODES[i].store(exit_code, Ordering::Relaxed);
+            if DEFERRED_IRQ_KILL_PIDS[i]
+                .compare_exchange(0, pid as u64, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                DEFERRED_IRQ_KILL_PENDING.store(true, Ordering::Release);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn drain_deferred_irq_terminates() {
+    if !DEFERRED_IRQ_KILL_PENDING.load(Ordering::Acquire) {
+        return;
+    }
+    DEFERRED_IRQ_KILL_PENDING.store(false, Ordering::Relaxed);
+    for i in 0..MAX_DEFERRED_IRQ_KILLS {
+        let pid_raw = DEFERRED_IRQ_KILL_PIDS[i].swap(0, Ordering::Acquire);
+        if pid_raw != 0 {
+            let code = DEFERRED_IRQ_KILL_CODES[i].load(Ordering::Relaxed);
+            terminate_process(pid_raw as ProcessId, code);
+        }
+    }
+}
+
 /// R117-1 FIX: Centralized self-termination primitive.
 ///
 /// Terminates the current process and enters a safe no-return halt loop.

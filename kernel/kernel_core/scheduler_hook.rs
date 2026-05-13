@@ -130,16 +130,15 @@ pub fn on_scheduler_tick() {
 #[inline]
 pub fn reschedule_if_needed() {
     // R65-6 FIX: Drain deferred TCP timer work before scheduling check
-    // This ensures timer work is completed in safe (non-IRQ) context when
-    // IRQ-time processing was blocked by lock contention.
     crate::time::drain_deferred_tcp_timers();
 
     // R149-1 FIX: Drain deferred stdin wakes from keyboard/serial IRQ.
-    // IRQ handlers only set a flag (no locks); actual wake happens here.
     crate::syscall::drain_deferred_stdin_wakes();
 
+    // R155-6 FIX: Drain deferred IRQ terminations in process context.
+    crate::process::drain_deferred_irq_terminates();
+
     // E.4 RCU: Drain callbacks in process context.
-    // This runs deferred destruction work for RCU-protected data.
     crate::rcu::poll();
 
     // R67-4 FIX: Consume this CPU's IRQ-triggered reschedule request
