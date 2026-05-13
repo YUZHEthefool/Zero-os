@@ -403,12 +403,10 @@ fn allow_challenge_ack(now_ms: u64) -> bool {
     // wins the reset race. Without CAS, multiple CPUs can simultaneously
     // observe the window as expired and all refill tokens to the full limit.
     //
-    // R154-15 FIX: Use Release ordering on the CAS success and Acquire on
-    // the token load. Between CAS on WINDOW_START and store on TOKENS, a
-    // second CPU with Relaxed ordering could observe the new window start
-    // but stale (zero) tokens, permanently losing a window's worth of
-    // budget. Release on the TOKENS store pairs with Acquire on the load
-    // to ensure the refilled count is visible after the window transition.
+    // R155-13 FIX: Refill tokens only on CAS success to prevent a losing CPU
+    // from overwriting tokens the winner already spent.
+    // Release on CAS pairs with Acquire on window_start load to ensure
+    // the token store is visible to any CPU that sees the new window.
     let window_start = CHALLENGE_ACK_WINDOW_START.load(Ordering::Acquire);
     if window_start == 0 || now_ms.saturating_sub(window_start) >= CHALLENGE_ACK_WINDOW_MS {
         if CHALLENGE_ACK_WINDOW_START
@@ -3928,6 +3926,33 @@ impl SocketTable {
                             // SYN cookie path handles the backlog-full case above,
                             // but queue_syn can still fail due to global half-open limit.
                             if listen_state.queue_syn(pending) {
+                                // R155-9 FIX: Seed conntrack for the inbound SYN +
+                                // outbound SYN-ACK so the final ACK transitions to
+                                // Established. Same pattern as the SYN cookie path.
+                                #[cfg(feature = "conntrack")]
+                                {
+                                    use crate::conntrack::ct_process_tcp;
+                                    let _ = ct_process_tcp(
+                                        listener.net_ns_id.0,
+                                        src_ip,
+                                        dst_ip,
+                                        header.src_port,
+                                        header.dst_port,
+                                        header.flags,
+                                        payload.len(),
+                                        now_ms,
+                                    );
+                                    let _ = ct_process_tcp(
+                                        listener.net_ns_id.0,
+                                        dst_ip,
+                                        src_ip,
+                                        header.dst_port,
+                                        header.src_port,
+                                        TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                        0,
+                                        now_ms,
+                                    );
+                                }
                                 return Some(syn_ack);
                             }
 
@@ -4502,6 +4527,9 @@ impl SocketTable {
                 }
 
                 let mut data_received = false;
+                // R155-15 FIX: Track whether OOO drain delivered a buffered FIN,
+                // so that state waiters are also woken (not just data waiters).
+                let mut ooo_fin_delivered = false;
                 let mut response: Option<Vec<u8>> = None;
                 // R144-1 FIX: Save rcv_nxt AFTER in-order data but BEFORE OOO drain.
                 //
@@ -4561,6 +4589,15 @@ impl SocketTable {
                         // acceptance, enabling post-FIN data injection.
                         if !is_fin {
                             tcp_state.control.ooo_drain_contiguous();
+
+                            // R155-15 FIX: OOO drain may deliver a buffered FIN,
+                            // triggering state transitions inside tcp.rs (e.g.
+                            // Established→CloseWait) without socket-layer side
+                            // effects.  If fin_received became true, ensure recv
+                            // waiters are woken for EOF delivery.
+                            if tcp_state.control.fin_received {
+                                ooo_fin_delivered = true;
+                            }
                         }
 
                         // Build ACK (plain — no SACK blocks needed for in-order data
@@ -4672,6 +4709,16 @@ impl SocketTable {
 
                     if data_received {
                         // Wake any threads blocked in tcp_recv()
+                        sock.wake_tcp_data_waiters();
+                    }
+
+                    // R155-15 FIX: OOO drain delivered a buffered FIN, which
+                    // transitioned the state (e.g. Established→CloseWait)
+                    // inside tcp.rs.  Wake state waiters so close/shutdown
+                    // paths see the transition, and ensure data waiters are
+                    // woken for EOF even if data_received was not set.
+                    if ooo_fin_delivered {
+                        sock.wake_tcp_waiters();
                         sock.wake_tcp_data_waiters();
                     }
 
@@ -4787,6 +4834,8 @@ impl SocketTable {
                 }
 
                 let mut data_received = false;
+                // R155-15 FIX: Track OOO-drain-delivered FIN for wake side effects.
+                let mut ooo_fin_delivered = false;
                 let mut response: Option<Vec<u8>> = None;
                 // R144-1 FIX: See Established-state comment for rationale.
                 let mut fin_expected_seq: Option<u32> = None;
@@ -4823,6 +4872,10 @@ impl SocketTable {
                         fin_expected_seq = Some(tcp_state.control.rcv_nxt);
                         if !is_fin {
                             tcp_state.control.ooo_drain_contiguous();
+                            // R155-15 FIX: OOO drain may deliver buffered FIN.
+                            if tcp_state.control.fin_received {
+                                ooo_fin_delivered = true;
+                            }
                         }
 
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
@@ -4931,6 +4984,12 @@ impl SocketTable {
                     if data_received {
                         sock.wake_tcp_data_waiters();
                     }
+                    // R155-15 FIX: OOO drain delivered buffered FIN — wake
+                    // both data and state waiters for EOF and state transition.
+                    if ooo_fin_delivered {
+                        sock.wake_tcp_waiters();
+                        sock.wake_tcp_data_waiters();
+                    }
                     if acked_fin {
                         sock.wake_tcp_waiters();
                     }
@@ -5017,6 +5076,8 @@ impl SocketTable {
                 }
 
                 let mut data_received = false;
+                // R155-15 FIX: Track OOO-drain-delivered FIN for wake side effects.
+                let mut ooo_fin_delivered = false;
                 let mut response: Option<Vec<u8>> = None;
                 // R144-1 FIX: See Established-state comment for rationale.
                 let mut fin_expected_seq: Option<u32> = None;
@@ -5053,6 +5114,11 @@ impl SocketTable {
                         fin_expected_seq = Some(tcp_state.control.rcv_nxt);
                         if !is_fin {
                             tcp_state.control.ooo_drain_contiguous();
+                            // R155-15 FIX: OOO drain may deliver buffered FIN
+                            // (FinWait2→TimeWait transition inside tcp.rs).
+                            if tcp_state.control.fin_received {
+                                ooo_fin_delivered = true;
+                            }
                         }
 
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
@@ -5147,6 +5213,13 @@ impl SocketTable {
                 if let Some(resp) = response {
                     drop(guard);
                     if data_received {
+                        sock.wake_tcp_data_waiters();
+                    }
+                    // R155-15 FIX: OOO drain delivered buffered FIN
+                    // (FinWait2→TimeWait) — wake both waiters for EOF
+                    // and state-transition side effects.
+                    if ooo_fin_delivered {
+                        sock.wake_tcp_waiters();
                         sock.wake_tcp_data_waiters();
                     }
                     return Some(resp);

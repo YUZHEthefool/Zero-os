@@ -47,7 +47,10 @@ pub const CT_TCP_TIMEOUT_SYN_RECV_MS: u64 = 60_000;
 // 5 minutes silently dropped SSH, DB, and long-poll connections.
 // 2 hours balances memory usage against real-world idle connection lifetimes.
 pub const CT_TCP_TIMEOUT_ESTABLISHED_MS: u64 = 7_200_000; // 2 hours
-pub const CT_TCP_TIMEOUT_FIN_WAIT_MS: u64 = 120_000; // 2 minutes
+// R155-10 FIX: Aligned with socket-layer FIN_WAIT_2 timeout (60s).
+// Previously 120s, causing conntrack to persist 60s after socket layer
+// killed the connection, classifying stale packets as Established.
+pub const CT_TCP_TIMEOUT_FIN_WAIT_MS: u64 = 60_000; // 1 minute
 pub const CT_TCP_TIMEOUT_CLOSE_WAIT_MS: u64 = 60_000;
 pub const CT_TCP_TIMEOUT_LAST_ACK_MS: u64 = 30_000;
 pub const CT_TCP_TIMEOUT_TIME_WAIT_MS: u64 = 120_000; // 2*MSL

@@ -175,9 +175,13 @@ fn fd_close_callback(fd: i32) -> Result<(), SyscallError> {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
-    // 移除文件描述符（Drop 会自动清理管道资源）
-    let mut proc = process.lock();
-    proc.remove_fd(fd).ok_or(SyscallError::EBADF)?;
+    // R155-3 FIX: Extract the FileDescriptor under lock, then drop OUTSIDE
+    // to avoid lock inversion (Process → socket waiters → Process).
+    let removed = {
+        let mut proc = process.lock();
+        proc.remove_fd(fd).ok_or(SyscallError::EBADF)?
+    };
+    drop(removed);
 
     Ok(())
 }

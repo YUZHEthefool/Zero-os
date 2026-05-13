@@ -83,6 +83,8 @@ pub enum ElfLoadError {
     TooManySegments,
     /// R154-12 FIX: PT_LOAD segments have overlapping virtual address ranges
     OverlappingSegments,
+    /// R155-16 FIX: Segment vaddr+memsz arithmetic overflow
+    InvalidSegment,
 }
 
 /// ELF 加载结果
@@ -177,7 +179,21 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
             let vaddr = ph.virtual_addr() as usize;
             let memsz = ph.mem_size() as usize;
             if memsz > 0 {
-                let segment_end = vaddr.saturating_add(memsz);
+                // R155-16 FIX: Use checked_add instead of saturating_add.
+                // saturating_add silently clamps to usize::MAX on overflow,
+                // producing a bogus segment_end that passes overlap checks
+                // and causes incorrect page mappings. Return an error instead.
+                let segment_end = match vaddr.checked_add(memsz) {
+                    Some(end) => end,
+                    None => {
+                        klog!(Error,
+                            "ELF loader: PT_LOAD segment vaddr {:#x} + memsz {:#x} overflows",
+                            vaddr, memsz
+                        );
+                        rollback_all_mappings(&mut all_mappings, cgroup_id);
+                        return Err(ElfLoadError::InvalidSegment);
+                    }
+                };
 
                 // R154-12 FIX: Check overlap with all previously loaded segments.
                 for &(prev_start, prev_end) in loaded_ranges.iter() {
@@ -463,6 +479,8 @@ fn load_segment_tracked(
                 }
 
                 // Z-10 fix: 追加到本段和全局追踪向量
+                // R155-4 FIX: Fallible push to avoid kernel panic on OOM
+                tracked.try_reserve(1).map_err(|_| ElfLoadError::OutOfMemory)?;
                 segment_mapped.push((page, frame));
                 tracked.push((page, frame));
             }
@@ -579,6 +597,8 @@ fn allocate_user_stack_tracked(
                 }
 
                 // Z-10 fix: 追加到本段和全局追踪向量
+                // R155-4 FIX: Fallible push to avoid kernel panic on OOM
+                tracked.try_reserve(1).map_err(|_| ElfLoadError::OutOfMemory)?;
                 stack_mapped.push((page, frame));
                 tracked.push((page, frame));
             }

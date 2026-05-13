@@ -185,23 +185,42 @@ impl WaitQueue {
     }
 
     /// R39-6 FIX: 标记指定进程因超时唤醒（从队列移除并设置为 Ready）
-    fn timeout_wake(&self, pid: ProcessId) {
+    ///
+    /// Returns true if the wake completed, false if Process lock was contended
+    /// (caller should retry on next tick).
+    fn timeout_wake(&self, pid: ProcessId) -> bool {
         interrupts::without_interrupts(|| {
+            // R155-2 FIX: try_lock() to avoid deadlock in IRQ context.
+            // Only remove from queue if state transition succeeds.
+            if let Some(proc_arc) = process::get_process(pid) {
+                if let Some(mut proc) = proc_arc.try_lock() {
+                    if proc.state == ProcessState::Blocked {
+                        proc.state = ProcessState::Ready;
+                    }
+                } else {
+                    return false;
+                }
+            } else {
+                // R155-12 FIX: Process no longer exists (killed).
+                // Remove from waiters to avoid leak, but do NOT insert
+                // into timed_out — no one will consume the flag, causing
+                // an unbounded leak and PID-reuse misclassification.
+                let mut waiters = self.waiters.lock();
+                if let Some(pos) = waiters.iter().position(|&p| p == pid) {
+                    waiters.remove(pos);
+                }
+                return true;
+            }
+
             let mut waiters = self.waiters.lock();
             if let Some(pos) = waiters.iter().position(|&p| p == pid) {
                 waiters.remove(pos);
             }
             drop(waiters);
 
-            if let Some(proc_arc) = process::get_process(pid) {
-                let mut proc = proc_arc.lock();
-                if proc.state == ProcessState::Blocked {
-                    proc.state = ProcessState::Ready;
-                }
-            }
-
             self.timed_out.lock().insert(pid);
-        });
+            true
+        })
     }
 
     /// R39-6 FIX: 消费超时标记
@@ -475,26 +494,39 @@ impl KMutex {
         }
     }
 
-    /// 获取锁
-    ///
-    /// 如果锁已被持有，当前进程会被阻塞直到锁可用
+    /// R155-7 FIX: Use prepare_to_wait/cancel_wait pattern (same as R154-6 Semaphore)
+    /// to prevent lost-wakeup race where unlock() calls wake_one() between our
+    /// CAS failure and enqueue, seeing an empty queue.
     pub fn lock(&self) {
         loop {
-            // 尝试获取锁
             if self
                 .locked
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                // 成功获取锁
                 if let Some(pid) = process::current_pid() {
                     *self.owner.lock() = Some(pid);
                 }
                 return;
             }
 
-            // 锁被占用，加入等待队列并阻塞
-            self.wait_queue.wait();
+            if !self.wait_queue.prepare_to_wait() {
+                return;
+            }
+
+            if self
+                .locked
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.wait_queue.cancel_wait();
+                if let Some(pid) = process::current_pid() {
+                    *self.owner.lock() = Some(pid);
+                }
+                return;
+            }
+
+            self.wait_queue.finish_wait();
         }
     }
 
@@ -808,13 +840,28 @@ fn process_waitqueue_timeouts(now_ticks: u64) {
         expired_count
     };
 
+    // R155-2 FIX: Track failed wakes for re-insertion
+    let mut retry: [Option<TimedWaiter>; MAX_TIMEOUTS_PER_TICK] = [None; MAX_TIMEOUTS_PER_TICK];
+    let mut retry_count = 0;
+
     for waiter in expired.iter().take(count).flatten() {
-        // 安全性：waiter.queue 来源于 &WaitQueue 的地址，
-        // 调用者需确保 WaitQueue 在超时期间仍然有效
         unsafe {
             if let Some(queue) = (waiter.queue as *const WaitQueue).as_ref() {
-                queue.timeout_wake(waiter.pid);
+                if !queue.timeout_wake(waiter.pid) {
+                    if retry_count < MAX_TIMEOUTS_PER_TICK {
+                        retry[retry_count] = Some(*waiter);
+                        retry_count += 1;
+                    }
+                }
             }
+        }
+    }
+
+    // Re-insert failed wakes so the next tick retries
+    if retry_count > 0 {
+        let mut waits = TIMED_WAITERS.lock();
+        for w in retry.iter().take(retry_count).flatten() {
+            waits.push(*w);
         }
     }
 }

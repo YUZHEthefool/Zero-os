@@ -664,20 +664,27 @@ impl SocketWaiters {
             let (queue_addr, pid, is_timeout) = *entry;
 
             if let Some(queue) = self.waiters.get_mut(&queue_addr) {
-                if let Some(pos) = queue.iter().position(|(p, _)| *p == pid) {
-                    queue.remove(pos);
-
-                    // Mark as timed out for correct WaitOutcome (only if timeout, not exit)
-                    if is_timeout {
-                        self.timed_out.insert(pid);
+                if queue.iter().any(|(p, _)| *p == pid) {
+                    // R155-2 FIX: try_lock BEFORE removing from queue.
+                    // If contended, skip — the entry stays with its original
+                    // deadline and will be retried on the next tick.
+                    if let Some(proc_arc) = get_process(pid) {
+                        if let Some(mut proc) = proc_arc.try_lock() {
+                            if proc.state == ProcessState::Blocked {
+                                proc.state = ProcessState::Ready;
+                            }
+                        } else {
+                            continue;
+                        }
                     }
 
-                    // Wake the process if it still exists
-                    if let Some(proc_arc) = get_process(pid) {
-                        let mut proc = proc_arc.lock();
-                        if proc.state == ProcessState::Blocked {
-                            proc.state = ProcessState::Ready;
-                        }
+                    // Lock succeeded (or process gone) — now remove
+                    if let Some(pos) = queue.iter().position(|(p, _)| *p == pid) {
+                        queue.remove(pos);
+                    }
+
+                    if is_timeout {
+                        self.timed_out.insert(pid);
                     }
 
                     // Track queues that may need cleanup
@@ -8672,18 +8679,18 @@ fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
 
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
-    let mut proc = proc_arc.lock();
 
-    let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
-    let cloned = src.clone_box();
-
-    // R39-4 FIX: 使用 remove_fd 代替直接操作 fd_table
-    // 这样会同时清除 newfd 的 CLOEXEC 标记
-    //
-    // POSIX: dup2 创建的新 fd 不继承 CLOEXEC 标志
-    proc.remove_fd(newfd);
-    proc.fd_table.insert(newfd, cloned);
-    // newfd 不设置 CLOEXEC（这是 dup2 的标准行为）
+    // R155-3 FIX: Extract old fd under lock, drop OUTSIDE to prevent
+    // lock inversion (Process → SocketFile::drop → waiters → Process).
+    let old_fd_entry = {
+        let mut proc = proc_arc.lock();
+        let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
+        let cloned = src.clone_box();
+        let removed = proc.remove_fd(newfd);
+        proc.fd_table.insert(newfd, cloned);
+        removed
+    };
+    drop(old_fd_entry);
 
     Ok(newfd as usize)
 }
@@ -8713,21 +8720,23 @@ fn sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> SyscallResult {
 
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
-    let mut proc = proc_arc.lock();
 
-    let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
-    let cloned = src.clone_box();
+    // R155-3 FIX: Extract old fd under lock, drop OUTSIDE to prevent
+    // lock inversion (Process → SocketFile::drop → waiters → Process).
+    let old_fd_entry = {
+        let mut proc = proc_arc.lock();
+        let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
+        let cloned = src.clone_box();
+        let removed = proc.remove_fd(newfd);
+        proc.fd_table.insert(newfd, cloned);
 
-    // R39-4 FIX: 使用 remove_fd 清除旧 fd 的 CLOEXEC 标记
-    proc.remove_fd(newfd);
-    proc.fd_table.insert(newfd, cloned);
+        if flags & O_CLOEXEC != 0 {
+            proc.set_fd_cloexec(newfd, true);
+        }
 
-    // R39-4 FIX: 如果 flags 包含 O_CLOEXEC，标记 fd 为 close-on-exec
-    //
-    // dup3 相比 dup2 的唯一区别就是可以原子地设置 CLOEXEC
-    if flags & O_CLOEXEC != 0 {
-        proc.set_fd_cloexec(newfd, true);
-    }
+        removed
+    };
+    drop(old_fd_entry);
 
     Ok(newfd as usize)
 }
@@ -9704,6 +9713,23 @@ fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult 
         .connect(&socket, &ctx, cap_id, src_ip, dst_ip, dst_port, Some(0))
         .map_err(socket_error_to_syscall)?;
 
+    // R155-8 FIX: Seed conntrack entry for the outbound SYN before transmitting.
+    // Without this, the inbound SYN-ACK is classified Invalid (no existing entry,
+    // and SYN-ACK is not a pure SYN). Same pattern as the SYN cookie path.
+    {
+        let now_ms = crate::time::get_ticks();
+        let _ = net::conntrack::ct_process_tcp(
+            socket.net_ns_id.0,
+            syn_result.src_ip,
+            syn_result.dst_ip,
+            syn_result.local_port,
+            syn_result.dst_port,
+            net::TCP_FLAG_SYN,
+            0,
+            now_ms,
+        );
+    }
+
     // Phase 2: Transmit the SYN segment via network device
     // R51-5 FIX: Abort connection if TX fails to prevent TCB/binding leak
     if let Err(e) = net::transmit_tcp_segment(syn_result.dst_ip, &syn_result.segment) {
@@ -10369,27 +10395,22 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
         }
     }
 
-    // R148-5 FIX: Block migration for tasks with CLONE_VM shared address
-    // spaces. Migrating one sibling transfers ALL memory charges but
-    // leaves other siblings in the source cgroup with physical memory
-    // still mapped, enabling memory.max bypass.
+    // R155-5 FIX: Hold Process lock across the ENTIRE migration window
+    // (CLONE_VM check + migrate_task + charge transfer + cgroup_id update).
+    // Without this, process exit can read stale cgroup_id between
+    // migrate_task (membership moved) and cgroup_id update (PCB stale).
+    let mut proc = process.lock();
+
+    // R148-5 FIX: Block migration for CLONE_VM shared address spaces.
+    let memory_space = proc.memory_space;
+    if memory_space != 0
+        && crate::process::address_space_share_count(memory_space) > 1
     {
-        let memory_space = process.lock().memory_space;
-        if memory_space != 0
-            && crate::process::address_space_share_count(memory_space) > 1
-        {
-            return Err(SyscallError::EBUSY);
-        }
+        return Err(SyscallError::EBUSY);
     }
 
-    // Migrate task between cgroups
     match cgroup::migrate_task(pid as u64, old_cgroup_id, cgroup_id) {
         Ok(()) => {
-            // R143-1 FIX: Transfer cgroup memory charges from source to
-            // destination. Hold process lock across charge snapshot and
-            // cgroup_id update to prevent mutation race (mmap/brk between
-            // snapshot and cgroup_id update).
-            let mut proc = process.lock();
             let total_charged_bytes =
                 crate::process::compute_cgroup_charged_bytes(&proc);
 
@@ -10398,13 +10419,11 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
                 old_cgroup_id,
                 cgroup_id,
             ) {
-                // Charge transfer failed. Roll back PIDs migration.
                 drop(proc);
                 let _ = cgroup::migrate_task(pid as u64, cgroup_id, old_cgroup_id);
                 return Err(SyscallError::ENOMEM);
             }
 
-            // Update PCB with new cgroup (still under process lock).
             proc.cgroup_id = cgroup_id;
             Ok(0)
         }
