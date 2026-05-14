@@ -2878,18 +2878,28 @@ fn sys_clone(
             Arc::new(parent.cap_table.clone_for_fork())
         };
 
+        // R157-3 FIX: Fallible mmap_regions snapshot. BTreeMap::collect()
+        // uses infallible allocation; 65536 entries can exhaust 1 MiB heap.
+        // Pre-allocate Vec (single large alloc, fallible), then build BTreeMap
+        // from it (many small ~512B node allocs, much less likely to fail).
+        let mmap_snapshot: alloc::collections::BTreeMap<usize, usize> = {
+            let count = parent.mmap_regions.len();
+            let mut snap: Vec<(usize, usize)> = Vec::new();
+            if snap.try_reserve_exact(count).is_err() {
+                return Err(SyscallError::ENOMEM);
+            }
+            snap.extend(parent.mmap_regions.iter().map(|(&base, &len_with_flags)| {
+                (base, len_with_flags & !MMAP_REGION_FLAG_TRANSIENT_MASK)
+            }));
+            snap.into_iter().collect()
+        };
+
         (
             parent.memory_space,
             parent.user_memory_space, // H.3 KPTI
             parent.tgid,
             parent.thread_group_exiting.clone(), // R153-3 FIX
-            // R121-4 FIX: Strip only transient pending-map/unmap flags from
-            // mmap_regions when snapshotting for clone. Preserve committed
-            // per-region flags (e.g. PROT_NONE) so the child inherits
-            // correct region metadata.
-            parent.mmap_regions.iter()
-                .map(|(&base, &len_with_flags)| (base, len_with_flags & !MMAP_REGION_FLAG_TRANSIENT_MASK))
-                .collect(),
+            mmap_snapshot,
             parent.next_mmap_addr,
             parent.brk_start,
             parent.brk,
@@ -4435,7 +4445,11 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                 }
                 None => {
                     // 子进程已被清理但仍在父进程列表中，标记为过期
-                    stale_pids.push(*child_pid);
+                    // R157-6 FIX: Fallible push — skip stale entry on OOM
+                    // (it will be cleaned up on the next wait call).
+                    if stale_pids.try_reserve(1).is_ok() {
+                        stale_pids.push(*child_pid);
+                    }
                 }
             }
         }
@@ -6444,8 +6458,16 @@ fn sys_mmap(
                 }
 
                 // R156-3 FIX: Fallible push for mmap page tracking.
+                // R157-1 FIX: Unmap current page before frame dealloc —
+                // map_page() succeeded, so without unmap the PTE dangles
+                // to a freed frame (cross-process memory corruption).
                 if mapped.try_reserve(1).is_err() {
-                    frame_alloc.deallocate_frame(frame);
+                    // Unmap current page first; only free frame if unmap succeeded.
+                    // On unmap failure, leak the frame — safer than freeing a mapped frame.
+                    if manager.unmap_page(page).is_ok() {
+                        mm::flush_current_as_page(page.start_address());
+                        frame_alloc.deallocate_frame(frame);
+                    }
                     let flush_len = mapped.len() * 0x1000;
                     let mut frames_to_free = vec::Vec::new();
                     for (cleanup_page, cleanup_frame) in mapped.drain(..) {
@@ -6924,6 +6946,30 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                             return Err(SyscallError::ENOMEM);
                         }
 
+                        // R157-5 FIX: Fallible push (same pattern as R157-1/R156-3).
+                        if mapped.try_reserve(1).is_err() {
+                            if manager.unmap_page(page).is_ok() {
+                                mm::flush_current_as_page(page.start_address());
+                                frame_alloc.deallocate_frame(frame);
+                            }
+                            let flush_len = mapped.len() * 0x1000;
+                            let mut frames_to_free = vec::Vec::new();
+                            for (cp, cf) in mapped.drain(..) {
+                                if manager.unmap_page(cp).is_ok() {
+                                    frames_to_free.push(cf);
+                                }
+                            }
+                            if !frames_to_free.is_empty() {
+                                mm::flush_current_as_range(
+                                    VirtAddr::new(region_base as u64),
+                                    flush_len,
+                                );
+                                for f in frames_to_free {
+                                    frame_alloc.deallocate_frame(f);
+                                }
+                            }
+                            return Err(SyscallError::ENOMEM);
+                        }
                         mapped.push((page, frame));
                     }
 
@@ -7140,9 +7186,17 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     // updated entries and sync after releasing the process lock.
     let display_updates: Vec<(usize, usize)> = {
         let mut proc = process.lock();
+        // R157-4 FIX: Fallible push — PTE flags already committed, so
+        // truncating display-bit sync is safe (maps show stale prot bits
+        // for unsynced siblings, no correctness impact).
+        let count = proc.mmap_regions.range(addr..end).count();
         let mut updates = Vec::new();
+        let _ = updates.try_reserve_exact(count);
         for (&region_base, len_with_flags) in proc.mmap_regions.range_mut(addr..end) {
             *len_with_flags = (*len_with_flags & !prot_mask) | new_prot_flags;
+            if updates.try_reserve(1).is_err() {
+                break;
+            }
             updates.push((region_base, *len_with_flags));
         }
         updates

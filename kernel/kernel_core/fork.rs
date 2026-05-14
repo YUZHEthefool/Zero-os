@@ -429,13 +429,17 @@ fn fork_inner(
         // entry above. Strip only transient in-flight flags when cloning committed
         // regions into the child, preserving persistent per-region flags (e.g.
         // PROT_NONE) so the child inherits correct region metadata.
-        child.mmap_regions = parent
-            .mmap_regions
-            .iter()
-            .map(|(&base, &len_with_flags)| {
-                (base, len_with_flags & !crate::syscall::MMAP_REGION_FLAG_TRANSIENT_MASK)
-            })
-            .collect();
+        // R157-3 FIX: Fallible pre-allocation — BTreeMap::collect() uses
+        // infallible allocation; 65536 entries can exhaust the 1 MiB kernel heap.
+        let region_count = parent.mmap_regions.len();
+        let mut snap: Vec<(usize, usize)> = Vec::new();
+        if snap.try_reserve_exact(region_count).is_err() {
+            return Err(ForkError::MemoryAllocationFailed);
+        }
+        snap.extend(parent.mmap_regions.iter().map(|(&base, &len_with_flags)| {
+            (base, len_with_flags & !crate::syscall::MMAP_REGION_FLAG_TRANSIENT_MASK)
+        }));
+        child.mmap_regions = snap.into_iter().collect();
         child.next_mmap_addr = parent.next_mmap_addr;
 
         child.context.rax = 0; // 子进程返回值 0

@@ -538,7 +538,10 @@ pub unsafe extern "C" fn enter_usermode(ctx: *const Context) -> ! {
         "or  rax, {rflags_if}",        // 确保中断使能
         "mov r15, rax",                // 暂存到 r15
 
-        // 恢复 FPU/SIMD 状态
+        // R157-11 FIX: Disable interrupts before FPU restore — an interrupt
+        // between fxrstor64 and IRETQ could clobber the restored FPU state.
+        // IRETQ pops RFLAGS (with IF=1) to re-enable on usermode entry.
+        "cli",
         "fxrstor64 [rdi + {fxoff}]",
 
         // 恢复通用寄存器（除了 RSP，它由 IRETQ 恢复）

@@ -696,12 +696,12 @@ impl CgroupCtrlInode {
                     old_cgroup_id,
                     self.cgroup_id,
                 ) {
-                    // Charge transfer failed (destination memory.max exceeded).
-                    // Roll back the PIDs migration to leave the process in its
-                    // original cgroup. Ignore rollback error -- force_attach_task
-                    // in migrate_task handles orphan prevention.
-                    drop(proc_guard);
+                    // R157-2 FIX: Keep Process lock held during rollback.
+                    // Previously drop(proc_guard) before migrate_task created
+                    // a window where PCB.cgroup_id = old but membership = new.
+                    // Exit in that window leaks the task (same class as R156-5).
                     let _ = cgroup::migrate_task(pid_num, self.cgroup_id, old_cgroup_id);
+                    drop(proc_guard);
                     return Err(match e {
                         CgroupError::MemoryLimitExceeded => FsError::NoSpace,
                         CgroupError::NotFound => FsError::NotFound,

@@ -2280,7 +2280,12 @@ pub fn parse_tcp_options(data: &[u8], header: &TcpHeader) -> TcpOptions {
 /// TCP checksum value
 pub fn compute_tcp_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_data: &[u8]) -> u16 {
     // Build pseudo-header
-    let tcp_len = tcp_data.len() as u16;
+    // R157-9 FIX: Checked conversion — reject oversized segments instead of
+    // silent truncation (IPv4 prevents >65535 in practice, defense-in-depth).
+    let tcp_len: u16 = match u16::try_from(tcp_data.len()) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
     let mut pseudo = [0u8; 12];
     pseudo[0..4].copy_from_slice(&src_ip.0);
     pseudo[4..8].copy_from_slice(&dst_ip.0);

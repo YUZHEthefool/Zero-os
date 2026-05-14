@@ -751,6 +751,25 @@ fn process_tcp(
         tcp_payload,
         &tcp_options,
     ) {
+        // R157-10 FIX: Track the outbound reply through conntrack so
+        // the completing ACK advances SynRecv→Established. Without this,
+        // conntrack stays at SynRecv until the first data exchange.
+        #[cfg(feature = "conntrack")]
+        {
+            use crate::conntrack::ct_process_tcp;
+            let resp_flags = if resp_seg.len() >= 14 { resp_seg[13] } else { 0 };
+            let _ = ct_process_tcp(
+                net_ns_id.0,
+                ip_hdr.dst,
+                ip_hdr.src,
+                tcp_hdr.dst_port,
+                tcp_hdr.src_port,
+                resp_flags,
+                0,
+                now_ms,
+            );
+        }
+
         // Build IPv4 header (swap src/dst)
         let ip_reply = build_ipv4_header(
             ip_hdr.dst, // Our IP as source

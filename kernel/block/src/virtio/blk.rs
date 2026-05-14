@@ -283,8 +283,8 @@ impl VirtQueue {
 
     /// Push a descriptor chain to the available ring.
     unsafe fn push_avail(&self, head: u16) {
-        // R156-15 FIX: Validate head index is within descriptor table bounds.
-        debug_assert!(head < self.size, "push_avail: head {} >= size {}", head, self.size);
+        // R156-15 + R157-8 FIX: Runtime bounds check (defense-in-depth).
+        assert!(head < self.size, "push_avail: head {} >= size {}", head, self.size);
         let avail = &mut *self.avail;
         let idx = read_volatile(&avail.idx);
         let ring_idx = (idx % self.size) as usize;

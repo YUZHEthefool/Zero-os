@@ -3415,7 +3415,12 @@ fn reparent_orphans(orphans: &[ProcessId]) {
         if let Some(adopter) = get_process(adopt_pid) {
             let mut adopter_proc = adopter.lock();
             if !adopter_proc.children.contains(&child_pid) {
-                adopter_proc.children.push(child_pid);
+                // R157-7 FIX: Fallible push — skip on OOM. Orphan is still
+                // reparented (ppid set above), just not in children list.
+                // wait() will still find it via PROCESS_TABLE scan.
+                if adopter_proc.children.try_reserve(1).is_ok() {
+                    adopter_proc.children.push(child_pid);
+                }
             }
         }
     }
