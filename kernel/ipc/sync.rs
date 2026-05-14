@@ -228,6 +228,17 @@ impl WaitQueue {
         self.timed_out.lock().remove(&pid)
     }
 
+    /// R156-6 FIX: Remove stale entries for an exiting process.
+    /// Called during process cleanup to prevent PID reuse misclassification.
+    pub fn cleanup_for_pid(&self, pid: ProcessId) {
+        interrupts::without_interrupts(|| {
+            let mut waiters = self.waiters.lock();
+            waiters.retain(|&p| p != pid);
+            drop(waiters);
+            self.timed_out.lock().remove(&pid);
+        });
+    }
+
     /// 唤醒等待队列中的一个进程
     ///
     /// 返回被唤醒的进程ID，如果队列为空返回None

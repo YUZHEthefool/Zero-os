@@ -871,8 +871,12 @@ impl ConntrackTable {
         // Preserve the current state and let the socket layer (RFC 5961)
         // perform proper RST validation.  The conntrack entry expires
         // naturally via its idle timeout.
+        // R156-7 FIX: Return Related instead of Established for RST.
+        // Established lets spoofed RSTs pass the default firewall ACCEPT
+        // rule, amplifying CPU load via socket-layer lock contention.
+        // Related allows the firewall to distinguish RST from normal data.
         if l4.is_rst() {
-            return (CtProtoState::Tcp(state), CtDecision::Established);
+            return (CtProtoState::Tcp(state), CtDecision::Related);
         }
 
         let new_state = match (state, dir) {
@@ -903,6 +907,10 @@ impl ConntrackTable {
             // FIN wait - handle reply FIN or ACK
             // R146-NET-2 FIX: FinWait→FinWait2 on ACK (half-close; peer may
             // still send data), FinWait→LastAck on simultaneous FIN.
+            // R156-8 FIX: FIN+ACK (common piggybacked close) skips directly
+            // to TimeWait. Without this, the LastAck 30s timeout expires
+            // prematurely vs TimeWait 120s if the initiator's ACK is lost.
+            (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_fin() && l4.is_ack() => TcpCtState::TimeWait,
             (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_fin() => TcpCtState::LastAck,
             (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_ack() => TcpCtState::FinWait2,
             // FinWait2 → TimeWait when peer sends FIN (normal half-close close)

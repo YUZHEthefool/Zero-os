@@ -653,29 +653,41 @@ pub fn send_message_notify(endpoint_id: EndpointId, data: Vec<u8>) -> Result<(),
 /// 如果端点在等待期间被销毁，返回 EndpointNotFound 错误。
 pub fn receive_message_blocking(endpoint_id: EndpointId) -> Result<ReceivedMessage, IpcError> {
     loop {
-        // 尝试接收
-        match receive_message(endpoint_id)? {
-            Some(msg) => return Ok(msg),
-            None => {
-                // 队列为空，准备阻塞等待
-                // X-6: 使用 Arc 获取 wait queue，避免 use-after-free
-                let wq = get_or_create_wait_queue(endpoint_id);
+        // R156-4 FIX: Use prepare_to_wait/cancel_wait/finish_wait to
+        // close the lost-wakeup window. Previously, a sender could call
+        // wake_one() between receive_message() returning None and the
+        // internal prepare_to_wait inside wq.wait() — losing the signal.
+        //
+        // Now: register in WaitQueue FIRST, then check for messages.
+        // If a message arrived between registration and check, cancel_wait.
+        let wq = get_or_create_wait_queue(endpoint_id);
 
-                // X-6: 如果端点已被销毁（队列已关闭），直接返回错误避免阻塞
-                if wq.is_closed() {
-                    return Err(IpcError::EndpointNotFound);
-                }
+        if wq.is_closed() {
+            return Err(IpcError::EndpointNotFound);
+        }
 
-                // 等待唤醒
-                let waited = wq.wait();
+        if !wq.prepare_to_wait() {
+            if wq.is_closed() {
+                return Err(IpcError::EndpointNotFound);
+            }
+            return Err(IpcError::NoCurrentProcess);
+        }
 
-                // X-6: wait() 返回 false 表示队列已关闭或无当前进程
-                if !waited {
-                    if wq.is_closed() {
-                        return Err(IpcError::EndpointNotFound);
-                    }
-                    return Err(IpcError::NoCurrentProcess);
-                }
+        // Re-check for messages AFTER registering in the WaitQueue.
+        // If a sender enqueued + woke between our prepare_to_wait and
+        // this check, we'll find the message and cancel_wait.
+        match receive_message(endpoint_id) {
+            Ok(Some(msg)) => {
+                wq.cancel_wait();
+                return Ok(msg);
+            }
+            Ok(None) => {
+                // Still empty — block until woken by sender.
+                wq.finish_wait();
+            }
+            Err(e) => {
+                wq.cancel_wait();
+                return Err(e);
             }
         }
     }
@@ -717,6 +729,18 @@ pub fn receive_message_with_retries(
 /// 1. 设置 closed 标志，阻止新的等待者加入
 /// 2. 唤醒所有现有等待者
 /// 3. 等待者被唤醒后会检查 is_closed() 并返回错误
+/// R156-6 FIX: Remove stale WaitQueue entries for an exiting process.
+/// Prevents PID reuse misclassification from leftover timed_out entries.
+pub fn cleanup_waitqueues_for_pid(pid: ProcessId) {
+    let queues: Vec<Arc<WaitQueue>> = {
+        let wqs = ENDPOINT_WAIT_QUEUES.lock();
+        wqs.values().cloned().collect()
+    };
+    for wq in queues {
+        wq.cleanup_for_pid(pid);
+    }
+}
+
 fn cleanup_wait_queue(endpoint_id: EndpointId) {
     // X-6: 先取出 Arc，再释放锁后调用 close()
     // 这避免了在持有锁时调用可能导致调度的操作

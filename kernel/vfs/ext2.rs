@@ -934,7 +934,11 @@ impl Ext2Fs {
         let file_block = file_block - ptrs_per_block;
 
         // Double indirect (block 13)
-        if file_block < ptrs_per_block * ptrs_per_block {
+        // R156-11 FIX: Use checked_mul to prevent overflow with crafted superblocks.
+        let double_indirect_limit = ptrs_per_block
+            .checked_mul(ptrs_per_block)
+            .ok_or(FsError::Invalid)?;
+        if file_block < double_indirect_limit {
             // R28-5 Fix: Validate double indirect block pointer
             let dind_block = match self.validate_block(raw.block[EXT2_DIND_BLOCK])? {
                 Some(b) => b,

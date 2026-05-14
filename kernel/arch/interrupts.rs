@@ -255,8 +255,20 @@ fn clac_if_smap() {
     }
 }
 
+// R156-12 FIX: Bounded THR poll before each byte write, matching R155-14.
 #[inline(always)]
 unsafe fn serial_outb(port: u16, val: u8) {
+    const LSR_PORT_OFFSET: u16 = 5;
+    const LSR_THR_EMPTY: u8 = 0x20;
+    const MAX_WAIT: u32 = 1000;
+    let lsr_port = port + LSR_PORT_OFFSET;
+    for _ in 0..MAX_WAIT {
+        let lsr: u8;
+        core::arch::asm!("in al, dx", in("dx") lsr_port, out("al") lsr, options(nomem, nostack));
+        if lsr & LSR_THR_EMPTY != 0 {
+            break;
+        }
+    }
     core::arch::asm!(
         "out dx, al",
         in("dx") port,

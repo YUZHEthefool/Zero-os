@@ -207,6 +207,11 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
                         return Err(ElfLoadError::OverlappingSegments);
                     }
                 }
+                // R156-13 FIX: Fallible push for consistency with tracked.try_reserve.
+                if loaded_ranges.try_reserve(1).is_err() {
+                    rollback_all_mappings(&mut all_mappings, cgroup_id);
+                    return Err(ElfLoadError::OutOfMemory);
+                }
                 loaded_ranges.push((vaddr, segment_end));
 
                 if segment_end > highest_segment_end {

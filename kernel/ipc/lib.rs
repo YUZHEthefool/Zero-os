@@ -351,6 +351,9 @@ fn futex_callback(
 fn ipc_cleanup(pid: process::ProcessId, tgid: process::ProcessId, ipc_ns_id: NamespaceId) {
     cleanup_process_endpoints(ipc_ns_id, pid);
     cleanup_process_futexes(pid, tgid);
+    // R156-6 FIX: Drain stale timed_out entries for the exiting PID
+    // from all IPC WaitQueues, preventing PID reuse misclassification.
+    ipc::cleanup_waitqueues_for_pid(pid);
 }
 
 /// Futex 唤醒回调（用于线程退出时的 clear_child_tid 机制）

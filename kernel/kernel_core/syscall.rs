@@ -2691,6 +2691,19 @@ fn sys_clone(
         return Err(SyscallError::EINVAL);
     }
 
+    // R156-2 FIX: CLONE_NEWPID requires CAP_SYS_ADMIN or root, matching
+    // the gates on CLONE_NEWNS/NEWIPC/NEWNET. Previously ungated, allowing
+    // unprivileged PID namespace creation and quota exhaustion.
+    if flags & CLONE_NEWPID != 0 {
+        let has_cap_admin =
+            with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+        let is_root = crate::current_is_host_root();
+        if !is_root && !has_cap_admin {
+            kprintln!("[sys_clone] CLONE_NEWPID denied: requires CAP_SYS_ADMIN or root");
+            return Err(SyscallError::EPERM);
+        }
+    }
+
     // F.1: CLONE_NEWNS cannot be combined with CLONE_THREAD
     // Mount namespace is per-process; threads must share the same mount namespace
     if flags & CLONE_NEWNS != 0 && flags & CLONE_THREAD != 0 {
@@ -4090,7 +4103,10 @@ fn sys_exec(
     // ── Phase 2: Assemble stack content in a kernel-side buffer ──
 
     let buf_len = stack_top.checked_sub(buf_base).ok_or(SyscallError::EFAULT)?;
-    let mut stack_buf = vec![0u8; buf_len];
+    // R156-3 FIX: Fallible allocation for exec stack buffer.
+    let mut stack_buf = Vec::new();
+    stack_buf.try_reserve_exact(buf_len).map_err(|_| SyscallError::ENOMEM)?;
+    stack_buf.resize(buf_len, 0);
 
     // Helper: write bytes into stack_buf at the position corresponding to `user_addr`
     let buf_write = |buf: &mut Vec<u8>, user_addr: usize, data: &[u8]| -> Result<(), SyscallError> {
@@ -4388,7 +4404,15 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
             // 先标记为等待状态
             proc.state = ProcessState::Blocked;
             proc.waiting_child = Some(0); // 0 表示等待任意子进程
-            proc.children.clone()
+            // R156-14 FIX: Fallible clone to avoid panic on extreme OOM.
+            let mut snapshot = Vec::new();
+            if snapshot.try_reserve_exact(proc.children.len()).is_err() {
+                proc.state = ProcessState::Ready;
+                proc.waiting_child = None;
+                return Err(SyscallError::ENOMEM);
+            }
+            snapshot.extend_from_slice(&proc.children);
+            snapshot
         };
 
         // 查找已终止的僵尸子进程
@@ -4820,6 +4844,18 @@ fn sys_unshare(flags: u64) -> SyscallResult {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
+    // R156-2 FIX: CLONE_NEWPID in unshare requires CAP_ADMIN or root,
+    // matching clone() and the gates on CLONE_NEWNS/NEWIPC/NEWNET.
+    if flags & CLONE_NEWPID != 0 {
+        let has_cap_admin =
+            with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+        let is_root = crate::current_is_host_root();
+        if !is_root && !has_cap_admin {
+            kprintln!("[sys_unshare] CLONE_NEWPID denied: requires CAP_SYS_ADMIN or root");
+            return Err(SyscallError::EPERM);
+        }
+    }
+
     if flags & CLONE_NEWPID != 0 {
         // Create a new child PID namespace
         let current_ns_for_children = {
@@ -5160,7 +5196,10 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
         // Debug: print heap stats before allocation
         kprintln!("[sys_read] fd=0 count={}", count);
 
-        let mut tmp = vec![0u8; count];
+        // R156-3 FIX: Fallible allocation — infallible vec! panics on OOM.
+        let mut tmp = Vec::new();
+        tmp.try_reserve_exact(count).map_err(|_| SyscallError::ENOMEM)?;
+        tmp.resize(count, 0);
         loop {
             // 先尝试读取
             let bytes_read = drivers::keyboard_read(&mut tmp);
@@ -5203,8 +5242,10 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
         *callback.as_ref().ok_or(SyscallError::EBADF)?
     };
 
-    // 分配临时缓冲区并执行读取（在锁外）
-    let mut tmp = vec![0u8; count];
+    // R156-3 FIX: Fallible allocation for read buffer.
+    let mut tmp = Vec::new();
+    tmp.try_reserve_exact(count).map_err(|_| SyscallError::ENOMEM)?;
+    tmp.resize(count, 0);
     let bytes_read = read_fn(fd, &mut tmp)?;
 
     // Z-4 安全修复：将回调返回值 clamp 到请求的大小
@@ -5238,8 +5279,10 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
     // 预先验证用户缓冲区，避免在分配后发现指针无效
     validate_user_ptr(buf, count)?;
 
-    // 先复制到内核缓冲区，避免直接解引用用户指针
-    let mut tmp = vec![0u8; count];
+    // R156-3 FIX: Fallible allocation for write buffer.
+    let mut tmp = Vec::new();
+    tmp.try_reserve_exact(count).map_err(|_| SyscallError::ENOMEM)?;
+    tmp.resize(count, 0);
     copy_from_user(&mut tmp, buf)?;
 
     // stdout(1)/stderr(2): 直接打印
@@ -6400,7 +6443,24 @@ fn sys_mmap(
                     return Err(SyscallError::ENOMEM);
                 }
 
-                // 记录成功映射的页
+                // R156-3 FIX: Fallible push for mmap page tracking.
+                if mapped.try_reserve(1).is_err() {
+                    frame_alloc.deallocate_frame(frame);
+                    let flush_len = mapped.len() * 0x1000;
+                    let mut frames_to_free = vec::Vec::new();
+                    for (cleanup_page, cleanup_frame) in mapped.drain(..) {
+                        if manager.unmap_page(cleanup_page).is_ok() {
+                            frames_to_free.push(cleanup_frame);
+                        }
+                    }
+                    if !frames_to_free.is_empty() {
+                        mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
+                        for frame in frames_to_free {
+                            frame_alloc.deallocate_frame(frame);
+                        }
+                    }
+                    return Err(SyscallError::ENOMEM);
+                }
                 mapped.push((page, frame));
             }
 
@@ -8115,7 +8175,10 @@ fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> SyscallResult {
     // - 由 RDRAND/RDSEED 播种
     // - 定期重新播种
     // - 提供密码学安全的随机数
-    let mut tmp = vec![0u8; count];
+    // R156-3 FIX: Fallible allocation for getrandom buffer.
+    let mut tmp = Vec::new();
+    tmp.try_reserve_exact(count).map_err(|_| SyscallError::ENOMEM)?;
+    tmp.resize(count, 0);
     match rng::fill_random(&mut tmp) {
         Ok(()) => {}
         // R140-6 FIX: FIPS state failed/corrupted — deny all crypto.
@@ -8844,8 +8907,10 @@ fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
             FileType::Socket => 12,     // DT_SOCK
         };
 
-        // 构建dirent结构到临时缓冲区
-        let mut buf = vec![0u8; reclen];
+        // R156-3 FIX: Fallible allocation for dirent buffer.
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(reclen).map_err(|_| SyscallError::ENOMEM)?;
+        buf.resize(reclen, 0);
 
         // R113-1 FIX: Write header fields individually into the zeroed buffer
         // instead of copy_nonoverlapping from a stack LinuxDirent64, which would
@@ -9716,6 +9781,8 @@ fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult 
     // R155-8 FIX: Seed conntrack entry for the outbound SYN before transmitting.
     // Without this, the inbound SYN-ACK is classified Invalid (no existing entry,
     // and SYN-ACK is not a pure SYN). Same pattern as the SYN cookie path.
+    // R156-9 FIX: Gate behind conntrack feature to match all other call sites.
+    #[cfg(feature = "conntrack")]
     {
         let now_ms = crate::time::get_ticks();
         let _ = net::conntrack::ct_process_tcp(
@@ -9842,7 +9909,10 @@ fn sys_sendto(
 
         // Copy payload from user space
         validate_user_ptr(buf, len)?;
-        let mut data = vec![0u8; len];
+        // R156-3 FIX: Fallible allocation for TCP send buffer.
+        let mut data = Vec::new();
+        data.try_reserve_exact(len).map_err(|_| SyscallError::ENOMEM)?;
+        data.resize(len, 0);
         copy_from_user(&mut data, buf)?;
 
         // Get remote IP for transmission
@@ -9895,7 +9965,10 @@ fn sys_sendto(
 
     // Copy payload from user space
     validate_user_ptr(buf, len)?;
-    let mut data = vec![0u8; len];
+    // R156-3 FIX: Fallible allocation for UDP send buffer.
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).map_err(|_| SyscallError::ENOMEM)?;
+    data.resize(len, 0);
     copy_from_user(&mut data, buf)?;
 
     // R48-REVIEW FIX: Source IP - use actual bound address if available.
@@ -10395,18 +10468,27 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
         }
     }
 
-    // R155-5 FIX: Hold Process lock across the ENTIRE migration window
-    // (CLONE_VM check + migrate_task + charge transfer + cgroup_id update).
-    // Without this, process exit can read stale cgroup_id between
-    // migrate_task (membership moved) and cgroup_id update (PCB stale).
-    let mut proc = process.lock();
-
-    // R148-5 FIX: Block migration for CLONE_VM shared address spaces.
-    let memory_space = proc.memory_space;
+    // R156-1 FIX: Read memory_space under brief lock, then call
+    // address_space_share_count() OUTSIDE Process lock to avoid ABBA
+    // deadlock. address_space_share_count() acquires PROCESS_TABLE then
+    // iterates locking Process::inner — holding our Process::inner first
+    // inverts the documented Level 5 ordering with create_process().
+    let memory_space = { process.lock().memory_space };
     if memory_space != 0
         && crate::process::address_space_share_count(memory_space) > 1
     {
         return Err(SyscallError::EBUSY);
+    }
+
+    // R155-5 FIX: Hold Process lock across the ENTIRE migration window
+    // (migrate_task + charge transfer + cgroup_id update).
+    let mut proc = process.lock();
+
+    // R156-1 FIX: Re-verify memory_space after re-acquiring lock.
+    // Between the share_count check and here, exec/clone could have
+    // changed memory_space. Return EAGAIN so caller can retry.
+    if proc.memory_space != memory_space {
+        return Err(SyscallError::EAGAIN);
     }
 
     match cgroup::migrate_task(pid as u64, old_cgroup_id, cgroup_id) {
@@ -10419,7 +10501,10 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
                 old_cgroup_id,
                 cgroup_id,
             ) {
-                drop(proc);
+                // R156-5 FIX: Keep Process lock held during rollback.
+                // Previously drop(proc) created a window where PCB says
+                // old_cgroup but membership is in new_cgroup — exit in
+                // that window leaks the task in the destination cgroup.
                 let _ = cgroup::migrate_task(pid as u64, cgroup_id, old_cgroup_id);
                 return Err(SyscallError::ENOMEM);
             }
